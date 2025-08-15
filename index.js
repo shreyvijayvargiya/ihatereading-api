@@ -2280,10 +2280,15 @@ const cleanup = () => {
 process.on("SIGINT", cleanup);
 process.on("SIGTERM", cleanup);
 
-// Start the server
-const port = 3001;
-console.log(`Server is running on port ${port}`);
-serve({
-	fetch: app.fetch,
-	port,
-});
+// Start the server (only for local development)
+if (process.env.NODE_ENV !== 'production') {
+	const port = 3001;
+	console.log(`Server is running on port ${port}`);
+	serve({
+		fetch: app.fetch,
+		port,
+	});
+}
+
+// Export for Vercel
+export default app;
