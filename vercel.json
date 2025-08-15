@@ -4,10 +4,10 @@
 			"runtime": "nodejs18.x"
 		}
 	},
-	"routes": [
+	"rewrites": [
 		{
-			"src": "/(.*)",
-			"dest": "/index.js"
+			"source": "/(.*)",
+			"destination": "/index.js"
 		}
 	]
 }
