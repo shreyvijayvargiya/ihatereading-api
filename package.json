@@ -2,10 +2,10 @@
 	"name": "vanilla-js",
 	"version": "1.0.0",
 	"type": "module",
-	"main": "server.js",
+	"main": "index.js",
 	"scripts": {
-		"start": "nodemon server.js",
-		"dev": "nodemon server.js"
+		"start": "nodemon index.js",
+		"dev": "nodemon index.js"
 	},
 	"dependencies": {
 		"@google/genai": "^1.10.0",
