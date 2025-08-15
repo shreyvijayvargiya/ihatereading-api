@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  vanilla-js-server:
+    build: .
+    container_name: vanilla-js-server
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      # Add your environment variables here
+      # - GOOGLE_GENAI_API_KEY=${GOOGLE_GENAI_API_KEY}
+      # - LEMON_SQUEEZY_API_KEY=${LEMON_SQUEEZY_API_KEY}
+      # - LEMON_SQUEEZY_STORE_ID=${LEMON_SQUEEZY_STORE_ID}
+    env_file:
+      - .env
+    volumes:
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3001/home",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Add a development service for hot reload
+  vanilla-js-dev:
+    build: .
+    container_name: vanilla-js-dev
+    ports:
+      - "3002:3001"
+    environment:
+      - NODE_ENV=development
+    env_file:
+      - .env
+    volumes:
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run dev
+    profiles:
+      - dev
+
+networks:
+  default:
+    name: vanilla-js-network
