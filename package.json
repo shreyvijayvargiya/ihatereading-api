@@ -5,8 +5,7 @@
 	"main": "server.js",
 	"scripts": {
 		"start": "nodemon server.js",
-		"dev": "nodemon server.js",
-		"frontend": "cd frontend && npm run dev"
+		"dev": "nodemon server.js"
 	},
 	"dependencies": {
 		"@google/genai": "^1.10.0",
