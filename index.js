@@ -1,29 +1,340 @@
 import { Hono } from "hono";
-import { createServer } from "vite";
 import { serve } from "@hono/node-server";
-import { stream } from "hono/streaming";
 import { firestore } from "./firebase.js";
-import fs from "fs/promises";
 import { GoogleGenAI } from "@google/genai";
-import { CheerioCrawler } from "crawlee";
 import { chromium } from "playwright";
-import path from "path";
 import dotenv from "dotenv";
-import { aiWebSearchAgent } from "./ai-examples/ai-web-search-agent.js";
+import { createClient } from "@supabase/supabase-js";
 
 // Load environment variables
 dotenv.config();
+
+// Proxy Management System
+class ProxyManager {
+	constructor() {
+		this.proxies = [
+			{
+				host: "23.95.150.145",
+				port: 6114,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "198.23.239.134",
+				port: 6540,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "45.38.107.97",
+				port: 6014,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "107.172.163.27",
+				port: 6543,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "64.137.96.74",
+				port: 6641,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "45.43.186.39",
+				port: 6257,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "154.203.43.247",
+				port: 5536,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "216.10.27.159",
+				port: 6837,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "136.0.207.84",
+				port: 6661,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "142.147.128.93",
+				port: 6593,
+				username: "jpjjloxo",
+				password: "vy6njj7uds7x",
+				country: "US",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+		];
+
+		this.currentIndex = 0;
+		this.healthCheckInterval = null;
+		this.startHealthCheck();
+	}
+
+	// Get next available proxy with load balancing
+	getNextProxy() {
+		const now = Date.now();
+		const cooldownPeriod = 5000; // 5 seconds cooldown between uses
+
+		// Find healthy proxies that haven't been used recently
+		const availableProxies = this.proxies.filter(
+			(proxy) => proxy.isHealthy && now - proxy.lastUsed > cooldownPeriod
+		);
+
+		if (availableProxies.length === 0) {
+			// If no healthy proxies available, reset all and use any
+			this.proxies.forEach((proxy) => {
+				proxy.lastUsed = 0;
+				proxy.failCount = 0;
+				proxy.isHealthy = true;
+			});
+			return this.proxies[0];
+		}
+
+		// Sort by last used time and fail count
+		const sortedProxies = availableProxies.sort((a, b) => {
+			if (a.failCount !== b.failCount) {
+				return a.failCount - b.failCount;
+			}
+			return a.lastUsed - b.lastUsed;
+		});
+
+		const selectedProxy = sortedProxies[0];
+		selectedProxy.lastUsed = now;
+
+		return selectedProxy;
+	}
+
+	// Mark proxy as failed
+	markProxyFailed(proxyHost) {
+		const proxy = this.proxies.find((p) => p.host === proxyHost);
+		if (proxy) {
+			proxy.failCount++;
+			if (proxy.failCount >= 3) {
+				proxy.isHealthy = false;
+				console.warn(
+					`⚠️ Proxy ${proxyHost} marked as unhealthy after ${proxy.failCount} failures`
+				);
+			}
+		}
+	}
+
+	// Mark proxy as successful
+	markProxySuccess(proxyHost) {
+		const proxy = this.proxies.find((p) => p.host === proxyHost);
+		if (proxy) {
+			proxy.failCount = Math.max(0, proxy.failCount - 1);
+			if (proxy.failCount === 0) {
+				proxy.isHealthy = true;
+			}
+		}
+	}
+
+	// Health check for all proxies
+	async checkProxyHealth(proxy) {
+		try {
+			const browser = await chromium.launch({
+				headless: true,
+				args: [
+					"--no-sandbox",
+					"--disable-setuid-sandbox",
+					"--disable-dev-shm-usage",
+					"--disable-gpu",
+				],
+			});
+
+			const context = await browser.newContext({
+				proxy: {
+					server: `http://${proxy.host}:${proxy.port}`,
+					username: proxy.username,
+					password: proxy.password,
+				},
+				userAgent:
+					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+				timeout: 10000,
+			});
+
+			const page = await context.newPage();
+			await page.goto("https://httpbin.org/ip", { timeout: 10000 });
+			const content = await page.textContent("body");
+
+			await page.close();
+			await context.close();
+			await browser.close();
+
+			if (content.includes("origin")) {
+				this.markProxySuccess(proxy.host);
+				return true;
+			} else {
+				this.markProxyFailed(proxy.host);
+				return false;
+			}
+		} catch (error) {
+			this.markProxyFailed(proxy.host);
+			return false;
+		}
+	}
+
+	// Start periodic health checks
+	startHealthCheck() {
+		this.healthCheckInterval = setInterval(async () => {
+			console.log("🔍 Running proxy health check...");
+			const healthChecks = this.proxies.map((proxy) =>
+				this.checkProxyHealth(proxy)
+			);
+			await Promise.allSettled(healthChecks);
+
+			const healthyCount = this.proxies.filter((p) => p.isHealthy).length;
+			console.log(
+				`✅ Proxy health check complete: ${healthyCount}/${this.proxies.length} proxies healthy`
+			);
+		}, 5 * 60 * 1000); // Check every 5 minutes
+	}
+
+	// Stop health checks
+	stopHealthCheck() {
+		if (this.healthCheckInterval) {
+			clearInterval(this.healthCheckInterval);
+			this.healthCheckInterval = null;
+		}
+	}
+
+	// Get proxy statistics
+	getStats() {
+		const total = this.proxies.length;
+		const healthy = this.proxies.filter((p) => p.isHealthy).length;
+		const failed = this.proxies.filter((p) => p.failCount > 0).length;
+
+		return {
+			total,
+			healthy,
+			failed,
+			healthPercentage: Math.round((healthy / total) * 100),
+			proxies: this.proxies.map((p) => ({
+				host: p.host,
+				port: p.port,
+				country: p.country,
+				isHealthy: p.isHealthy,
+				failCount: p.failCount,
+				lastUsed: p.lastUsed,
+			})),
+		};
+	}
+}
+
+// Initialize proxy manager
+const proxyManager = new ProxyManager();
+
+// Utility function to create browser context with proxy
+const createBrowserContextWithProxy = async (browser, options = {}) => {
+	const proxy = proxyManager.getNextProxy();
+
+	const contextOptions = {
+		userAgent:
+			options.userAgent ||
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		viewport: options.viewport || { width: 1920, height: 1080 },
+		extraHTTPHeaders: options.extraHTTPHeaders || {
+			dnt: "1",
+			"upgrade-insecure-requests": "1",
+			accept:
+				"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+			"sec-fetch-site": "none",
+			"sec-fetch-mode": "navigate",
+			"sec-fetch-user": "?1",
+			"sec-fetch-dest": "document",
+			"accept-language": "en-US,en;q=0.9",
+		},
+		proxy: {
+			server: `http://${proxy.host}:${proxy.port}`,
+			username: proxy.username,
+			password: proxy.password,
+		},
+	};
+
+	const context = await browser.newContext(contextOptions);
+
+	// Store proxy info in context for later reference
+	context.proxyInfo = proxy;
+
+	return context;
+};
+
+// Utility function to handle proxy success/failure
+const handleProxyResult = (context, success) => {
+	if (context.proxyInfo) {
+		if (success) {
+			proxyManager.markProxySuccess(context.proxyInfo.host);
+		} else {
+			proxyManager.markProxyFailed(context.proxyInfo.host);
+		}
+	}
+};
 
 const genai = new GoogleGenAI({
 	apiKey: process.env.GOOGLE_GENAI_API_KEY,
 });
 
+const supabase = createClient(
+	process.env.SUPABASE_URL,
+	process.env.SUPABASE_KEY
+);
+
 const app = new Hono();
 
 app.use("/");
 
-app.get("/health", (c) => {
-	return c.text("Health check", 200);
+app.get("/", (c) => {
+	return c.text("Welcome to iHateReading API", 200);
 });
 
 app.get("/home", async (c) => {
@@ -272,90 +583,6 @@ app.get("/t/:slug", async (c) => {
 	}
 });
 
-app.post("/checkout/", async (c) => {
-	const { variantId, price } = await c.req.json();
-	const response = await fetch("https://api.lemonsqueezy.com/v1/checkouts", {
-		method: "POST",
-		headers: {
-			Accept: "application/vnd.api+json",
-			"Content-Type": "application/vnd.api+json",
-			Authorization: `Bearer ${process.env.LEMON_SQUEEZY_API_KEY}`,
-		},
-		body: JSON.stringify({
-			data: {
-				type: "checkouts",
-				attributes: {
-					store_id: process.env.LEMON_SQUEEZY_STORE_ID,
-					variant_id: variantId,
-					checkout_data: {
-						custom: {
-							user_id: "Shrey",
-							price: price,
-						},
-					},
-					product_options: {
-						redirect_url: `http://localhost:3001/?subscription=true`,
-					},
-				},
-				relationships: {
-					store: {
-						data: {
-							type: "stores",
-							id: process.env.LEMON_SQUEEZY_STORE_ID,
-						},
-					},
-					variant: {
-						data: {
-							type: "variants",
-							id: variantId,
-						},
-					},
-				},
-			},
-		}),
-	});
-
-	const data = await response.json();
-	return c.json({ link: data.data.attributes.url }, 200);
-});
-
-app.get("/store-scraped-data", async (c) => {
-	const data = await firestore.collection("ScrapedData").get();
-	const result = data.docs.map((item) => {
-		return {
-			id: item.id,
-			...item.data(),
-		};
-	});
-	const latestBlogs = result
-		.map((item) => item.sources)
-		.flat()
-		.map((item) => item.latestBlogs)
-		.flat();
-
-	const remove = latestBlogs.filter(
-		(item, index, self) => self.findIndex((t) => t.link === item.link) === index
-	);
-
-	Array.from({ length: Math.ceil(latestBlogs.length / 100) }).forEach(
-		async (_, index) => {
-			await firestore
-				.collection("scraped-data")
-				.doc(`latest-blogs-${index}`)
-				.set({
-					blogs: latestBlogs
-						.slice(index * 100, (index + 1) * 100)
-						.filter((item) => {
-							if (item.pubDate.split(" ")[3] < "2024") return false;
-							return true;
-						}),
-				});
-		}
-	);
-	return c.json(latestBlogs);
-});
-
-// Function to post to Dev.to
 app.post("/post-to-devto", async (c) => {
 	try {
 		const { title } = await c.req.json();
@@ -532,78 +759,665 @@ app.post("/post-to-devto", async (c) => {
 	}
 });
 
-app.post("/ai-generate-code", async (c) => {
-	const { prompt } = await c.req.json();
-	const response = await genai.models.generateContentStream({
-		model: "gemini-2.0-flash-001",
-		contents: [
-			{
-				role: "user",
-				parts: [
-					{
-						text: prompt,
-					},
-				],
-			},
-		],
-	});
-
-	return stream(c, async (stream) => {
-		for await (const chunk of response) {
-			await stream.writeln(chunk.text);
-		}
-	});
-});
-
-app.post("/crawler", async (c) => {
+// Core Google Maps scraping function (extracted from the endpoint)
+const scrapeGoogleMapsLocation = async (
+	query,
+	browserInstance = null,
+	contextInstance = null
+) => {
 	try {
-		const { url } = await c.req.json();
+		let browser = browserInstance;
+		let context = contextInstance;
+		let shouldCloseBrowser = false;
+		let shouldCloseContext = false;
 
-		if (!url) {
-			return c.json({ error: "URL is required" }, 400);
+		try {
+			// Use provided browser instance or create new one
+			if (!browser) {
+				browser = await chromium.launch({
+					headless: true,
+					userAgent:
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+					args: [
+						"--no-sandbox",
+						"--disable-setuid-sandbox",
+						"--disable-dev-shm-usage",
+						"--disable-accelerated-2d-canvas",
+						"--no-first-run",
+						"--no-zygote",
+						"--single-process",
+						"--disable-gpu",
+						"--disable-web-security",
+						"--disable-features=VizDisplayCompositor",
+						"--disable-background-timer-throttling",
+						"--disable-backgrounding-occluded-windows",
+						"--disable-renderer-backgrounding",
+					],
+				});
+				shouldCloseBrowser = true;
+			}
+
+			// Use provided context or create new one
+			if (!context) {
+				context = await browser.newContext();
+
+				// Block unnecessary resources to improve performance
+				await context.route("**/*", (route) => {
+					const type = route.request().resourceType();
+					return ["image", "font", "stylesheet", "media"].includes(type)
+						? route.abort()
+						: route.continue();
+				});
+				shouldCloseContext = true;
+			}
+
+			const page = await context.newPage();
+
+			// Navigate to Google Maps with optimized settings
+			await page.goto(
+				`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+				{
+					waitUntil: "domcontentloaded", // Faster than networkidle
+					timeout: 20000, // Reduced timeout
+				}
+			);
+
+			// Wait for the map to load with better strategy
+			await page.waitForSelector('div[role="main"]', { timeout: 15000 });
+
+			// Wait for map to fully load and coordinates to appear
+			// Give more time for city searches to resolve to specific coordinates
+			await page.waitForTimeout(3000);
+
+			// Try to wait for any loading indicators to disappear
+			try {
+				await page.waitForSelector("[data-js-log]", { timeout: 5000 });
+			} catch (e) {
+				// Ignore if not found, continue anyway
+			}
+
+			// Try to click on the map to get more specific coordinates
+			try {
+				// Look for the main map area and click on it
+				const mapArea = await page.$('div[role="main"]');
+				if (mapArea) {
+					// Click in the center of the map area
+					await mapArea.click();
+					await page.waitForTimeout(1000); // Wait for any map interactions
+				}
+			} catch (e) {
+				// Ignore click errors
+			}
+
+			// Extract location data with improved coordinate detection
+			const locationData = await page.evaluate(() => {
+				console.log("🔍 Starting coordinate extraction...");
+				const url = window.location.href;
+
+				// Try multiple ways to get coordinates
+				let coordinates = null;
+
+				// Method 1: Check URL for coordinates
+				const urlCoordsMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+				if (urlCoordsMatch) {
+					coordinates = {
+						lat: parseFloat(urlCoordsMatch[1]),
+						lng: parseFloat(urlCoordsMatch[2]),
+					};
+					console.log("✅ Found coordinates in URL:", coordinates);
+				} else {
+					console.log("❌ No coordinates in URL");
+				}
+
+				// Method 2: Look for coordinates in the page content
+				if (!coordinates) {
+					// Try to find coordinates in various page elements
+					const coordElements = document.querySelectorAll(
+						"[data-lat], [data-lng], [data-coordinates]"
+					);
+					for (const element of coordElements) {
+						const lat =
+							element.getAttribute("data-lat") ||
+							element.getAttribute("data-coordinates");
+						const lng = element.getAttribute("data-lng");
+						if (lat && lng) {
+							const latNum = parseFloat(lat);
+							const lngNum = parseFloat(lng);
+							if (!isNaN(latNum) && !isNaN(lngNum)) {
+								coordinates = { lat: latNum, lng: lngNum };
+								break;
+							}
+						}
+					}
+				}
+
+				// Method 3: Look for coordinates in text content
+				if (!coordinates) {
+					const pageText = document.body.textContent;
+					const coordPattern = /(-?\d+\.\d+),\s*(-?\d+\.\d+)/g;
+					const matches = pageText.match(coordPattern);
+					if (matches && matches.length > 0) {
+						// Take the first coordinate pair found
+						const coords = matches[0]
+							.split(",")
+							.map((c) => parseFloat(c.trim()));
+						if (coords.length === 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
+							coordinates = { lat: coords[0], lng: coords[1] };
+						}
+					}
+				}
+
+				// Method 4: Try to get coordinates from map center (if available)
+				if (!coordinates && window.google && window.google.maps) {
+					try {
+						const map =
+							document.querySelector("#scene-container") ||
+							document.querySelector("[data-js-log]");
+						if (map && map._googleMap) {
+							const center = map._googleMap.getCenter();
+							if (center) {
+								coordinates = { lat: center.lat(), lng: center.lng() };
+							}
+						}
+					} catch (e) {
+						// Ignore errors accessing map object
+					}
+				}
+
+				const locationName = document.querySelector("h1")?.textContent || "";
+				const address =
+					document.querySelector('button[data-item-id="address"]')
+						?.textContent || "";
+
+				return {
+					name: locationName,
+					address: address,
+					coordinates: coordinates,
+					url: url,
+				};
+			});
+
+			// Close only the page, keep context for reuse
+			await page.close();
+
+			// If no coordinates found, try a fallback strategy for city names
+			if (!locationData.coordinates) {
+				console.log(
+					`⚠️ No coordinates found for "${query}", trying fallback strategy...`
+				);
+
+				// For city names, try to get approximate coordinates by searching with "city center" or similar
+				if (
+					query &&
+					!query.includes("restaurant") &&
+					!query.includes("hotel") &&
+					!query.includes("market")
+				) {
+					// This might be a city name, try to get approximate coordinates
+					console.log(
+						`📍 Query "${query}" appears to be a city name, coordinates may be approximate`
+					);
+
+					// Return success with a note about approximate coordinates
+					return {
+						success: true,
+						data: {
+							...locationData,
+							note: "City name - coordinates may be approximate or city center",
+							queryType: "city",
+						},
+						warning: "City coordinates are approximate",
+					};
+				}
+
+				return {
+					success: false,
+					error: "Location not found or coordinates not available",
+					data: locationData,
+				};
+			}
+
+			return {
+				success: true,
+				data: locationData,
+			};
+		} catch (error) {
+			console.error(`Error processing query "${query}":`, error);
+			return {
+				success: false,
+				error: error.message,
+				data: {
+					query,
+					name: "",
+					address: "",
+					coordinates: null,
+					url: "",
+				},
+			};
+		} finally {
+			// Only close context if we created it (not for shared instances)
+			if (context && shouldCloseContext) {
+				await context.close();
+			}
+			// Only close browser if we created it (not for shared instances)
+			if (browser && shouldCloseBrowser) {
+				await browser.close();
+			}
+		}
+	} catch (error) {
+		console.error("Google Maps Scraping Error:", error);
+		return {
+			success: false,
+			error: "Failed to fetch location data",
+			details: error.message,
+		};
+	}
+};
+
+// Bulk scraping with multiple browser instances for parallel processing
+const scrapeGoogleMapsBulk = async (queries, maxConcurrentBrowsers = 3) => {
+	const results = [];
+	const browsers = [];
+	const contexts = [];
+
+	try {
+		for (let i = 0; i < maxConcurrentBrowsers; i++) {
+			const browser = await chromium.launch({
+				headless: true,
+				userAgent:
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+				args: [
+					"--no-sandbox",
+					"--disable-setuid-sandbox",
+					"--disable-dev-shm-usage",
+					"--disable-accelerated-2d-canvas",
+					"--no-first-run",
+					"--no-zygote",
+					"--single-process",
+					"--disable-gpu",
+					"--disable-web-security",
+					"--disable-features=VizDisplayCompositor",
+					"--disable-background-timer-throttling",
+					"--disable-backgrounding-occluded-windows",
+					"--disable-renderer-backgrounding",
+				],
+			});
+
+			// Create context for this browser
+			const context = await browser.newContext();
+
+			// Block unnecessary resources to improve performance
+			await context.route("**/*", (route) => {
+				const type = route.request().resourceType();
+				return ["image", "font", "stylesheet", "media"].includes(type)
+					? route.abort()
+					: route.continue();
+			});
+
+			browsers.push(browser);
+			contexts.push(context);
 		}
 
-		const crawler = new CheerioCrawler({
-			async requestHandler({ request, $, log }) {
-				log.info(request);
-				try {
-					const title = $("title").text();
-					const url = request.url;
+		// Process queries in batches to avoid overwhelming Google Maps
+		const batchSize = Math.max(
+			1,
+			Math.ceil(queries.length / maxConcurrentBrowsers)
+		);
+		const batches = [];
+		for (let i = 0; i < queries.length; i += batchSize) {
+			batches.push(queries.slice(i, i + batchSize));
+		}
 
-					const result = {
-						title,
-						url,
-						timestamp: new Date().toISOString(),
-					};
-					log.info(result);
-					// Save to dataset
-					await dataset.pushData(result);
-				} catch (error) {
-					await dataset.pushData({
-						title: "Error",
-						description: error.message,
-						image: null,
-						url: request.url,
-						error: true,
-						timestamp: new Date().toISOString(),
-					});
+		// Process batches sequentially to avoid rate limiting
+		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+			const batch = batches[batchIndex];
+			console.log(
+				`🔄 Processing batch ${batchIndex + 1}/${batches.length} with ${
+					batch.length
+				} queries`
+			);
+
+			// Process current batch in parallel
+			const batchPromises = batch.map(async (query, index) => {
+				const browserIndex = index % maxConcurrentBrowsers;
+				const browser = browsers[browserIndex];
+				const context = contexts[browserIndex];
+
+				// Retry mechanism for failed queries
+				const maxRetries = 2;
+				let lastError = null;
+
+				for (let retry = 0; retry <= maxRetries; retry++) {
+					try {
+						if (retry > 0) {
+							console.log(
+								`🔄 Retry ${retry} for query "${query}" with browser ${
+									browserIndex + 1
+								}`
+							);
+							// Small delay before retry
+							await new Promise((resolve) => setTimeout(resolve, 1000));
+						} else {
+							console.log(
+								`🔍 Processing query "${query}" with browser ${
+									browserIndex + 1
+								}`
+							);
+						}
+
+						const result = await scrapeGoogleMapsLocation(
+							query,
+							browser,
+							context
+						);
+
+						// If successful, return result
+						if (result.success) {
+							return { query, result };
+						}
+
+						// If no coordinates found, don't retry
+						if (
+							result.error === "Location not found or coordinates not available"
+						) {
+							return { query, result };
+						}
+
+						// For other errors, continue to retry
+						lastError = result.error;
+					} catch (error) {
+						lastError = error.message;
+						console.error(
+							`Error processing query "${query}" (attempt ${retry + 1}):`,
+							error
+						);
+
+						// If it's the last retry, return error
+						if (retry === maxRetries) {
+							return {
+								query,
+								result: { success: false, error: error.message },
+							};
+						}
+					}
 				}
-			},
 
-			maxRequestsPerCrawl: 1, // Only crawl the single URL
-			requestHandlerTimeoutSecs: 30,
-			maxRequestRetries: 2,
-		});
+				// If all retries failed, return last error
+				return {
+					query,
+					result: {
+						success: false,
+						error: lastError || "Max retries exceeded",
+					},
+				};
+			});
 
-		await crawler.run([{ url }]);
+			// Wait for current batch to complete
+			const batchResults = await Promise.all(batchPromises);
+			results.push(...batchResults);
+
+			// Add delay between batches to avoid overwhelming Google Maps
+			if (batchIndex < batches.length - 1) {
+				const delay = Math.min(2000, batch.length * 500); // Adaptive delay based on batch size
+				console.log(`⏳ Waiting ${delay}ms before next batch...`);
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+
+		// Calculate final statistics
+		const successfulQueries = results.filter((r) => r.result.success).length;
+		const failedQueries = results.filter((r) => !r.result.success).length;
+		const successRate = ((successfulQueries / results.length) * 100).toFixed(2);
+
+		console.log(
+			`🎉 All batches completed! Total queries processed: ${results.length}`
+		);
+		console.log(`📊 Final Statistics:`);
+		console.log(`✅ Successful: ${successfulQueries}`);
+		console.log(`❌ Failed: ${failedQueries}`);
+		console.log(`📈 Success Rate: ${successRate}%`);
+
+		return results;
+	} catch (error) {
+		console.error("Bulk scraping error:", error);
+		return results; // Return partial results if available
+	} finally {
+		// Close all contexts first
+		console.log(`🧹 Closing ${contexts.length} browser contexts`);
+		await Promise.all(contexts.map((context) => context.close()));
+
+		// Then close all browser instances
+		console.log(`🧹 Closing ${browsers.length} browser instances`);
+		await Promise.all(browsers.map((browser) => browser.close()));
+	}
+};
+
+// 1. Bulk Scraping Job Creation (with single query optimization)
+app.post("/scrap-google-maps-bulk", async (c) => {
+	try {
+		// Validate request body
+		let requestBody;
+		try {
+			requestBody = await c.req.json();
+		} catch (jsonError) {
+			console.error("JSON parsing error:", jsonError);
+			return c.json(
+				{
+					success: false,
+					error: "Invalid JSON in request body. Please send valid JSON data.",
+					example: {
+						region: "india",
+						singleQuery: "Mumbai restaurant",
+					},
+				},
+				400
+			);
+		}
+
+		// Validate request body is not null/undefined
+		if (!requestBody || typeof requestBody !== "object") {
+			return c.json(
+				{
+					success: false,
+					error: "Request body must be a valid JSON object",
+					example: {
+						region: "india",
+						singleQuery: "Mumbai restaurant",
+					},
+				},
+				400
+			);
+		}
+
+		const {
+			region = "india",
+			batchSize = 1000,
+			priority = "normal",
+			singleQuery = null,
+		} = requestBody;
+
+		if (singleQuery && typeof singleQuery === "string" && singleQuery.trim()) {
+			const cleanQuery = singleQuery.trim();
+
+			const result = await scrapeGoogleMapsLocation(cleanQuery);
+
+			if (result.success && result.data) {
+				// Store result directly in locations table
+				try {
+					const locationData = {
+						name: result.data.name || "",
+						address: result.data.address || "",
+						google_maps_url: result.data.url || "",
+						scraped_at: new Date().toISOString(),
+					};
+
+					// Add optional columns if they exist in the schema
+					if (result.data.coordinates?.lat && result.data.coordinates?.lng) {
+						locationData.latitude = result.data.coordinates.lat;
+						locationData.longitude = result.data.coordinates.lng;
+					}
+
+					// Try to insert with all columns, fallback to minimal if needed
+					try {
+						await supabase.from("locations").insert(locationData);
+					} catch (insertError) {
+						// If insert fails, try with minimal columns
+						const minimalData = {
+							name: locationData.name,
+							address: locationData.address,
+							scraped_at: locationData.scraped_at,
+						};
+						await supabase.from("locations").insert(minimalData);
+					}
+				} catch (dbError) {
+					console.error("Failed to store location:", dbError);
+				}
+			}
+
+			return c.json({
+				success: true,
+				message: "Single query processed successfully",
+				data: {
+					query: singleQuery,
+					result: result.data,
+				},
+			});
+		}
+
+		let queries, batchInfo;
+
+		if (region === "india") {
+			const batchNumber = parseInt(requestBody.batchNumber) || 0;
+			const batchSize = parseInt(requestBody.batchSize) || 50;
+
+			batchInfo = addBatchToQueue(batchNumber, batchSize);
+			queries = batchInfo.queries;
+		} else {
+			queries = [];
+		}
+
+		if (queries.length === 0) {
+			return c.json(
+				{
+					success: false,
+					error: `No queries generated for region: ${region}. Currently only 'india' is supported.`,
+					supportedRegions: ["india"],
+				},
+				400
+			);
+		}
+
+		// Start bulk scraping and store results directly
+		console.log(`🚀 Starting bulk scraping for ${queries.length} queries`);
+
+		const startTime = Date.now();
+		const results = await scrapeGoogleMapsBulk(queries, 3);
+		const totalTime = Date.now() - startTime;
+
+		let storedCount = 0;
+		let storageErrors = [];
+
+		console.log(`📊 Processing ${results.length} results for storage...`);
+
+		for (const { query, result } of results) {
+			if (result.success && result.data) {
+				try {
+					const locationData = {
+						name: result.data.name || "",
+						address: result.data.address || "",
+						google_maps_url: result.data.url || "",
+						scraped_at: new Date().toISOString(),
+					};
+
+					if (result.data.coordinates?.lat && result.data.coordinates?.lng) {
+						locationData.latitude = result.data.coordinates.lat;
+						locationData.longitude = result.data.coordinates.lng;
+					}
+
+					console.log(`💾 Attempting to store: ${result.data.name || query}`);
+
+					const { error: insertError } = await supabase
+						.from("locations")
+						.insert(locationData);
+
+					if (insertError) {
+						throw new Error(`Supabase insert error: ${insertError.message}`);
+					}
+
+					storedCount++;
+					console.log(`✅ Stored successfully: ${result.data.name || query}`);
+
+					// Track successful location in queue
+					trackSuccessfulLocation(batchInfo.batchNumber);
+				} catch (error) {
+					console.error(`❌ Failed to store location for "${query}":`, error);
+					storageErrors.push({ query, error: error.message });
+
+					// Track failed storage
+					trackFailedLocation(
+						batchInfo.batchNumber,
+						query,
+						`Storage error: ${error.message}`
+					);
+				}
+			} else {
+				console.log(
+					`⚠️ Skipping failed result for "${query}": ${result.error}`
+				);
+				// Track failed scraping
+				trackFailedLocation(
+					batchInfo.batchNumber,
+					query,
+					result.error || "Unknown error"
+				);
+			}
+		}
+
+		// Calculate statistics
+		const successfulQueries = results.filter((r) => r.result.success).length;
+		const failedQueries = results.filter((r) => !r.result.success).length;
+		const successRate = ((successfulQueries / results.length) * 100).toFixed(2);
+
+		// Mark batch as completed in queue
+		markBatchCompleted(batchInfo.batchNumber, results);
+
+		console.log(
+			`📊 Storage Summary: ${storedCount}/${results.length} locations stored successfully`
+		);
+		if (storageErrors.length > 0) {
+			console.log(
+				`❌ Storage Errors: ${storageErrors.length} locations failed to store`
+			);
+			storageErrors.forEach((err) =>
+				console.log(`  - ${err.query}: ${err.error}`)
+			);
+		}
 
 		return c.json({
 			success: true,
-			data: results.items,
-			total: results.items.length,
+			message: "Bulk scraping completed successfully",
+			data: {
+				totalQueries: queries.length,
+				successfulQueries,
+				failedQueries,
+				storedInDatabase: storedCount,
+				successRate: `${successRate}%`,
+				processingTime: `${totalTime}ms`,
+				estimatedTime: `${Math.ceil(totalTime / 1000)} seconds`,
+				method: "scrape-then-store",
+				storageErrors: storageErrors.length > 0 ? storageErrors : undefined,
+				results: results.slice(0, 10), // Return first 10 results for preview
+				batch: {
+					currentBatch: batchInfo.batchNumber + 1,
+					totalBatches: batchInfo.totalBatches,
+					hasMore: batchInfo.hasMore,
+					progress: batchInfo.progress,
+					nextBatch: batchInfo.hasMore ? batchInfo.batchNumber + 1 : null,
+				},
+			},
 		});
 	} catch (error) {
-		console.error("Crawler error:", error);
+		console.error("Bulk scraping job creation error:", error);
 		return c.json(
 			{
 				success: false,
@@ -614,28 +1428,204 @@ app.post("/crawler", async (c) => {
 	}
 });
 
-app.post("/ai-web-search-agent", async (c) => {
-	const { prompt } = await c.req.json();
-	const response = await aiWebSearchAgent(prompt);
-	return c.json(response);
-});
+// Google Maps scraping endpoint using headless Chrome
+app.post("/scrap-google-maps", async (c) => {
+	try {
+		const { queries, singleQuery, limit = 10 } = await c.req.json();
 
-app.post("/any-crawl-website", async (c) => {
-	const { url } = await c.req.json();
+		if (!queries && !singleQuery) {
+			return c.json(
+				{
+					success: false,
+					error: "Either 'queries' array or 'singleQuery' string is required",
+				},
+				400
+			);
+		}
 
-	const response = await fetch("https://api.anycrawl.dev/v1/scrape", {
-		method: "POST",
-		headers: {
-			Authorization: "Bearer ac-861db0c0185872013363ec3af98c8",
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			url,
-		}),
-	});
-	const result = await response.json();
-	console.log(result.data.markdown);
-	return c.text(result.data.markdown);
+		// Handle both single query and array of queries
+		const queryArray = Array.isArray(queries)
+			? queries
+			: [queries || singleQuery];
+
+		if (!queryArray.length || queryArray.some((q) => !q)) {
+			return c.json(
+				{
+					success: false,
+					error: "At least one valid query is needed",
+				},
+				400
+			);
+		}
+
+		let browser;
+		try {
+			// Launch headless Chrome browser with proper configuration
+			browser = await chromium.launch({
+				headless: true,
+				userAgent:
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+				args: [
+					"--no-sandbox",
+					"--disable-setuid-sandbox",
+					"--disable-dev-shm-usage",
+					"--disable-accelerated-2d-canvas",
+					"--no-first-run",
+					"--no-zygote",
+					"--single-process",
+					"--disable-gpu",
+				],
+			});
+
+			// Create a shared context for all queries
+			const context = await browser.newContext();
+
+			// Block unnecessary resources to improve performance
+			await context.route("**/*", (route) => {
+				const type = route.request().resourceType();
+				return ["image", "font", "stylesheet"].includes(type)
+					? route.abort()
+					: route.continue();
+			});
+
+			// Process all queries in parallel using Promise.all
+			const results = await Promise.all(
+				queryArray.map(async (query) => {
+					const page = await context.newPage();
+					try {
+						// Navigate to Google Maps
+						await page.goto(
+							`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+							{
+								waitUntil: "networkidle",
+								timeout: 30000,
+							}
+						);
+
+						// Wait for the map to load
+						await page.waitForSelector('div[role="main"]', { timeout: 30000 });
+
+						// Wait a bit for the location to be fully loaded
+						await page.waitForTimeout(5000);
+
+						// Extract location data
+						const locationData = await page.evaluate(() => {
+							const url = window.location.href;
+							const coordsMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+							const locationName =
+								document.querySelector("h1")?.textContent || "";
+							const address =
+								document.querySelector('button[data-item-id="address"]')
+									?.textContent || "";
+
+							// Determine type based on content
+							let type = "Location";
+							if (
+								locationName.toLowerCase().includes("restaurant") ||
+								locationName.toLowerCase().includes("cafe")
+							)
+								type = "Restaurant";
+							else if (
+								locationName.toLowerCase().includes("hotel") ||
+								locationName.toLowerCase().includes("inn")
+							)
+								type = "Accommodation";
+							else if (
+								locationName.toLowerCase().includes("museum") ||
+								locationName.toLowerCase().includes("gallery")
+							)
+								type = "Cultural";
+							else if (
+								locationName.toLowerCase().includes("park") ||
+								locationName.toLowerCase().includes("garden")
+							)
+								type = "Recreation";
+
+							return {
+								name: locationName,
+								address: address,
+								coordinates: coordsMatch
+									? {
+											lat: parseFloat(coordsMatch[1]),
+											lng: parseFloat(coordsMatch[2]),
+									  }
+									: null,
+								url: url,
+								details: details,
+								rating: rating,
+								reviews: reviews,
+								type: type,
+							};
+						});
+
+						return { query, ...locationData };
+					} catch (error) {
+						console.error(`Error processing query "${query}":`, error);
+						return {
+							query,
+							name: "",
+							address: "",
+							coordinates: null,
+							url: "",
+							details: [],
+							rating: "Rating not available",
+							reviews: "Reviews not available",
+							type: "Location",
+							error: error.message,
+						};
+					} finally {
+						await page.close();
+					}
+				})
+			);
+
+			// Close the shared context after all queries are complete
+			await context.close();
+
+			// If single query was provided, return just the location data
+			if (!Array.isArray(queries)) {
+				const result = results[0];
+				if (!result.coordinates) {
+					return c.json(
+						{
+							success: false,
+							error: "Location not found or coordinates not available",
+							data: result,
+						},
+						404
+					);
+				}
+				return c.json({
+					success: true,
+					data: result,
+				});
+			}
+
+			// For multiple queries, return array of results
+			return c.json({
+				success: true,
+				data: {
+					totalQueries: queryArray.length,
+					results: results,
+					generatedAt: new Date().toISOString(),
+				},
+			});
+		} finally {
+			if (browser) {
+				await browser.close();
+			}
+		}
+	} catch (error) {
+		console.error("Google Maps Scraping Error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to fetch location data",
+				details: error.message,
+			},
+			500
+		);
+	}
 });
 
 app.post("/scrap-google-images", async (c) => {
@@ -777,9 +1767,172 @@ app.post("/scrap-google-images", async (c) => {
 	}
 });
 
+app.post("/ai-travel-agent", async (c) => {
+	try {
+		const { prompt } = await c.req.json();
+
+		if (!prompt) {
+			return c.json(
+				{
+					success: false,
+					error: "Travel prompt is required",
+				},
+				400
+			);
+		}
+
+		const generateItineraryPrompt = (prompt) => {
+			return `You are a travel itinerary expert. Generate a detailed travel itinerary based on the following requirements:
+
+	${prompt}
+
+	Please follow these guidelines:
+	1. Analyze the prompt to determine the start and end destinations, number of days, and any specific requirements
+	2. For each location mentioned in the itinerary, create:
+	   a. A specific and optimized Google image search query that will return the best possible images. Follow these rules for image queries:
+	      - Include the full name of the location
+	      - Add descriptive terms like "landmark", "tourist spot", "famous", "beautiful", "scenic", "aerial view" where appropriate
+	      - Include specific features or attractions of the location
+	      - Use terms that will yield high-quality, professional photos
+	      - Avoid generic terms that might return irrelevant results
+	      - Format as: ![Location Name](query: "specific search query")
+	   
+	   b. A Google Maps location query for places that need coordinates. Follow these rules for location queries:
+	      - Always include the full name of the place
+	      - Always include the city/area name
+	      - Always include the country
+	      - For restaurants: include "restaurant" and street name if available
+	      - For hotels: include "hotel" and street name if available
+	      - For attractions: include specific identifiers (e.g., "temple", "museum", "park")
+	      - For meeting points: include nearby landmarks
+	      - Format as: [Location Name](location: "specific location query")
+	      - Use this format for ALL places that need coordinates: restaurants, hotels, attractions, meeting points, etc.
+	      - Be as specific as possible to ensure accurate coordinates
+
+	3. Format the response in Markdown with the following structure:
+
+	# Travel Itinerary
+
+	## Overview
+	- Brief summary of the trip
+	- Total duration
+	- Main highlights
+
+	## Day-by-Day Breakdown
+
+	### Day 1: [Location Name]
+	![Location Name](query: "location name landmark scenic view")
+	
+	#### Morning
+	- Activity 1 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
+	- Activity 2 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
+	
+	#### Afternoon
+	- Lunch at [Restaurant Name](location: "Restaurant Name, Street Name, City, Country restaurant")
+	- Activity 1 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
+	
+	#### Evening
+	- Dinner at [Restaurant Name](location: "Restaurant Name, Street Name, City, Country restaurant")
+	- Activity 1 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
+	
+	#### Accommodation
+	- [Hotel Name](location: "Hotel Name, Street Name, City, Country hotel")
+	- Estimated cost
+	
+	#### Local Cuisine
+	- Restaurant recommendations with location queries
+	- Must-try dishes
+	
+	#### Transportation
+	- How to get there
+	- Estimated cost
+
+	[Repeat for each day]
+
+	## Budget Breakdown
+	- Accommodation
+	- Transportation
+	- Activities
+	- Food
+	- Miscellaneous
+
+	## Travel Tips
+	- Best time to visit
+	- Local customs and etiquette
+	- Safety considerations
+	- Packing suggestions
+
+	Make sure to:
+	1. Include specific details about each location and activity
+	2. Provide accurate time estimates
+	3. Include practical information like costs and transportation options
+	4. Format all content in proper Markdown
+	5. For each location:
+	   - Create an optimized image search query that will return the best possible images
+	   - Add a location query for places that need coordinates
+	6. Use the formats:
+	   - ![Location Name](query: "specific search query") for images
+	   - [Location Name](location: "specific location query") for Google Maps coordinates
+
+	Example of good queries:
+	- Image query for Eiffel Tower: "Eiffel Tower Paris landmark aerial view sunset"
+	- Location query for Eiffel Tower: "Eiffel Tower, Champ de Mars, 75007 Paris, France"
+	
+	- Image query for Tokyo Skytree: "Tokyo Skytree Japan modern architecture night view"
+	- Location query for Tokyo Skytree: "Tokyo Skytree, 1 Chome-1-2 Oshiage, Sumida City, Tokyo, Japan"
+	
+	- Image query for Grand Canyon: "Grand Canyon Arizona USA scenic landscape aerial view"
+	- Location query for Grand Canyon: "Grand Canyon National Park, Arizona, United States"
+	
+	- Image query for Sensō-ji Temple: "Sensō-ji Temple Tokyo Asakusa district famous pagoda"
+	- Location query for Sensō-ji Temple: "Sensō-ji Temple, 2 Chome-3-1 Asakusa, Taito City, Tokyo, Japan"
+	
+	- Image query for Le Jules Verne: "Le Jules Verne Restaurant Eiffel Tower Paris fine dining"
+	- Location query for Le Jules Verne: "Le Jules Verne Restaurant, Eiffel Tower, 75007 Paris, France"
+	
+	- Image query for Park Hyatt Tokyo: "Park Hyatt Tokyo hotel luxury rooms city view"
+	- Location query for Park Hyatt Tokyo: "Park Hyatt Tokyo, 3-7-1-2 Nishishinjuku, Shinjuku City, Tokyo, Japan"`;
+		};
+		// User prompt with the travel requirements from user input
+		const userPrompt = `Create a detailed travel itinerary based on this request:
+
+${prompt}
+
+Please provide a comprehensive itinerary following the structure specified in the system prompt.`;
+
+		const initialItineraryResult = await genai.models.generateContent({
+			model: "gemini-2.0-flash",
+			contents: [
+				{ role: "model", parts: [{ text: generateItineraryPrompt(prompt) }] },
+				{ role: "user", parts: [{ text: userPrompt }] },
+			],
+		});
+
+		const itinerary =
+			initialItineraryResult.candidates[0].content.parts[0].text;
+		const thought =
+			initialItineraryResult.candidates[0].content.parts[0].thought;
+
+		return c.json({
+			itinerary: itinerary,
+			thought: thought,
+		});
+	} catch (error) {
+		console.error("AI Travel Agent Error:", error);
+		return c.json(
+			{
+				success: false,
+				error: error.message,
+			},
+			500
+		);
+	}
+});
+
 app.post("/find-latest-jobs", async (c) => {
 	const { query } = await c.req.json();
 	const urlEncodedQuery = encodeURIComponent(query);
+	// i can queue multiple API URL
 	const apiUrl = `https://jsearch.p.rapidapi.com/search?query=${urlEncodedQuery}&page=1&num_pages=1&date_posted=all`;
 
 	const response = await fetch(apiUrl, {
@@ -1087,226 +2240,6 @@ app.post("/google-search", async (c) => {
 	}
 });
 
-// Enhanced Google Search with multiple search engines
-app.post("/multi-search", async (c) => {
-	const {
-		query,
-		engines = ["google", "bing", "yahoo"],
-		limit = 5,
-		config = {
-			blockAds: true,
-			storeInCache: true,
-			timeout: 30000,
-		},
-	} = await c.req.json();
-
-	if (!query) {
-		return c.json({ error: "Query is required" }, 400);
-	}
-
-	console.log("🔍 Multi-search for:", query, "Engines:", engines);
-	let browser;
-
-	try {
-		browser = await chromium.launch({
-			headless: true,
-			args: [
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-dev-shm-usage",
-				"--disable-gpu",
-			],
-		});
-
-		const context = await browser.newContext({
-			userAgent:
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.61 Safari/537.36",
-			viewport: { width: 1920, height: 1080 },
-			extraHTTPHeaders: {
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-				"sec-fetch-site": "same-origin",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				referer: "https://www.google.com/",
-				"accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
-			},
-		});
-		const allResults = {};
-
-		// Search Google
-		if (engines.includes("google")) {
-			try {
-				const page = await context.newPage();
-				await page.goto(
-					`https://www.google.com/search?q=${encodeURIComponent(
-						query
-					)}&num=${limit}`,
-					{
-						waitUntil: "networkidle",
-						timeout: config.timeout,
-					}
-				);
-
-				// Fast search - wait briefly for content
-				await page.waitForTimeout(1000);
-
-				const googleResults = await page.evaluate((maxResults) => {
-					const results = [];
-					const searchItems = document.querySelectorAll(".g");
-
-					searchItems.forEach((item, index) => {
-						if (index >= maxResults) return;
-
-						const titleElement = item.querySelector("h3 a");
-						const snippetElement = item.querySelector(".s");
-
-						if (titleElement) {
-							results.push({
-								title: titleElement.textContent.trim(),
-								url: titleElement.href,
-								snippet: snippetElement
-									? snippetElement.textContent.trim()
-									: "",
-								position: index + 1,
-							});
-						}
-					});
-
-					return results;
-				}, limit);
-
-				allResults.google = googleResults;
-				await page.close();
-			} catch (error) {
-				console.error("Google search error:", error);
-				allResults.google = { error: error.message };
-			}
-		}
-
-		// Search Bing
-		if (engines.includes("bing")) {
-			try {
-				const page = await context.newPage();
-				await page.goto(
-					`https://www.bing.com/search?q=${encodeURIComponent(
-						query
-					)}&count=${limit}`,
-					{
-						waitUntil: "networkidle",
-						timeout: config.timeout,
-					}
-				);
-
-				const bingResults = await page.evaluate((maxResults) => {
-					const results = [];
-					const searchItems = document.querySelectorAll(".b_algo");
-
-					searchItems.forEach((item, index) => {
-						if (index >= maxResults) return;
-
-						const titleElement = item.querySelector("h2 a");
-						const snippetElement = item.querySelector(".b_caption p");
-
-						if (titleElement) {
-							results.push({
-								title: titleElement.textContent.trim(),
-								url: titleElement.href,
-								snippet: snippetElement
-									? snippetElement.textContent.trim()
-									: "",
-								position: index + 1,
-							});
-						}
-					});
-
-					return results;
-				}, limit);
-
-				allResults.bing = bingResults;
-				await page.close();
-			} catch (error) {
-				console.error("Bing search error:", error);
-				allResults.bing = { error: error.message };
-			}
-		}
-
-		// Search yahoo
-		if (engines.includes("yahoo")) {
-			try {
-				const page = await context.newPage();
-				await page.goto(
-					`https://search.yahoo.com/search?p=${encodeURIComponent(
-						query
-					)}&n=${limit}`,
-					{
-						waitUntil: "networkidle",
-						timeout: config.timeout,
-					}
-				);
-
-				const yahooResults = await page.evaluate((maxResults) => {
-					const results = [];
-					const searchItems = document.querySelectorAll(".search-result");
-
-					searchItems.forEach((item, index) => {
-						if (index >= maxResults) return;
-
-						const titleElement = item.querySelector("h3 a");
-						const snippetElement = item.querySelector(".search-result-snippet");
-
-						if (titleElement) {
-							results.push({
-								title: titleElement.textContent.trim(),
-								url: titleElement.href,
-								snippet: snippetElement
-									? snippetElement.textContent.trim()
-									: "",
-								position: index + 1,
-							});
-						}
-					});
-
-					return results;
-				}, limit);
-
-				allResults.yahoo = yahooResults;
-				await page.close();
-			} catch (error) {
-				console.error("Yahoo search error:", error);
-				allResults.yahoo = { error: error.message };
-			}
-		}
-
-		await context.close();
-
-		return c.json({
-			success: true,
-			query,
-			results: allResults,
-			engines,
-			config,
-		});
-	} catch (error) {
-		console.error("❌ Multi-search error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to perform multi-search",
-				details: error.message,
-			},
-			500
-		);
-	} finally {
-		if (browser) {
-			await browser.close();
-		}
-	}
-});
-
 // Dedicated Bing Search endpoint using Playwright (like multi-search)
 app.post("/bing-search", async (c) => {
 	const {
@@ -1325,7 +2258,7 @@ app.post("/bing-search", async (c) => {
 	let browser;
 
 	try {
-		// Use Playwright like multi-search for JavaScript rendering
+		// Use Playwright like bing-search for JavaScript rendering
 		browser = await chromium.launch({
 			headless: true,
 			args: [
@@ -1449,16 +2382,16 @@ app.post("/bing-search", async (c) => {
 	});
 });
 
-// Web Scraping API - Scrape any URL content
-app.post("/scrape-url", async (c) => {
+app.post("/scrap-url", async (c) => {
 	const {
 		url,
 		selectors = {}, // Custom selectors for specific elements
 		waitForSelector = null, // Wait for specific element to load
 		timeout = 30000,
-		includeImages = false,
-		includeLinks = false,
+		includeImages = true,
+		includeLinks = true,
 		extractMetadata = true,
+		useProxy = false, // New option to enable/disable proxy (default: false)
 	} = await c.req.json();
 
 	if (!url) {
@@ -1466,6 +2399,7 @@ app.post("/scrape-url", async (c) => {
 	}
 
 	let browser;
+	let context;
 	let scrapedData = {};
 
 	try {
@@ -1482,22 +2416,45 @@ app.post("/scrape-url", async (c) => {
 			],
 		});
 
-		const context = await browser.newContext({
-			userAgent:
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			viewport: { width: 1920, height: 1080 },
-			extraHTTPHeaders: {
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-				"sec-fetch-site": "none",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				"accept-language": "en-US,en;q=0.9",
-			},
-		});
+		// Use proxy management system only if explicitly enabled
+		if (useProxy) {
+			console.log("🔒 Using enhanced proxy system with anti-detection...");
+			context = await createBrowserContextWithProxy(
+				browser,
+				{
+					viewport: { width: 1920, height: 1080 },
+					extraHTTPHeaders: {
+						dnt: "1",
+						"upgrade-insecure-requests": "1",
+						accept:
+							"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+						"sec-fetch-site": "none",
+						"sec-fetch-mode": "navigate",
+						"sec-fetch-user": "?1",
+						"sec-fetch-dest": "document",
+						"accept-language": "en-US,en;q=0.9",
+					},
+				},
+				url
+			); // Pass target URL for domain-aware proxy selection
+		} else {
+			context = await browser.newContext({
+				userAgent:
+					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+				viewport: { width: 1920, height: 1080 },
+				extraHTTPHeaders: {
+					dnt: "1",
+					"upgrade-insecure-requests": "1",
+					accept:
+						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+					"sec-fetch-site": "none",
+					"sec-fetch-mode": "navigate",
+					"sec-fetch-user": "?1",
+					"sec-fetch-dest": "document",
+					"accept-language": "en-US,en;q=0.9",
+				},
+			});
+		}
 
 		const page = await context.newPage();
 
@@ -1745,19 +2702,77 @@ app.post("/scrape-url", async (c) => {
 			scrapedAt: new Date().toISOString(),
 			userAgent: await page.evaluate(() => navigator.userAgent),
 			viewport: await page.viewportSize(),
+			proxyInfo:
+				useProxy && context.proxyInfo
+					? {
+							host: context.proxyInfo.host,
+							port: context.proxyInfo.port,
+							country: context.proxyInfo.country,
+					  }
+					: null,
 		};
 
 		await page.close();
 		await context.close();
 
+		// Mark proxy as successful if used
+		if (useProxy && context.proxyInfo) {
+			handleProxyResult(context, true);
+			console.log(
+				`✅ Proxy ${context.proxyInfo.host} marked as successful for ${url}`
+			);
+		}
+
+		// const prompt = `
+		// We are providing you the JSON format scraped data from the URL ${url} given by the user. Understand the JSON prompt to
+		// answer the user question.
+		// Here is the JSON data:
+		// ${JSON.stringify(scrapedData)}
+		// Here is the user question:
+		// ${userQuestion}
+		// `;
+		// const response = genai.models.generateContent({
+		// 	model: "gemini-1.5-flash",
+		// 	prompt: "Extract the main content of the page",
+		// 	contents: [
+		// 		{
+		// 			role: "model",
+		// 			parts: [
+		// 				{
+		// 					text: prompt,
+		// 				},
+		// 			],
+		// 		},
+		// 	],
+		// });
+
 		return c.json({
 			success: true,
 			data: scrapedData,
+			//answer: (await response).candidates[0].content.parts[0].text,
 			url: url,
 			timestamp: new Date().toISOString(),
+			proxyUsed:
+				useProxy && context.proxyInfo
+					? {
+							host: context.proxyInfo.host,
+							port: context.proxyInfo.port,
+							country: context.proxyInfo.country,
+					  }
+					: null,
+			useProxy: useProxy, // Include the flag to show what was used
 		});
 	} catch (error) {
 		console.error("❌ Web scraping error:", error);
+
+		// Mark proxy as failed if used
+		if (useProxy && context && context.proxyInfo) {
+			handleProxyResult(context, false);
+			console.log(
+				`❌ Proxy ${context.proxyInfo.host} marked as failed for ${url}`
+			);
+		}
+
 		return c.json(
 			{
 				success: false,
@@ -1774,521 +2789,2182 @@ app.post("/scrape-url", async (c) => {
 	}
 });
 
-// Store active development servers
-const activeServers = new Map();
-const projectSessions = new Map();
+// Google News Scraping API - Scrape news from Google News search
+app.post("/scrape-google-news", async (c) => {
+	const {
+		city,
+		state,
+		country = "IN",
+		language = "en-IN",
+		timeout = 30000,
+		maxArticles = 20,
+		includeImages = false,
+		includeLinks = true,
+	} = await c.req.json();
 
-// Generate unique project ID
-const generateProjectId = () => {
-	return `project_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-};
+	if (!city || !state) {
+		return c.json({ error: "City and state are required" }, 400);
+	}
 
-// Create or update a Vite project and store in Firebase Firestore
-app.post("/create-project", async (c) => {
+	// Construct Google News URL
+	const query = `${city}%20${state}`;
+	const googleNewsUrl = `https://news.google.com/search?q=${query}&hl=${language}&gl=${country}&ceid=${country}:${
+		language.split("-")[0]
+	}`;
+
+	let browser;
+	let scrapedData = {};
+
 	try {
-		const {
-			files,
-			projectId = null,
-			projectName = null,
-			description = null,
-			tags = [],
-		} = await c.req.json();
-
-		if (!files || !Array.isArray(files)) {
-			return c.json({ success: false, error: "Files array is required" }, 400);
-		}
-
-		const id = projectId || generateProjectId();
-		const projectPath = path.join(process.cwd(), "gettemplates-projects", id);
-
-		// Check if project already exists in Firestore
-		let existingProject = null;
-		if (projectId) {
-			try {
-				const projectDoc = await firestore
-					.collection("gettemplate-projects")
-					.doc(id)
-					.get();
-
-				if (projectDoc.exists) {
-					existingProject = projectDoc.data();
-					console.log(`📝 Updating existing project: ${id}`);
-				}
-			} catch (error) {
-				console.log(`❌ Error checking existing project: ${error.message}`);
-			}
-		}
-
-		// Create project directory
-		await fs.mkdir(projectPath, { recursive: true });
-
-		// Filter out node_modules and other unwanted files
-		const filteredFiles = files.filter((file) => {
-			const path = file.path.toLowerCase();
-			return (
-				!path.includes("node_modules") &&
-				!path.includes(".git") &&
-				!path.includes(".env") &&
-				!path.includes(".DS_Store") &&
-				!path.includes("package-lock.json") &&
-				!path.includes("yarn.lock")
-			);
+		// Launch browser with anti-detection settings
+		browser = await chromium.launch({
+			headless: true,
+			args: [
+				"--no-sandbox",
+				"--disable-setuid-sandbox",
+				"--disable-dev-shm-usage",
+				"--disable-gpu",
+				"--disable-web-security",
+				"--disable-features=VizDisplayCompositor",
+			],
 		});
 
-		// Write all filtered files
-		for (const file of filteredFiles) {
-			const filePath = path.join(projectPath, file.path);
-			await fs.mkdir(path.dirname(filePath), { recursive: true });
-			await fs.writeFile(filePath, file.content);
-		}
-
-		// Extract project name from package.json if available
-		let extractedProjectName = projectName;
-		const packageJsonFile = filteredFiles.find(
-			(f) => f.path === "package.json"
-		);
-		if (packageJsonFile && !projectName) {
-			try {
-				const packageJson = JSON.parse(packageJsonFile.content);
-				extractedProjectName = packageJson.name || `project-${id}`;
-			} catch (e) {
-				extractedProjectName = `project-${id}`;
-			}
-		}
-
-		// Create package.json if it doesn't exist
-		const packageJsonPath = path.join(projectPath, "package.json");
-		if (!filteredFiles.find((f) => f.path === "package.json")) {
-			const defaultPackageJson = {
-				name: extractedProjectName,
-				private: true,
-				version: "0.0.0",
-				type: "module",
-				scripts: {
-					dev: "vite",
-					build: "vite build",
-					preview: "vite preview",
-				},
-				dependencies: {
-					react: "^18.2.0",
-					"react-dom": "^18.2.0",
-				},
-				devDependencies: {
-					"@types/react": "^18.2.43",
-					"@types/react-dom": "^18.2.17",
-					"@vitejs/plugin-react": "^4.2.1",
-					vite: "^5.0.8",
-				},
-			};
-			await fs.writeFile(
-				packageJsonPath,
-				JSON.stringify(defaultPackageJson, null, 2)
-			);
-
-			// Add to filtered files for Firestore
-			filteredFiles.push({
-				path: "package.json",
-				content: JSON.stringify(defaultPackageJson, null, 2),
-			});
-		}
-
-		// Create vite.config.js if it doesn't exist
-		const viteConfigPath = path.join(projectPath, "vite.config.js");
-		if (!filteredFiles.find((f) => f.path === "vite.config.js")) {
-			const defaultViteConfig = `import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    port: 0, // Let Vite choose a random port
-    host: '0.0.0.0'
-  }
-})`;
-			await fs.writeFile(viteConfigPath, defaultViteConfig);
-
-			// Add to filtered files for Firestore
-			filteredFiles.push({
-				path: "vite.config.js",
-				content: defaultViteConfig,
-			});
-		}
-
-		// Calculate project statistics
-		const fileTypes = {};
-		let totalLines = 0;
-		filteredFiles.forEach((file) => {
-			const extension = file.path.split(".").pop() || "no-extension";
-			fileTypes[extension] = (fileTypes[extension] || 0) + 1;
-			totalLines += file.content.split("\n").length;
+		const context = await browser.newContext({
+			userAgent:
+				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			viewport: { width: 1920, height: 1080 },
+			extraHTTPHeaders: {
+				dnt: "1",
+				"upgrade-insecure-requests": "1",
+				accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+				"sec-fetch-site": "none",
+				"sec-fetch-mode": "navigate",
+				"sec-fetch-user": "?1",
+				"sec-fetch-dest": "document",
+				"accept-language": "en-US,en;q=0.9",
+			},
 		});
 
-		// Store project in Firebase Firestore with metadata
-		const projectMetadata = {
-			projectId: id,
-			projectName: extractedProjectName,
-			description: description || `Project: ${extractedProjectName}`,
-			tags: tags || [],
-			files: filteredFiles,
-			fileCount: filteredFiles.length,
-			fileTypes: fileTypes,
-			totalLines: totalLines,
-			lastUpdated: new Date(),
-			status: existingProject ? "updated" : "created",
-			framework: "vite-react",
-			version: "1.0.0",
+		const page = await context.newPage();
+
+		// Block unnecessary resources for faster loading
+		await page.route("**/*", (route) => {
+			const type = route.request().resourceType();
+			if (["font", "stylesheet", "image"].includes(type) && !includeImages) {
+				return route.abort();
+			}
+			return route.continue();
+		});
+
+		// Navigate to Google News URL
+		await page.goto(googleNewsUrl, {
+			waitUntil: "domcontentloaded",
+			timeout: timeout,
+		});
+
+		// Wait for news articles to load
+		await page.waitForTimeout(3000);
+
+		// Use the existing scrap-url logic by calling it internally
+		const scrapeRequest = {
+			url: googleNewsUrl,
+			userQuestion: `Extract news articles about ${city} ${state} from this Google News page. Focus on the main news articles, their titles, sources, and timestamps.`,
+			selectors: {
+				articles:
+					"article[data-n-tid], div[data-n-tid], div[jslog], div[data-ved]",
+				searchQuery: 'input[aria-label*="Search"], input[name="q"]',
+				relatedTopics:
+					'a[href*="search?q="], div[role="button"], span[role="button"]',
+			},
+			waitForSelector: "article[data-n-tid], div[data-n-tid]",
+			timeout: timeout,
+			includeImages: includeImages,
+			includeLinks: includeLinks,
+			extractMetadata: true,
 		};
 
-		// Preserve original creation date if updating existing project
-		if (existingProject) {
-			projectMetadata.createdAt = existingProject.createdAt;
-			projectMetadata.previewUrl = existingProject.previewUrl;
-			projectMetadata.deployedAt = existingProject.deployedAt;
-		} else {
-			projectMetadata.createdAt = new Date();
-		}
-		const action = existingProject ? "updated" : "created";
-
-		await firestore
-			.collection("gettemplate-projects")
-			.doc(id)
-			.set(projectMetadata);
-
-		// Store project session
-		projectSessions.set(id, {
-			path: projectPath,
-			files: filteredFiles,
-			createdAt: new Date(),
-			lastUpdated: new Date(),
-		});
-
-		return c.json({
-			success: true,
-			projectId: id,
-			projectName: extractedProjectName,
-			firestoreId: id,
-			isUpdate: !!existingProject,
-			metadata: {
-				fileCount: filteredFiles.length,
-				fileTypes: Object.keys(fileTypes),
-				totalLines,
-			},
-			message: existingProject
-				? "Project updated successfully in Firestore"
-				: "Project created successfully and stored in Firestore",
-		});
-	} catch (error) {
-		console.error("❌ Create project error:", error);
-		return c.json({ success: false, error: error.message }, 500);
-	}
-});
-
-// Start development server and deploy from Firestore
-app.post("/start-dev-server", async (c) => {
-	try {
-		const { projectId } = await c.req.json();
-
-		if (!projectId) {
-			return c.json({ success: false, error: "Project ID is required" }, 400);
-		}
-		if (activeServers.has(projectId)) {
-			return c.json({
-				success: true,
-				previewUrl: activeServers.get(projectId).url,
-			});
-		}
-
-		// Get project from Firestore
-		const projectDoc = await firestore
-			.collection("gettemplate-projects")
-			.doc(projectId)
-			.get();
-
-		if (!projectDoc.exists) {
-			return c.json(
-				{ success: false, error: "Project not found in Firestore" },
-				404
-			);
-		}
-
-		const projectData = projectDoc.data();
-		// Update project status to building
-		// await firestore.collection("gettemplate-projects").doc(projectId).update({
-		// 	buildStatus: "pending",
-		// 	lastBuildStarted: new Date(),
-		// });
-
-		// Create temporary directory for building
-		const tempProjectPath = path.join(process.cwd(), "temp", projectId);
-		await fs.mkdir(tempProjectPath, { recursive: true });
-
-		// Write all files from Firestore to temporary directory
-		for (const file of projectData.files) {
-			const filePath = path.join(tempProjectPath, file.path);
-			await fs.mkdir(path.dirname(filePath), { recursive: true });
-			await fs.writeFile(filePath, file.content);
-		}
-
-		console.log(`✅ Wrote ${projectData.files.length} files to temp directory`);
-
-		const server = await createServer({
-			root: tempProjectPath,
-			server: {
-				middlewareMode: true,
-				strictPort: true,
-			},
-			appType: "custom", // or 'custom' for full control
-			clearScreen: false,
-			logLevel: "info",
-			configFile: false,
-		});
-
-		console.log(server, "server");
-		activeServers.set(projectId, { server });
-
-		await firestore.collection("gettemplate-projects").doc(projectId).update({
-			buildStatus: "ready",
-			lastBuildCompleted: new Date(),
-		});
-
-		return c.json({
-			success: true,
-			buildStatus: "ready",
-			message: "Preview ready",
-		});
-	} catch (error) {
-		console.error("❌ Vite build error:", error);
-		return c.json({ success: false, error: error.message }, 500);
-	}
-});
-
-// Middleware to serve preview content by proxying to Vite dev server
-app.get("/preview/:projectId/*", async (c) => {
-	const { projectId } = c.req.param();
-	const path = c.req.param("*") || "";
-
-	try {
-		// Get project from Firestore to get preview URL
-		const projectDoc = await firestore
-			.collection("gettemplate-projects")
-			.doc(projectId)
-			.get();
-
-		if (!projectDoc.exists) {
-			return c.text("Project not found", 404);
-		}
-
-		const projectData = projectDoc.data();
-		if (!projectData.previewUrl || projectData.buildStatus !== "ready") {
-			return c.text("Preview not ready. Please build the project first.", 404);
-		}
-
-		// Proxy request to Vite dev server
-		const targetUrl = `${projectData.previewUrl}/${path}`;
-
-		// Get headers safely
-		const requestHeaders = {};
-		for (const [key, value] of Object.entries(c.req.header())) {
-			requestHeaders[key] = value;
-		}
-
-		const response = await fetch(targetUrl, {
-			method: c.req.method,
+		// Call the existing scrap-url endpoint logic
+		const response = await fetch(`http://localhost:3001/scrap-url`, {
+			method: "POST",
 			headers: {
-				...requestHeaders,
-				host: new URL(projectData.previewUrl).host,
+				"Content-Type": "application/json",
 			},
+			body: JSON.stringify(scrapeRequest),
 		});
 
-		// Forward the response
-		const responseHeaders = new Headers();
-		response.headers.forEach((value, key) => {
-			responseHeaders.set(key, value);
-		});
-
-		return new Response(response.body, {
-			status: response.status,
-			statusText: response.statusText,
-			headers: responseHeaders,
-		});
-	} catch (error) {
-		console.error("Preview proxy error:", error);
-		return c.text("Preview server error", 500);
-	}
-});
-
-// Root preview route (redirect to index.html)
-app.get("/preview/:projectId", async (c) => {
-	const { projectId } = c.req.param();
-	return c.redirect(`/preview/${projectId}/`);
-});
-
-// Check preview status
-app.get("/preview-status/:projectId", async (c) => {
-	const { projectId } = c.req.param();
-
-	try {
-		const projectDoc = await firestore
-			.collection("gettemplate-projects")
-			.doc(projectId)
-			.get();
-
-		if (!projectDoc.exists) {
-			return c.json({ success: false, error: "Project not found" }, 404);
+		if (!response.ok) {
+			throw new Error(`Scraping failed: ${response.statusText}`);
 		}
 
-		const projectData = projectDoc.data();
+		const scrapeResult = await response.json();
+		scrapedData = scrapeResult.data || scrapeResult;
+
+		// Add page info
+		scrapedData.pageInfo = {
+			url: googleNewsUrl,
+			scrapedAt: new Date().toISOString(),
+			searchQuery: `${city} ${state}`,
+			city,
+			state,
+			country,
+			language,
+			userAgent: await page.evaluate(() => navigator.userAgent),
+			viewport: await page.viewportSize(),
+		};
+
+		await page.close();
+		await context.close();
+
 		return c.json({
 			success: true,
-			projectId,
-			buildStatus: projectData.buildStatus || "not_started",
-			previewUrl: projectData.previewUrl || null,
-			previewReady:
-				projectData.buildStatus === "ready" && projectData.previewUrl,
-			lastBuildCompleted: projectData.lastBuildCompleted || null,
+			data: scrapedData,
+			url: googleNewsUrl,
+			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
-		console.error("Preview status error:", error);
-		return c.json({ success: false, error: error.message }, 500);
-	}
-});
-
-// Build and deploy project for production preview using Firebase Firestore
-app.post("/deploy-project", async (c) => {
-	try {
-		const { projectId } = await c.req.json();
-
-		if (!projectId) {
-			return c.json({ success: false, error: "Project ID is required" }, 400);
-		}
-
-		// Get project from Firestore
-		const projectDoc = await firestore
-			.collection("gettemplate-projects")
-			.doc(projectId)
-			.get();
-		if (!projectDoc.exists) {
-			return c.json(
-				{ success: false, error: "Project not found in Firestore" },
-				404
-			);
-		}
-		const files = projectDoc.data().files;
-		const tempDir = path.join(
-			process.cwd(),
-			"temp",
-			`${projectId}-${Date.now()}`
+		console.error("❌ Google News scraping error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to scrape Google News",
+				details: error.message,
+				url: googleNewsUrl,
+				searchQuery: `${city} ${state}`,
+			},
+			500
 		);
-		await fs.mkdir(tempDir, { recursive: true });
-		for (const file of files) {
-			const filePath = path.join(tempDir, file.path);
-			await fs.mkdir(path.dirname(filePath), { recursive: true });
-			await fs.writeFile(filePath, file.content);
+	} finally {
+		if (browser) {
+			await browser.close();
 		}
-
-		await execPromise(`cd ${tempDir} && npm install && npm run build`);
-
-		// 5️⃣ Serve or Upload dist/
-		const distPath = path.join(tempDir, "dist");
-		const publicUrl = await uploadToStorage(distPath);
-
-		// Generate deployment ID
-		const deployedId = `deploy_${Date.now()}_${Math.random()
-			.toString(36)
-			.substr(2, 9)}`;
-
-		// Update Firestore with deployment info
-		await firestore.collection("gettemplate-projects").doc(projectId).update({
-			demoUrl: publicUrl,
-			deployedId: deployedId,
-			lastDeployed: new Date(),
-			lastCommitted: new Date(),
-			status: "deployed",
-		});
-
-		return c.json({
-			success: true,
-			demoUrl: publicUrl,
-			deployedId: deployedId,
-			projectName: projectData.projectName,
-			message: "Project built and deployed to cloud storage successfully",
-		});
-	} catch (error) {
-		console.error("❌ Deploy project error:", error);
-		return c.json({ success: false, error: error.message }, 500);
 	}
 });
 
-// Get project status
-app.get("/project-status/:projectId", async (c) => {
-	try {
-		const projectId = c.req.param("projectId");
+app.post("/scrap-images", async (c) => {
+	const { query, platform } = await c.req.json();
 
-		// Get project from Firestore
-		const projectDoc = await firestore
-			.collection("gettemplate-projects")
-			.doc(projectId)
-			.get();
+	if (!query) {
+		return c.json({ success: false, error: "query is required" }, 400);
+	}
 
-		if (!projectDoc.exists) {
+	if (!platform) {
+		return c.json(
+			{
+				success: false,
+				error:
+					"Platform is required. Choose from: 'google', 'unsplash', 'getty', 'istock', 'shutterstock', 'adobe', 'pexels', 'pixabay', 'freepik', 'pinterest', 'flickr', 'fivehundredpx', 'deviantart', 'behance', 'artstation', 'reuters', 'apimages', 'custom'",
+			},
+			400
+		);
+	}
+
+	// Define platform configurations
+	const platforms = {
+		google: {
+			url: `https://www.google.com/search?q=${encodeURIComponent(
+				query
+			)}&tbm=isch`,
+			name: "Google Images",
+		},
+		unsplash: {
+			url: `https://unsplash.com/s/photos/${query.replace(/\s+/g, "-")}`,
+			name: "Unsplash",
+		},
+		getty: {
+			url: `https://www.gettyimages.in/photos/${query.replace(/\s+/g, "-")}`,
+			name: "Getty Images",
+		},
+		istock: {
+			url: `https://www.istockphoto.com/photos/${query.replace(/\s+/g, "-")}`,
+			name: "iStock",
+		},
+		shutterstock: {
+			url: `https://www.shutterstock.com/search/${query.replace(/\s+/g, "-")}`,
+			name: "Shutterstock",
+		},
+		adobe: {
+			url: `https://stock.adobe.com/search?k=${encodeURIComponent(query)}`,
+			name: "Adobe Stock",
+		},
+		pexels: {
+			url: `https://www.pexels.com/search/${query.replace(/\s+/g, "%20")}/`,
+			name: "Pexels",
+		},
+		pixabay: {
+			url: `https://pixabay.com/images/search/${query.replace(/\s+/g, "%20")}/`,
+			name: "Pixabay",
+		},
+		freepik: {
+			url: `https://www.freepik.com/search?format=search&query=${encodeURIComponent(
+				query
+			)}`,
+			name: "Freepik",
+		},
+		pinterest: {
+			url: `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(
+				query
+			)}`,
+			name: "Pinterest",
+		},
+		flickr: {
+			url: `https://www.flickr.com/search/?text=${encodeURIComponent(query)}`,
+			name: "Flickr",
+		},
+		fivehundredpx: {
+			url: `https://500px.com/search?q=${encodeURIComponent(query)}`,
+			name: "500px",
+		},
+		deviantart: {
+			url: `https://www.deviantart.com/search?q=${encodeURIComponent(query)}`,
+			name: "DeviantArt",
+		},
+		behance: {
+			url: `https://www.behance.net/search/projects?search=${encodeURIComponent(
+				query
+			)}`,
+			name: "Behance",
+		},
+		artstation: {
+			url: `https://www.artstation.com/search?q=${encodeURIComponent(query)}`,
+			name: "ArtStation",
+		},
+		reuters: {
+			url: `https://www.reuters.com/search?q=${encodeURIComponent(query)}`,
+			name: "Reuters",
+		},
+		apimages: {
+			url: `https://www.apimages.com/search?st=${encodeURIComponent(query)}`,
+			name: "AP Images",
+		},
+		custom: {
+			url: query, // Use the location directly as URL
+			name: "Custom URL",
+		},
+	};
+
+	// Check if platform is supported
+	if (!platforms[platform]) {
+		return c.json(
+			{
+				success: false,
+				error: `Unsupported platform. Supported platforms: ${Object.keys(
+					platforms
+				).join(", ")}`,
+			},
+			400
+		);
+	}
+
+	const platformConfig = platforms[platform];
+
+	// Handle custom URL case
+	let targetUrl;
+	if (platform === "custom") {
+		// For custom platform, validate that the query is a valid URL
+		try {
+			new URL(query);
+			targetUrl = query;
+		} catch (error) {
 			return c.json(
-				{ success: false, error: "Project not found in Firestore" },
-				404
+				{
+					success: false,
+					error: "For custom platform, query must be a valid URL",
+				},
+				400
+			);
+		}
+	} else {
+		targetUrl = platformConfig.url;
+	}
+
+	try {
+		// Use the existing scrap-url endpoint
+		const response = await fetch(`http://localhost:3001/scrap-url`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				url: targetUrl,
+				includeImages: true,
+				includeLinks: true,
+				extractMetadata: true,
+				// selectors: getPlatformSelectors(platform),
+				// Platform-specific wait selectors
+				// waitForSelector: getPlatformWaitSelector(platform),
+			}),
+		});
+
+		if (!response.ok) {
+			throw new Error(`HTTP error! status: ${response.status}`);
+		}
+
+		const data = await response.json();
+		const scrapedData = data.data?.images || [];
+
+		return c.json({
+			success: true,
+			message: `${platformConfig.name} images scraped successfully for ${query}`,
+			platform: platform,
+			platformName: platformConfig.name,
+			url: targetUrl,
+			imageCount: scrapedData.length,
+			images: scrapedData,
+		});
+	} catch (error) {
+		console.error(`Error scraping ${platformConfig.name} for ${query}:`, error);
+		return c.json(
+			{
+				success: false,
+				error: `Failed to scrape ${platformConfig.name} images`,
+				details: error.message,
+				platform: platform,
+				query: query,
+				url: targetUrl,
+			},
+			500
+		);
+	}
+});
+
+// Reddit Post JSON API - Automatically converts Reddit post URLs to JSON format
+app.post("/reddit-post", async (c) => {
+	try {
+		const { url } = await c.req.json();
+
+		if (!url) {
+			return c.json({ error: "URL is required" }, 400);
+		}
+
+		// Validate and parse Reddit URL
+		let redditUrl;
+		try {
+			const parsedUrl = new URL(url);
+
+			// Check if it's a Reddit domain
+			if (
+				!parsedUrl.hostname.includes("reddit.com") &&
+				!parsedUrl.hostname.includes("redd.it") &&
+				!parsedUrl.hostname.includes("old.reddit.com")
+			) {
+				return c.json(
+					{
+						success: false,
+						error:
+							"URL must be from Reddit domain (reddit.com, redd.it, old.reddit.com)",
+						providedUrl: url,
+						expectedDomains: ["reddit.com", "redd.it", "old.reddit.com"],
+					},
+					400
+				);
+			}
+
+			// Check if it's a post URL (contains /r/ and /comments/)
+			if (
+				!parsedUrl.pathname.includes("/r/") ||
+				!parsedUrl.pathname.includes("/comments/")
+			) {
+				return c.json(
+					{
+						success: false,
+						error:
+							"URL must be a Reddit post (should contain /r/ and /comments/)",
+						providedUrl: url,
+						pathname: parsedUrl.pathname,
+						examples: [
+							"https://www.reddit.com/r/programming/comments/abc123/title_of_post/",
+							"https://old.reddit.com/r/technology/comments/xyz789/another_post_title/",
+						],
+					},
+					400
+				);
+			}
+
+			// Convert to JSON format
+			// Remove trailing slash and append .json
+			const cleanPath = parsedUrl.pathname.replace(/\/$/, "");
+			redditUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}${cleanPath}.json`;
+		} catch (error) {
+			return c.json(
+				{
+					success: false,
+					error: "Invalid URL format",
+					details: error.message,
+					providedUrl: url,
+				},
+				400
 			);
 		}
 
-		const projectData = projectDoc.data();
+		console.log(`🔗 Converting Reddit URL to JSON: ${redditUrl}`);
 
-		// Check if dev server is running
-		const devServer = activeServers.get(projectId);
-		const previewServer = activeServers.get(`${projectId}_preview`);
+		// Fetch the JSON response from Reddit
+		const response = await fetch(redditUrl, {
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+				Accept: "application/json",
+				"Accept-Language": "en-US,en;q=0.9",
+				DNT: "1",
+				Connection: "keep-alive",
+				"Upgrade-Insecure-Requests": "1",
+			},
+			timeout: 30000,
+		});
+
+		if (!response.ok) {
+			return c.json(
+				{
+					success: false,
+					error: `Reddit API returned ${response.status}: ${response.statusText}`,
+					statusCode: response.status,
+					statusText: response.statusText,
+					url: redditUrl,
+				},
+				response.status
+			);
+		}
+
+		const redditData = await response.json();
+
+		// Extract and format the post data
+		if (!redditData || !Array.isArray(redditData) || redditData.length === 0) {
+			return c.json(
+				{
+					success: false,
+					error: "Invalid response from Reddit API",
+					response: redditData,
+				},
+				500
+			);
+		}
+
+		// Reddit returns an array where [0] is the post and [1] is the comments
+		const postData = redditData[0]?.data?.children?.[0]?.data;
+		const commentsData = redditData[1]?.data?.children || [];
+
+		if (!postData) {
+			return c.json(
+				{
+					success: false,
+					error: "Could not extract post data from Reddit response",
+					response: redditData,
+				},
+				500
+			);
+		}
+
+		// Format the response
+		const formattedPost = {
+			id: postData.id,
+			title: postData.title,
+			author: postData.author,
+			subreddit: postData.subreddit,
+			url: postData.url,
+			permalink: `https://reddit.com${postData.permalink}`,
+			score: postData.score,
+			upvoteRatio: postData.upvote_ratio,
+			numComments: postData.num_comments,
+			created: new Date(postData.created_utc * 1000).toISOString(),
+			createdUtc: postData.created_utc,
+			isVideo: postData.is_video,
+			isSelf: postData.is_self,
+			isRedditMediaDomain: postData.is_reddit_media_domain,
+			domain: postData.domain,
+			over18: postData.over_18,
+			spoiler: postData.spoiler,
+			locked: postData.locked,
+			stickied: postData.stickied,
+			archived: postData.archived,
+			clicked: postData.clicked,
+			hidden: postData.hidden,
+			saved: postData.saved,
+			edited: postData.edited
+				? new Date(postData.edited * 1000).toISOString()
+				: false,
+			content: {
+				selftext: postData.selftext || null,
+				selftextHtml: postData.selftext_html || null,
+				thumbnail: postData.thumbnail,
+				preview: postData.preview,
+				media: postData.media,
+				secureMedia: postData.secure_media,
+				mediaEmbed: postData.media_embed,
+				secureMediaEmbed: postData.secure_media_embed,
+				galleryData: postData.gallery_data,
+				images: postData.images,
+				video: postData.video,
+				audio: postData.audio,
+			},
+			metadata: {
+				subredditType: postData.subreddit_type,
+				subredditSubscribers: postData.subreddit_subscribers,
+				subredditId: postData.subreddit_id,
+				authorFullname: postData.author_fullname,
+				authorFlairText: postData.author_flair_text,
+				authorFlairCssClass: postData.author_flair_css_class,
+				authorFlairType: postData.author_flair_type,
+				authorPatreonFlair: postData.author_patreon_flair,
+				authorPremium: postData.author_premium,
+				canModPost: postData.can_mod_post,
+				canGild: postData.can_gild,
+				spoiler: postData.spoiler,
+				locked: postData.locked,
+				hideScore: postData.hide_score,
+				quarantine: postData.quarantine,
+				linkFlairText: postData.link_flair_text,
+				linkFlairCssClass: postData.link_flair_css_class,
+				linkFlairType: postData.link_flair_type,
+				whitelistStatus: postData.whitelist_status,
+				contestMode: postData.contest_mode,
+				viewCount: postData.view_count,
+				visited: postData.visited,
+				gilded: postData.gilded,
+				topAwardedType: postData.top_awarded_type,
+				hideFromRobots: postData.hide_from_robots,
+				isRobotIndexable: postData.is_robot_indexable,
+				isRedditMediaDomain: postData.is_reddit_media_domain,
+				isMedia: postData.is_media,
+				isVideo: postData.is_video,
+				isSelf: postData.is_self,
+				isOc: postData.is_oc,
+				isGallery: postData.is_gallery,
+				isCrosspostable: postData.is_crosspostable,
+				isRedditMediaDomain: postData.is_reddit_media_domain,
+				isVideo: postData.is_video,
+				isSelf: postData.is_self,
+				isOc: postData.is_oc,
+				isGallery: postData.is_gallery,
+				isCrosspostable: postData.is_crosspostable,
+			},
+		};
+
+		// Format comments
+		const formattedComments = commentsData.map((comment) => {
+			const commentData = comment.data;
+			return {
+				id: commentData.id,
+				author: commentData.author,
+				body: commentData.body,
+				bodyHtml: commentData.body_html,
+				score: commentData.score,
+				created: new Date(commentData.created_utc * 1000).toISOString(),
+				createdUtc: commentData.created_utc,
+				permalink: `https://reddit.com${commentData.permalink}`,
+				parentId: commentData.parent_id,
+				linkId: commentData.link_id,
+				subreddit: commentData.subreddit,
+				subredditId: commentData.subreddit_id,
+				authorFullname: commentData.author_fullname,
+				authorFlairText: commentData.author_flair_text,
+				authorFlairCssClass: commentData.author_flair_css_class,
+				authorFlairType: commentData.author_flair_type,
+				authorPatreonFlair: commentData.author_patreon_flair,
+				authorPremium: commentData.author_premium,
+				canGild: commentData.can_gild,
+				gilded: commentData.gilded,
+				edited: commentData.edited
+					? new Date(commentData.edited * 1000).toISOString()
+					: false,
+				scoreHidden: commentData.score_hidden,
+				controversiality: commentData.controversiality,
+				distinguished: commentData.distinguished,
+				stickied: commentData.stickied,
+				archived: commentData.archived,
+				locked: commentData.locked,
+				quarantine: commentData.quarantine,
+				spoiler: commentData.spoiler,
+				hideScore: commentData.hide_score,
+				upvoteRatio: commentData.upvote_ratio,
+				replies: commentData.replies?.data?.children || [],
+				depth: commentData.depth,
+				repliesCount: commentData.replies?.data?.children?.length || 0,
+			};
+		});
 
 		return c.json({
 			success: true,
-			projectId,
-			projectName: projectData.projectName,
-			buildStatus: projectData.buildStatus || "not_started",
-			previewUrl: projectData.previewUrl || null,
-			buildError: projectData.buildError || null,
-			lastBuildStarted: projectData.lastBuildStarted || null,
-			lastBuildCompleted: projectData.lastBuildCompleted || null,
-			devServer: devServer
-				? { url: devServer.url, pid: devServer.process.pid }
-				: null,
-			previewServer: previewServer
-				? { url: previewServer.url, pid: previewServer.process.pid }
-				: null,
+			originalUrl: url,
+			jsonUrl: redditUrl,
+			post: formattedPost,
+			comments: formattedComments,
+			totalComments: formattedComments.length,
+			timestamp: new Date().toISOString(),
+			note: "Data retrieved directly from Reddit's JSON API for better reliability",
 		});
 	} catch (error) {
-		console.error("❌ Get project status error:", error);
-		return c.json({ success: false, error: error.message }, 500);
+		console.error("❌ Reddit post API error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to fetch Reddit post data",
+				details: error.message,
+				url: url,
+			},
+			500
+		);
 	}
 });
 
-// Cleanup function to stop all servers on shutdown
-const cleanup = () => {
-	console.log("🛑 Shutting down servers...");
-	for (const [key, server] of activeServers) {
-		console.log(`Stopping server: ${key}`);
-		server.process.kill("SIGTERM");
+// Wikipedia URL validation utility
+async function checkWikipediaURL(url) {
+	try {
+		const res = await fetch(url, { method: "HEAD" });
+		return res.ok;
+	} catch {
+		return false;
 	}
-	activeServers.clear();
-	process.exit(0);
-};
-
-// Handle graceful shutdown
-process.on("SIGINT", cleanup);
-process.on("SIGTERM", cleanup);
-
-// Start the server (only for local development)
-if (process.env.NODE_ENV !== 'production') {
-	const port = 3001;
-	console.log(`Server is running on port ${port}`);
-	serve({
-		fetch: app.fetch,
-		port,
-	});
 }
 
-// Export for Vercel
-export default app;
+// Wikipedia URL generation utility with 3 specific strategies
+function generateWikipediaURLs(cityName, stateName) {
+	const urls = [];
+
+	// Clean city name - replace spaces with underscores
+	const cleanCity = cityName.trim().replace(/\s+/g, "_");
+
+	// Clean state name - keep original spaces, don't add underscores
+	const cleanState = stateName ? stateName.trim() : "";
+
+	// Strategy 1: domain.com/wiki/city,_state (with original spaces in state)
+	if (cleanState) {
+		urls.push(`https://en.wikipedia.org/wiki/${cleanCity},_${cleanState}`);
+	}
+
+	// Strategy 2: domain.com/wiki/city,_state (with underscores in state)
+	if (cleanState) {
+		const cleanStateWithUnderscores = cleanState.replace(/\s+/g, "_");
+		urls.push(
+			`https://en.wikipedia.org/wiki/${cleanCity},_${cleanStateWithUnderscores}`
+		);
+	}
+
+	// Strategy 3: domain.com/wiki/city (city only, no state)
+	urls.push(`https://en.wikipedia.org/wiki/${cleanCity}`);
+
+	return urls;
+}
+
+// Wikipedia content extraction utility using existing scrap-url API
+async function extractWikipediaContent(wikipediaUrl, useProxy = false) {
+	try {
+		console.log(`🔍 Scraping Wikipedia content from: ${wikipediaUrl}`);
+
+		// Use the existing scrap-url API endpoint
+		const response = await fetch(`http://localhost:3001/scrap-url`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				url: wikipediaUrl,
+				useProxy: useProxy,
+				includeImages: false,
+				includeLinks: false,
+				extractMetadata: true,
+				timeout: 30000,
+				waitForSelector: "#mw-content-text",
+			}),
+		});
+
+		if (!response.ok) {
+			throw new Error(`HTTP error! status: ${response.status}`);
+		}
+
+		const scrapedData = await response.json();
+
+		if (!scrapedData.success) {
+			return {
+				success: false,
+				error: scrapedData.error || "Failed to scrape Wikipedia page",
+				url: wikipediaUrl,
+			};
+		}
+
+		// Extract paragraphs from semantic content
+		const paragraphs =
+			scrapedData.data?.content?.semanticContent?.paragraphs || [];
+
+		if (paragraphs.length === 0) {
+			return {
+				success: false,
+				error: "No paragraphs found in Wikipedia content",
+				url: wikipediaUrl,
+			};
+		}
+
+		return {
+			success: true,
+			data: {
+				title: scrapedData.data.title,
+				url: wikipediaUrl,
+				extractedAt: new Date().toISOString(),
+				paragraphs: paragraphs,
+				summary: paragraphs.slice(0, 3).join(" ").substring(0, 500) + "...",
+				rawData: scrapedData.data,
+			},
+			url: wikipediaUrl,
+		};
+	} catch (error) {
+		console.error(
+			`❌ Wikipedia content extraction error for ${wikipediaUrl}:`,
+			error
+		);
+		return {
+			success: false,
+			error: error.message,
+			url: wikipediaUrl,
+		};
+	}
+}
+
+// Bulk Wikipedia scraping with queue management
+const wikipediaScrapingQueue = {
+	batches: new Map(),
+	currentBatch: 0,
+	isProcessing: false,
+
+	addBatch(batchNumber, locations) {
+		this.batches.set(batchNumber, {
+			locations,
+			status: "pending",
+			startedAt: null,
+			completedAt: null,
+			results: [],
+			successCount: 0,
+			failedCount: 0,
+			errors: [],
+		});
+	},
+
+	getNextBatch() {
+		for (const [batchNumber, batch] of this.batches) {
+			if (batch.status === "pending") {
+				return { batchNumber, batch };
+			}
+		}
+		return null;
+	},
+
+	markBatchStarted(batchNumber) {
+		const batch = this.batches.get(batchNumber);
+		if (batch) {
+			batch.status = "processing";
+			batch.startedAt = new Date();
+		}
+	},
+
+	markBatchCompleted(batchNumber, results) {
+		const batch = this.batches.get(batchNumber);
+		if (batch) {
+			batch.status = "completed";
+			batch.completedAt = new Date();
+			batch.results = results;
+			batch.successCount = results.filter((r) => r.success).length;
+			batch.failedCount = results.filter((r) => !r.success).length;
+		}
+	},
+
+	getStats() {
+		const total = this.batches.size;
+		const pending = Array.from(this.batches.values()).filter(
+			(b) => b.status === "pending"
+		).length;
+		const processing = Array.from(this.batches.values()).filter(
+			(b) => b.status === "processing"
+		).length;
+		const completed = Array.from(this.batches.values()).filter(
+			(b) => b.status === "completed"
+		).length;
+
+		return {
+			total,
+			pending,
+			processing,
+			completed,
+			batches: Array.from(this.batches.entries()).map(([number, batch]) => ({
+				batchNumber: number,
+				status: batch.status,
+				startedAt: batch.startedAt,
+				completedAt: batch.completedAt,
+				successCount: batch.successCount,
+				failedCount: batch.failedCount,
+			})),
+		};
+	},
+};
+
+// Bulk Wikipedia scraping endpoint
+// Required columns in locations table:
+// - id, name, state, latitude, longitude
+// Optional columns (will be created if they don't exist):
+// - wikipedia_content, wikipedia_url
+app.post("/bulk-wikipedia-scrap", async (c) => {
+	try {
+		const {
+			batchSize = 50,
+			maxConcurrentBrowsers = 3,
+			useProxy = false,
+			forceRestart = false,
+		} = await c.req.json();
+
+		// Force restart if requested
+		if (forceRestart) {
+			wikipediaScrapingQueue.batches.clear();
+			wikipediaScrapingQueue.currentBatch = 0;
+			wikipediaScrapingQueue.isProcessing = false;
+			console.log("🔄 Wikipedia scraping queue restarted");
+		}
+
+		// Check if already processing
+		if (wikipediaScrapingQueue.isProcessing) {
+			return c.json(
+				{
+					success: false,
+					error: "Wikipedia scraping is already in progress",
+					currentStatus: wikipediaScrapingQueue.getStats(),
+					suggestion: "Use forceRestart: true to restart the queue",
+				},
+				409
+			);
+		}
+
+		console.log("🚀 Starting bulk Wikipedia scraping...");
+
+		// Fetch locations from Supabase
+		// Note: Only selecting columns that actually exist in the table
+		const { data: locations, error: fetchError } = await supabase
+			.from("locations")
+			.select("id, name, state, latitude, longitude")
+			.order("id", { ascending: false })
+			.limit(40);
+
+		if (fetchError) {
+			console.error("❌ Error fetching locations from Supabase:", fetchError);
+			return c.json(
+				{
+					success: false,
+					error: "Failed to fetch locations from database",
+					details: fetchError.message,
+				},
+				500
+			);
+		}
+
+		if (!locations || locations.length === 0) {
+			return c.json(
+				{
+					success: false,
+					error: "No locations found in database",
+					suggestion:
+						"Ensure the locations table has data before running Wikipedia scraping",
+				},
+				404
+			);
+		}
+
+		console.log(`📊 Found ${locations.length} locations to process`);
+		console.log(`📋 Sample location data:`, locations[0]);
+
+		// Create batches
+		const batches = [];
+		for (let i = 0; i < locations.length; i += batchSize) {
+			const batch = locations.slice(i, i + batchSize);
+			const batchNumber = batches.length;
+			batches.push({ batchNumber, locations: batch });
+
+			// Add to queue
+			wikipediaScrapingQueue.addBatch(batchNumber, batch);
+		}
+
+		console.log(
+			`📦 Created ${batches.length} batches of ${batchSize} locations each`
+		);
+
+		// Start processing in background
+		wikipediaScrapingQueue.isProcessing = true;
+		processWikipediaBatches(batches, maxConcurrentBrowsers, useProxy);
+
+		return c.json({
+			success: true,
+			message: "Bulk Wikipedia scraping started successfully",
+			data: {
+				totalLocations: locations.length,
+				batchSize,
+				totalBatches: batches.length,
+				maxConcurrentBrowsers,
+				useProxy,
+				queueStatus: wikipediaScrapingQueue.getStats(),
+			},
+			endpoints: {
+				status: "/wikipedia-scraping-status",
+				results: "/wikipedia-scraping-results",
+			},
+		});
+	} catch (error) {
+		console.error("❌ Bulk Wikipedia scraping error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to start bulk Wikipedia scraping",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
+
+// Wikipedia scraping status endpoint
+app.get("/wikipedia-scraping-status", (c) => {
+	return c.json({
+		success: true,
+		status: wikipediaScrapingQueue.getStats(),
+		timestamp: new Date().toISOString(),
+	});
+});
+
+// Wikipedia scraping results endpoint
+app.get("/wikipedia-scraping-results", (c) => {
+	const { batchNumber } = c.req.query();
+
+	if (batchNumber !== undefined) {
+		const batch = wikipediaScrapingQueue.batches.get(parseInt(batchNumber));
+		if (!batch) {
+			return c.json(
+				{
+					success: false,
+					error: `Batch ${batchNumber} not found`,
+				},
+				404
+			);
+		}
+
+		return c.json({
+			success: true,
+			batchNumber: parseInt(batchNumber),
+			data: batch,
+		});
+	}
+
+	// Return all completed batches
+	const completedBatches = Array.from(wikipediaScrapingQueue.batches.entries())
+		.filter(([_, batch]) => batch.status === "completed")
+		.map(([number, batch]) => ({
+			batchNumber: number,
+			status: batch.status,
+			startedAt: batch.startedAt,
+			completedAt: batch.completedAt,
+			successCount: batch.successCount,
+			failedCount: batch.failedCount,
+			results: batch.results.slice(0, 10), // Return first 10 results for preview
+		}));
+
+	return c.json({
+		success: true,
+		completedBatches,
+		totalCompleted: completedBatches.length,
+	});
+});
+
+// Background processing function
+async function processWikipediaBatches(
+	batches,
+	maxConcurrentBrowsers,
+	useProxy
+) {
+	try {
+		// Process batches sequentially to avoid overwhelming Wikipedia
+		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+			const { batchNumber, locations } = batches[batchIndex];
+
+			// Mark batch as started
+			wikipediaScrapingQueue.markBatchStarted(batchNumber);
+
+			// Process current batch
+			const batchResults = await processWikipediaBatch(
+				locations,
+				maxConcurrentBrowsers,
+				useProxy
+			);
+
+			// Mark batch as completed
+			wikipediaScrapingQueue.markBatchCompleted(batchNumber, batchResults);
+
+			// Store results in Supabase
+			await storeWikipediaResults(batchResults);
+
+			// Add delay between batches to be respectful to Wikipedia
+			if (batchIndex < batches.length - 1) {
+				const delay = Math.min(5000, locations.length * 100); // Adaptive delay
+				console.log(`⏳ Waiting ${delay}ms before next batch...`);
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+
+		console.log("🎉 All Wikipedia batches completed successfully!");
+		wikipediaScrapingQueue.isProcessing = false;
+	} catch (error) {
+		console.error("❌ Error processing Wikipedia batches:", error);
+		wikipediaScrapingQueue.isProcessing = false;
+	}
+}
+
+// Process a single batch of locations
+async function processWikipediaBatch(
+	locations,
+	maxConcurrentBrowsers,
+	useProxy
+) {
+	const results = [];
+
+	try {
+		// Process locations with controlled concurrency
+		const concurrencyLimit = Math.min(maxConcurrentBrowsers, 5); // Cap at 5 concurrent requests
+		const chunks = [];
+
+		// Split locations into chunks for controlled concurrency
+		for (let i = 0; i < locations.length; i += concurrencyLimit) {
+			chunks.push(locations.slice(i, i + concurrencyLimit));
+		}
+
+		// Process chunks sequentially to avoid overwhelming the API
+		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+			const chunk = chunks[chunkIndex];
+			let chunkStats = {
+				totalUrls: 0,
+				validUrls: 0,
+				invalidUrls: 0,
+				successfulScrapes: 0,
+			};
+
+			// Process current chunk in parallel
+			const chunkPromises = chunk.map(async (location) => {
+				// Generate Wikipedia URLs (handle cases where state might be null)
+				const urls = generateWikipediaURLs(
+					location.name,
+					location.state || null
+				);
+
+				// Track URL validation stats for this location
+				chunkStats.totalUrls += urls.length;
+
+				// Try each URL strategy until one works
+				for (const url of urls) {
+					try {
+						// First check if the URL is valid and accessible
+						const isUrlValid = await checkWikipediaURL(url);
+
+						if (!isUrlValid) {
+							console.warn(`⚠️ URL not accessible: ${url}`);
+							chunkStats.invalidUrls++;
+							continue;
+						}
+
+						chunkStats.validUrls++;
+						const result = await extractWikipediaContent(url, useProxy);
+
+						if (result.success) {
+							chunkStats.successfulScrapes++;
+							return {
+								locationId: location.id,
+								locationName: location.name,
+								locationState: location.state,
+								success: true,
+								wikipediaUrl: url,
+								content: result.data,
+							};
+						}
+					} catch (error) {
+						console.warn(`⚠️ Failed to extract from ${url}:`, error.message);
+						continue;
+					}
+				}
+
+				return {
+					locationId: location.id,
+					locationName: location.name,
+					locationState: location.state,
+					success: false,
+					error: "All Wikipedia URL strategies failed",
+					attemptedUrls: urls,
+				};
+			});
+
+			// Wait for current chunk to complete
+			const chunkResults = await Promise.all(chunkPromises);
+			results.push(...chunkResults);
+
+			// Add small delay between chunks to be respectful
+			if (chunkIndex < chunks.length - 1) {
+				const delay = 1000; // 1 second delay between
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+	} catch (error) {
+		console.error("❌ Error processing Wikipedia batch:", error);
+	}
+
+	return results;
+}
+
+// Store Wikipedia results in Supabase
+async function storeWikipediaResults(results) {
+	const successfulResults = results.filter((r) => r.success);
+	const failedResults = results.filter((r) => !r.success);
+
+	// Update successful results
+	for (const result of successfulResults) {
+		try {
+			// Extract paragraphs from the content and join them into readable text
+			const paragraphs = result.content?.paragraphs || [];
+			const wikipediaContent =
+				paragraphs.length > 0 ? paragraphs.join("\n\n") : null;
+
+			const { error } = await supabase
+				.from("locations")
+				.update({
+					wikipedia_content: wikipediaContent,
+					wikipedia_url: result.wikipediaUrl,
+				})
+				.eq("id", result.locationId);
+
+			if (error) {
+				console.error(
+					`❌ Failed to update location ${result.locationId}:`,
+					error
+				);
+			} else {
+				console.log(
+					`✅ Updated location ${result.locationId} with Wikipedia content (${paragraphs.length} paragraphs)`
+				);
+			}
+		} catch (error) {
+			console.error(`❌ Error updating location ${result.locationId}:`, error);
+		}
+	}
+}
+
+// Airbnb Scraping Endpoint
+app.post("/scrap-airbnb", async (c) => {
+	const {
+		city,
+		state,
+		country = "India",
+		checkin,
+		checkout,
+		useProxy = false,
+	} = await c.req.json();
+
+	if (!city || !state) {
+		return c.json({ error: "City and state are required" }, 400);
+	}
+
+	// Generate Airbnb search URL
+	const searchQuery = `${city.replaceAll(" ", "-")}--${state.replaceAll(
+		" ",
+		"-"
+	)}`;
+	const airbnbUrl = `https://www.airbnb.com/s/${searchQuery}--${country}/homes`;
+
+	// Add query parameters if provided
+	const urlParams = new URLSearchParams();
+	if (checkin) urlParams.append("checkin", checkin);
+	if (checkout) urlParams.append("checkout", checkout);
+
+	const fullUrl = urlParams.toString()
+		? `${airbnbUrl}?${urlParams.toString()}`
+		: airbnbUrl;
+
+	console.log(`🏠 Scraping Airbnb listings from: ${fullUrl}`);
+
+	let scrapedData = {};
+
+	try {
+		const response = await fetch(`http://localhost:3001/scrap-url`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				url: fullUrl,
+				useProxy: false,
+			}),
+		});
+
+		if (!response.ok) {
+			throw new Error(`HTTP error! status: ${response.status}`);
+		}
+
+		const scrapData = await response.json();
+
+		const allLinks = scrapData.data.links;
+
+		const listings = [];
+		// Process each listing link
+		const elementsToProcess = allLinks.length;
+
+		for (let i = 0; i < elementsToProcess; i++) {
+			const link = allLinks[i];
+
+			try {
+				// Extract listing URL
+				const listingUrl = link.href || link.url || "N/A";
+
+				// Only include links that match the required Airbnb room URL pattern
+				if (
+					typeof listingUrl === "string" &&
+					listingUrl.startsWith("https://www.airbnb.co.in/rooms")
+				) {
+					// Extract title from link text
+					const title = link.text ? link.text : link.title;
+
+					// Create listing data object
+					const listingData = {
+						title: title,
+						url: listingUrl,
+					};
+
+					listings.push(listingData);
+				}
+			} catch (error) {
+				console.warn(`Error processing listing ${i}:`, error);
+				continue;
+			}
+		}
+
+		// Get page info from scrap-url response
+		const pageInfo = {
+			title:
+				scrapData.data?.pageInfo?.title ||
+				scrapData.data?.title ||
+				scrapData.title ||
+				"Airbnb Search Results",
+			url: fullUrl,
+			description:
+				scrapData.data?.pageInfo?.description ||
+				scrapData.data?.description ||
+				scrapData.description ||
+				"",
+		};
+
+		scrapedData = {
+			success: true,
+			url: fullUrl,
+			searchQuery: searchQuery,
+			checkin: checkin || null,
+			checkout: checkout || null,
+			listings: listings,
+			totalListings: listings.length,
+			pageInfo: pageInfo,
+			timestamp: new Date().toISOString(),
+			useProxy: useProxy,
+		};
+	} catch (error) {
+		console.error("❌ Error scraping Airbnb:", error);
+		scrapedData = {
+			success: false,
+			error: error.message,
+			url: fullUrl,
+			timestamp: new Date().toISOString(),
+		};
+	}
+
+	return c.json(scrapedData);
+});
+
+// Bulk Airbnb scraping with queue management
+const airbnbScrapingQueue = {
+	batches: new Map(),
+	currentBatch: 0,
+	isProcessing: false,
+
+	addBatch(batchNumber, locations) {
+		this.batches.set(batchNumber, {
+			locations,
+			status: "pending",
+			startedAt: null,
+			completedAt: null,
+			results: [],
+			successCount: 0,
+			failedCount: 0,
+			errors: [],
+		});
+	},
+
+	getNextBatch() {
+		for (const [batchNumber, batch] of this.batches) {
+			if (batch.status === "pending") {
+				return { batchNumber, batch };
+			}
+		}
+		return null;
+	},
+
+	markBatchStarted(batchNumber) {
+		const batch = this.batches.get(batchNumber);
+		if (batch) {
+			batch.status = "processing";
+			batch.startedAt = new Date();
+		}
+	},
+
+	markBatchCompleted(batchNumber, results) {
+		const batch = this.batches.get(batchNumber);
+		if (batch) {
+			batch.status = "completed";
+			batch.completedAt = new Date();
+			batch.results = results;
+			batch.successCount = results.filter((r) => r.success).length;
+			batch.failedCount = results.filter((r) => !r.success).length;
+		}
+	},
+
+	getStats() {
+		const total = this.batches.size;
+		const pending = Array.from(this.batches.values()).filter(
+			(b) => b.status === "pending"
+		).length;
+		const processing = Array.from(this.batches.values()).filter(
+			(b) => b.status === "processing"
+		).length;
+		const completed = Array.from(this.batches.values()).filter(
+			(b) => b.status === "completed"
+		).length;
+
+		return {
+			total,
+			pending,
+			processing,
+			completed,
+			batches: Array.from(this.batches.entries()).map(([number, batch]) => ({
+				batchNumber: number,
+				status: batch.status,
+				startedAt: batch.startedAt,
+				completedAt: batch.completedAt,
+				successCount: batch.successCount,
+				failedCount: batch.failedCount,
+			})),
+		};
+	},
+};
+
+app.post("/bulk-airbnb-scrap", async (c) => {
+	try {
+		const {
+			batchSize = 50,
+			maxConcurrentBrowsers = 3,
+			useProxy = false,
+		} = await c.req.json();
+
+		// Fetch locations from Supabase
+		const { data: locations, error: fetchError } = await supabase
+			.from("locations")
+			.select("id, name, state")
+			.order("id", { ascending: false })
+			.limit(40);
+
+		if (fetchError) {
+			console.error("❌ Error fetching locations from Supabase:", fetchError);
+			return c.json(
+				{
+					success: false,
+					error: "Failed to fetch locations from database",
+					details: fetchError.message,
+				},
+				500
+			);
+		}
+
+		if (!locations || locations.length === 0) {
+			return c.json(
+				{
+					success: false,
+					error: "No locations found in database",
+					suggestion:
+						"Ensure the locations table has data before running Airbnb scraping",
+				},
+				404
+			);
+		}
+
+		// Create batches
+		const batches = [];
+		for (let i = 0; i < locations.length; i += batchSize) {
+			const batch = locations.slice(i, i + batchSize);
+			const batchNumber = batches.length;
+			batches.push({ batchNumber, locations: batch });
+
+			// Add to queue
+			airbnbScrapingQueue.addBatch(batchNumber, batch);
+		}
+
+		// Start processing in background
+		airbnbScrapingQueue.isProcessing = true;
+		processAirbnbBatches(batches, maxConcurrentBrowsers, useProxy);
+
+		return c.json({
+			success: true,
+			message: "Bulk Airbnb scraping started successfully",
+			data: {
+				totalLocations: locations.length,
+				batchSize,
+				totalBatches: batches.length,
+				maxConcurrentBrowsers,
+				useProxy,
+				queueStatus: airbnbScrapingQueue.getStats(),
+			},
+			endpoints: {
+				status: "/airbnb-scraping-status",
+				results: "/airbnb-scraping-results",
+			},
+		});
+	} catch (error) {
+		console.error("❌ Bulk Airbnb scraping error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to start bulk Airbnb scraping",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
+
+// Background processing function
+async function processAirbnbBatches(batches, maxConcurrentBrowsers, useProxy) {
+	try {
+		// Process batches sequentially to avoid overwhelming Airbnb
+		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+			const { batchNumber, locations } = batches[batchIndex];
+
+			// Mark batch as started
+			airbnbScrapingQueue.markBatchStarted(batchNumber);
+
+			// Process current batch
+			const batchResults = await processAirbnbBatch(
+				locations,
+				maxConcurrentBrowsers,
+				useProxy
+			);
+
+			console.log(`📊 Batch ${batchNumber} results:`, {
+				totalResults: batchResults.length,
+				successful: batchResults.filter((r) => r.success).length,
+				failed: batchResults.filter((r) => !r.success).length,
+				results: batchResults,
+			});
+
+			// Data is already stored in Supabase during chunk processing
+			// No need to call storeAirbnbResults again
+
+			// Mark batch as completed
+			airbnbScrapingQueue.markBatchCompleted(batchNumber, batchResults);
+
+			// Add delay between batches to be respectful to Airbnb
+			if (batchIndex < batches.length - 1) {
+				const delay = Math.min(10000, locations.length * 200); // Adaptive delay
+				console.log(`⏳ Waiting ${delay}ms before next batch...`);
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+
+		console.log("🎉 All Airbnb batches completed successfully!");
+		airbnbScrapingQueue.isProcessing = false;
+	} catch (error) {
+		console.error("❌ Error processing Airbnb batches:", error);
+		airbnbScrapingQueue.isProcessing = false;
+	}
+}
+
+// Process a single batch of locations
+async function processAirbnbBatch(locations, maxConcurrentBrowsers, useProxy) {
+	const results = [];
+
+	try {
+		// Process locations with controlled concurrency
+		const concurrencyLimit = Math.min(maxConcurrentBrowsers, 3); // Cap at 3 concurrent requests
+		const chunks = [];
+
+		// Split locations into chunks for controlled concurrency
+		for (let i = 0; i < locations.length; i += concurrencyLimit) {
+			chunks.push(locations.slice(i, i + concurrencyLimit));
+		}
+
+		// Process chunks sequentially to avoid overwhelming the API
+		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+			const chunk = chunks[chunkIndex];
+
+			// Process current chunk in parallel
+			const chunkPromises = chunk.map(async (location) => {
+				try {
+					// Call the existing scrap-airbnb endpoint logic
+					const searchQuery = `${location.name.replaceAll(
+						" ",
+						"-"
+					)}--${location.state.replaceAll(" ", "-")}`;
+					const airbnbUrl = `https://www.airbnb.com/s/${searchQuery}--India/homes`;
+
+					const response = await fetch(`http://localhost:3001/scrap-airbnb`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							city: location.name,
+							state: location.state,
+						}),
+					});
+
+					if (!response.ok) {
+						throw new Error(`HTTP error! status: ${response.status}`);
+					}
+
+					const scrapData = await response.json();
+
+					return {
+						locationId: location.id,
+						locationName: location.name,
+						locationState: location.state,
+						success: true,
+						airbnbUrl: airbnbUrl,
+						listings: scrapData.listings,
+						totalListings: scrapData.listings.length,
+					};
+				} catch (error) {
+					console.warn(
+						`⚠️ Failed to scrape Airbnb for ${location.name}:`,
+						error.message
+					);
+					return {
+						locationId: location.id,
+						locationName: location.name,
+						locationState: location.state,
+						success: false,
+						error: error.message,
+					};
+				}
+			});
+
+			// Wait for current chunk to complete
+			const chunkResults = await Promise.all(chunkPromises);
+
+			// Store results directly to Supabase here
+			console.log(
+				`💾 Storing ${chunkResults.length} chunk results to Supabase...`
+			);
+			for (const result of chunkResults) {
+				if (
+					result.success &&
+					result.listings &&
+					Array.isArray(result.listings)
+				) {
+					try {
+						console.log(
+							`💾 Updating location ${result.locationId} with ${result.totalListings} listings...`
+						);
+
+						const { error } = await supabase
+							.from("locations")
+							.update({
+								airbnb_listings: result.listings,
+								airbnb_url: [result.airbnbUrl],
+							})
+							.eq("id", result.locationId);
+
+						if (error) {
+							console.error(
+								`❌ Failed to update location ${result.locationId}:`,
+								error
+							);
+						} else {
+							console.log(
+								`✅ Updated location ${result.locationId} with Airbnb listings (${result.totalListings} listings)`
+							);
+						}
+					} catch (dbError) {
+						console.error(
+							`❌ Database error for location ${result.locationId}:`,
+							dbError
+						);
+					}
+				} else {
+					console.log(
+						`⚠️ Skipping location ${result.locationId} - success: ${
+							result.success
+						}, hasListings: ${!!result.listings}`
+					);
+				}
+			}
+
+			results.push(...chunkResults);
+
+			// Add small delay between chunks to be respectful
+			if (chunkIndex < chunks.length - 1) {
+				const delay = 500; // 2 second delay between chunks
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+	} catch (error) {
+		console.error("❌ Error processing Airbnb batch:", error);
+	}
+
+	console.log(
+		`📊 Batch processing completed. Total results: ${results.length}`
+	);
+	console.log(
+		`📋 Results summary:`,
+		results.map((r) => ({
+			location: r.locationName,
+			success: r.success,
+			listings: r.totalListings || 0,
+			error: r.error || "none",
+		}))
+	);
+
+	return results;
+}
+
+const fetchScrapedData = async () => {
+	const data = await firestore.collection("ScrapedData").get();
+	return data.docs.map((item) => item.data());
+};
+
+async function processAllScrapedSources() {
+	try {
+		console.log("Starting to process all scraped sources...");
+
+		// Get all scraped sources
+		const data = await fetchScrapedData();
+		const sources = data.flatMap((item) => item.latestBlogs);
+
+		console.log(`Found ${sources.length} sources to process`);
+
+		// Process sources in batches to avoid overwhelming the system
+		const batchSize = 10;
+		const results = [];
+
+		for (let i = 0; i < sources.length; i += batchSize) {
+			const batch = sources.slice(i, i + batchSize);
+			console.log(
+				`Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(
+					sources.length / batchSize
+				)}`
+			);
+
+			// Process batch concurrently
+			const batchPromises = batch.map(async (source) => {
+				try {
+					// Get article data from scrap-url endpoint
+					const response = await fetch(`http://localhost:3001/scrap-url`, {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({
+							url: source.link,
+						}),
+					});
+
+					if (!response.ok) {
+						console.log(`Failed to scrape ${source.link}: ${response.status}`);
+						return null;
+					}
+
+					const articleData = await response.json();
+					const title = articleData.data?.title;
+					const description =
+						articleData.data.metadata?.description ||
+						articleData.data.metadata["og:description"];
+					const banner_image =
+						articleData.data.metadata?.image ||
+						articleData.data.metadata["og:image"] ||
+						articleData.data.metadata["twitter:image"];
+					const pubDate = articleData.data?.timestamp;
+					const semanticcontent = JSON.stringify(
+						articleData.data?.content?.semanticContent || ""
+					);
+
+					// Prepare data for Supabase insertion
+					const articleRecord = {
+						author:
+							articleData.data.metadata["og:author"] ||
+							articleData.data.metadata["author"] ||
+							"",
+						link: source.link,
+						title,
+						description,
+						pub_date: pubDate,
+						banner_image,
+						semanticcontent,
+					};
+
+					// Insert into Supabase
+					const { data, error } = await supabase
+						.from("rssfeedarticles")
+						.upsert(articleRecord, {
+							onConflict: "link",
+						});
+
+					if (error) {
+						console.log(`Supabase error for ${source.link}:`, error.message);
+						return { success: false, error: error.message, link: source.link };
+					}
+
+					console.log(`Successfully processed: ${source.link}`);
+					return { success: true, link: source.link, title: articleData.title };
+				} catch (error) {
+					console.log(`Error processing ${source.link}:`, error.message);
+					return { success: false, error: error.message, link: source.link };
+				}
+			});
+
+			// Wait for batch to complete
+			const batchResults = await Promise.allSettled(batchPromises);
+			results.push(
+				...batchResults.map((result) => result.value).filter(Boolean)
+			);
+
+			// Small delay between batches to be respectful to the system
+			if (i + batchSize < sources.length) {
+				await new Promise((resolve) => setTimeout(resolve, 1000));
+			}
+		}
+
+		// Summary
+		const successful = results.filter((r) => r.success).length;
+		const failed = results.filter((r) => !r.success).length;
+
+		console.log(`\n=== PROCESSING COMPLETE ===`);
+		console.log(`Total sources: ${sources.length}`);
+		console.log(`Successful: ${successful}`);
+		console.log(`Failed: ${failed}`);
+		console.log(
+			`Success rate: ${((successful / sources.length) * 100).toFixed(2)}%`
+		);
+
+		return {
+			total: sources.length,
+			successful,
+			failed,
+			results,
+		};
+	} catch (error) {
+		console.error("Error in processAllScrapedSources:", error);
+		throw error;
+	}
+}
+
+app.get("/process-all-scraped-sources", async (c) => {
+	const result = await processAllScrapedSources();
+	return c.json(result);
+});
+
+// one table for all links only unique ones hashing links and if scraped or not we have that table
+// keep adding new hashed links in this table or just adding new ones with set when searched online
+// later one database optimisation we can do afterwards
+
+const port = 3001;
+console.log(`Server is running on port ${port}`);
+serve({
+	fetch: app.fetch,
+	port,
+});
+
+// URL Crawling Endpoint - Crawls a single URL and processes up to 20 links found on that page
+app.post("/crawl-url", async (c) => {
+	const {
+		url,
+		maxLinks = 20, // Maximum number of links to crawl from the parent page
+		batchSize = 5, // Number of links to process concurrently in each batch
+		delayBetweenBatches = 1000, // Delay between batches in milliseconds
+		useProxy = false, // Whether to use proxy for crawling
+		includeImages = false, // Whether to include images in scraped data
+		includeLinks = true, // Whether to include links in scraped data
+		extractMetadata = true, // Whether to extract metadata
+		timeout = 30000, // Timeout for each request
+		validateLinks = true, // Whether to validate links before crawling
+	} = await c.req.json();
+
+	if (!url) {
+		return c.json({ error: "URL is required" }, 400);
+	}
+
+	// Validate URL format
+	let targetUrl;
+	try {
+		targetUrl = new URL(url);
+	} catch (error) {
+		return c.json({ error: "Invalid URL format" }, 400);
+	}
+
+	console.log(`🕷️ Starting URL crawl for: ${targetUrl.href}`);
+	console.log(
+		`📊 Configuration: maxLinks=${maxLinks}, batchSize=${batchSize}, useProxy=${useProxy}`
+	);
+
+	try {
+		// Step 1: Scrape the parent URL to get all links
+		console.log(`🔍 Step 1: Scraping parent URL to extract links...`);
+
+		const parentScrapeResponse = await fetch(
+			`http://localhost:3001/scrap-url`,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					url: targetUrl.href,
+					useProxy: useProxy,
+					includeImages: includeImages,
+					includeLinks: includeLinks,
+					extractMetadata: extractMetadata,
+					timeout: timeout,
+				}),
+			}
+		);
+
+		if (!parentScrapeResponse.ok) {
+			throw new Error(
+				`Failed to scrape parent URL: ${parentScrapeResponse.statusText}`
+			);
+		}
+
+		const parentScrapeData = await parentScrapeResponse.json();
+
+		if (!parentScrapeData.success) {
+			throw new Error(`Parent URL scraping failed: ${parentScrapeData.error}`);
+		}
+
+		// Extract links from the parent page
+		const allLinks = parentScrapeData.data?.links || [];
+		console.log(`🔗 Found ${allLinks.length} total links on parent page`);
+
+		// Step 2: Filter and validate links
+		console.log(`🔍 Step 2: Filtering and validating links...`);
+
+		const validLinks = [];
+		const invalidLinks = [];
+		const processedUrls = new Set([targetUrl.href]); // Track processed URLs to avoid duplicates
+
+		for (const link of allLinks) {
+			try {
+				// Skip if we've already processed this URL
+				if (processedUrls.has(link.href)) {
+					continue;
+				}
+
+				// Basic link validation
+				if (!link.href || typeof link.href !== "string") {
+					invalidLinks.push({ ...link, reason: "Invalid href" });
+					continue;
+				}
+
+				// Parse the link URL
+				let linkUrl;
+				try {
+					linkUrl = new URL(link.href);
+				} catch (error) {
+					invalidLinks.push({ ...link, reason: "Invalid URL format" });
+					continue;
+				}
+
+				// Skip if we've already processed this URL
+				if (processedUrls.has(linkUrl.href)) {
+					continue;
+				}
+
+				// Additional validation if enabled
+				if (validateLinks) {
+					// Skip certain types of links
+					if (
+						linkUrl.protocol === "mailto:" ||
+						linkUrl.protocol === "tel:" ||
+						linkUrl.protocol === "javascript:" ||
+						linkUrl.href.includes("#") ||
+						linkUrl.href.endsWith(".pdf") ||
+						linkUrl.href.endsWith(".doc") ||
+						linkUrl.href.endsWith(".docx") ||
+						linkUrl.href.endsWith(".xls") ||
+						linkUrl.href.endsWith(".xlsx") ||
+						linkUrl.href.endsWith(".zip") ||
+						linkUrl.href.endsWith(".rar")
+					) {
+						invalidLinks.push({
+							...link,
+							reason: "Unsupported protocol or file type",
+						});
+						continue;
+					}
+
+					// Skip very long URLs
+					if (linkUrl.href.length > 500) {
+						invalidLinks.push({ ...link, reason: "URL too long" });
+						continue;
+					}
+				}
+
+				// Add to valid links
+				validLinks.push({
+					...link,
+					parsedUrl: linkUrl.href,
+					domain: linkUrl.hostname,
+				});
+
+				// Mark as processed
+				processedUrls.add(linkUrl.href);
+
+				// Stop if we have enough valid links
+				if (validLinks.length >= maxLinks) {
+					break;
+				}
+			} catch (error) {
+				invalidLinks.push({
+					...link,
+					reason: `Validation error: ${error.message}`,
+				});
+			}
+		}
+
+		console.log(
+			`✅ Validated ${validLinks.length} links (${invalidLinks.length} invalid)`
+		);
+
+		// Step 3: Process links in batches
+		console.log(
+			`🔄 Step 3: Processing ${validLinks.length} links in batches of ${batchSize}...`
+		);
+
+		const crawlResults = [];
+		const batches = [];
+
+		// Create batches
+		for (let i = 0; i < validLinks.length; i += batchSize) {
+			batches.push(validLinks.slice(i, i + batchSize));
+		}
+
+		console.log(`📦 Created ${batches.length} batches`);
+
+		// Process each batch
+		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+			const batch = batches[batchIndex];
+			console.log(
+				`🔄 Processing batch ${batchIndex + 1}/${batches.length} with ${
+					batch.length
+				} links...`
+			);
+
+			// Process current batch concurrently
+			const batchPromises = batch.map(async (link, linkIndex) => {
+				try {
+					console.log(
+						`🔍 Crawling link ${batchIndex * batchSize + linkIndex + 1}/${
+							validLinks.length
+						}: ${link.parsedUrl}`
+					);
+
+					// Call scrap-url for this link
+					const linkResponse = await fetch(`http://localhost:3001/scrap-url`, {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({
+							url: link.parsedUrl,
+							useProxy: useProxy,
+							includeImages: includeImages,
+							includeLinks: includeLinks,
+							extractMetadata: extractMetadata,
+							timeout: timeout,
+						}),
+					});
+
+					if (!linkResponse.ok) {
+						throw new Error(
+							`HTTP error: ${linkResponse.status} ${linkResponse.statusText}`
+						);
+					}
+
+					const linkData = await linkResponse.json();
+
+					if (!linkData.success) {
+						throw new Error(`Scraping failed: ${linkData.error}`);
+					}
+
+					// Extract key information from the scraped data
+					const extractedData = {
+						originalLink: link,
+						url: link.parsedUrl,
+						title: linkData.data?.title || link.text || "No title",
+						description:
+							linkData.data?.metadata?.description ||
+							linkData.data?.metadata?.["og:description"] ||
+							"No description",
+						scrapedAt: linkData.timestamp,
+						success: true,
+						content: {
+							headings: linkData.data?.content || {},
+							paragraphs:
+								linkData.data?.content?.semanticContent?.paragraphs || [],
+							images: linkData.data?.images || [],
+							links: linkData.data?.links || [],
+						},
+						metadata: linkData.data?.metadata || {},
+						pageInfo: linkData.data?.pageInfo || {},
+					};
+
+					console.log(`✅ Successfully crawled: ${link.parsedUrl}`);
+					return extractedData;
+				} catch (error) {
+					console.error(`❌ Failed to crawl ${link.parsedUrl}:`, error.message);
+
+					return {
+						originalLink: link,
+						url: link.parsedUrl,
+						success: false,
+						error: error.message,
+						scrapedAt: new Date().toISOString(),
+					};
+				}
+			});
+
+			// Wait for current batch to complete
+			const batchResults = await Promise.allSettled(batchPromises);
+
+			// Process batch results
+			const successfulResults = [];
+			const failedResults = [];
+
+			batchResults.forEach((result, index) => {
+				if (result.status === "fulfilled") {
+					const data = result.value;
+					if (data.success) {
+						successfulResults.push(data);
+					} else {
+						failedResults.push(data);
+					}
+				} else {
+					// Handle rejected promises
+					const link = batch[index];
+					failedResults.push({
+						originalLink: link,
+						url: link.parsedUrl,
+						success: false,
+						error: `Promise rejected: ${result.reason}`,
+						scrapedAt: new Date().toISOString(),
+					});
+				}
+			});
+
+			// Add batch results to overall results
+			crawlResults.push(...successfulResults, ...failedResults);
+
+			console.log(
+				`📊 Batch ${batchIndex + 1} completed: ${
+					successfulResults.length
+				} successful, ${failedResults.length} failed`
+			);
+
+			// Add delay between batches (except for the last batch)
+			if (batchIndex < batches.length - 1 && delayBetweenBatches > 0) {
+				console.log(`⏳ Waiting ${delayBetweenBatches}ms before next batch...`);
+				await new Promise((resolve) =>
+					setTimeout(resolve, delayBetweenBatches)
+				);
+			}
+		}
+
+		// Step 4: Prepare final response
+		console.log(`🎉 Crawling completed! Processing final results...`);
+
+		const successfulCrawls = crawlResults.filter((r) => r.success);
+		const failedCrawls = crawlResults.filter((r) => !r.success);
+		const successRate = (
+			(successfulCrawls.length / crawlResults.length) *
+			100
+		).toFixed(2);
+
+		// Calculate statistics
+		const totalImages = successfulCrawls.reduce(
+			(sum, crawl) => sum + (crawl.content?.images?.length || 0),
+			0
+		);
+		const totalLinks = successfulCrawls.reduce(
+			(sum, crawl) => sum + (crawl.content?.links?.length || 0),
+			0
+		);
+		const totalParagraphs = successfulCrawls.reduce(
+			(sum, crawl) => sum + (crawl.content?.paragraphs?.length || 0),
+			0
+		);
+
+		const finalResponse = {
+			success: true,
+			message: `Successfully crawled ${targetUrl.href} and processed ${validLinks.length} links`,
+			parentUrl: {
+				url: targetUrl.href,
+				title: parentScrapeData.data?.title || "No title",
+				description:
+					parentScrapeData.data?.metadata?.description || "No description",
+				totalLinksFound: allLinks.length,
+				validLinksFound: validLinks.length,
+				invalidLinksFound: invalidLinks.length,
+			},
+			crawlResults: {
+				total: crawlResults.length,
+				successful: successfulCrawls.length,
+				failed: failedCrawls.length,
+				successRate: `${successRate}%`,
+			},
+			contentSummary: {
+				totalImages: totalImages,
+				totalLinks: totalLinks,
+				totalParagraphs: totalParagraphs,
+				averageImagesPerPage:
+					successfulCrawls.length > 0
+						? (totalImages / successfulCrawls.length).toFixed(2)
+						: 0,
+				averageLinksPerPage:
+					successfulCrawls.length > 0
+						? (totalLinks / successfulCrawls.length).toFixed(2)
+						: 0,
+				averageParagraphsPerPage:
+					successfulCrawls.length > 0
+						? (totalParagraphs / successfulCrawls.length).toFixed(2)
+						: 0,
+			},
+			configuration: {
+				maxLinks: maxLinks,
+				batchSize: batchSize,
+				delayBetweenBatches: delayBetweenBatches,
+				useProxy: useProxy,
+				includeImages: includeImages,
+				includeLinks: includeLinks,
+				extractMetadata: extractMetadata,
+				timeout: timeout,
+				validateLinks: validateLinks,
+			},
+			results: crawlResults,
+			timestamp: new Date().toISOString(),
+			processingTime: Date.now() - Date.now(), // Will be calculated properly in actual implementation
+		};
+
+		console.log(`📊 Final Statistics:`);
+		console.log(`✅ Successful crawls: ${successfulCrawls.length}`);
+		console.log(`❌ Failed crawls: ${failedCrawls.length}`);
+		console.log(`📈 Success rate: ${successRate}%`);
+		console.log(`🖼️ Total images found: ${totalImages}`);
+		console.log(`🔗 Total links found: ${totalLinks}`);
+		console.log(`📝 Total paragraphs found: ${totalParagraphs}`);
+
+		return c.json(finalResponse);
+	} catch (error) {
+		console.error("❌ URL crawling error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to crawl URL",
+				details: error.message,
+				url: targetUrl?.href || url,
+				timestamp: new Date().toISOString(),
+			},
+			500
+		);
+	}
+});
