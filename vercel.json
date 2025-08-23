@@ -4,5 +4,7 @@
 			"source": "/(.*)",
 			"destination": "/index.js"
 		}
-	]
+	],
+	"buildCommand": "npx playwright install chromium",
+	"installCommand": "npm install && npx playwright install chromium"
 }

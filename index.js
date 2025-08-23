@@ -5,9 +5,287 @@ import { GoogleGenAI } from "@google/genai";
 import { chromium } from "playwright";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import { performance } from "perf_hooks";
+import { cpus } from "os";
 
 // Load environment variables
 dotenv.config();
+
+// Performance Monitoring Utility
+class PerformanceMonitor {
+	constructor() {
+		this.metrics = new Map();
+		this.startTime = performance.now();
+		this.initialCpuUsage = process.cpuUsage();
+		this.initialMemoryUsage = process.memoryUsage();
+	}
+
+	// Start monitoring for a specific operation
+	startOperation(operationName) {
+		const operationId = `${operationName}_${Date.now()}_${Math.random()
+			.toString(36)
+			.substr(2, 9)}`;
+
+		this.metrics.set(operationId, {
+			name: operationName,
+			startTime: performance.now(),
+			startCpuUsage: process.cpuUsage(),
+			startMemoryUsage: process.memoryUsage(),
+			startHrtime: process.hrtime.bigint(),
+			status: "running",
+		});
+
+		return operationId;
+	}
+
+	// End monitoring for a specific operation
+	endOperation(operationId) {
+		const metric = this.metrics.get(operationId);
+		if (!metric) return null;
+
+		const endTime = performance.now();
+		const endCpuUsage = process.cpuUsage();
+		const endMemoryUsage = process.memoryUsage();
+		const endHrtime = process.hrtime.bigint();
+
+		// Calculate metrics
+		const duration = endTime - metric.startTime;
+		const cpuUsage = {
+			user: endCpuUsage.user - metric.startCpuUsage.user,
+			system: endCpuUsage.system - metric.startCpuUsage.system,
+			total:
+				endCpuUsage.user +
+				endCpuUsage.system -
+				(metric.startCpuUsage.user + metric.startCpuUsage.system),
+		};
+		const memoryUsage = {
+			rss: endMemoryUsage.rss - metric.startMemoryUsage.rss,
+			heapUsed: endMemoryUsage.heapUsed - metric.startMemoryUsage.heapUsed,
+			heapTotal: endMemoryUsage.heapTotal - metric.startMemoryUsage.heapTotal,
+			external: endMemoryUsage.external - metric.startMemoryUsage.external,
+		};
+		const hrtimeDiff = Number(endHrtime - metric.startHrtime) / 1000000; // Convert to milliseconds
+
+		// Update metric
+		metric.endTime = endTime;
+		metric.endCpuUsage = endCpuUsage;
+		metric.endMemoryUsage = endMemoryUsage;
+		metric.endHrtime = endHrtime;
+		metric.duration = duration;
+		metric.cpuUsage = cpuUsage;
+		metric.memoryUsage = memoryUsage;
+		metric.hrtimeDiff = hrtimeDiff;
+		metric.status = "completed";
+		metric.completedAt = new Date().toISOString();
+
+		return metric;
+	}
+
+	// Get current system performance metrics
+	getSystemMetrics() {
+		const currentCpuUsage = process.cpuUsage();
+		const currentMemoryUsage = process.memoryUsage();
+		const uptime = process.uptime();
+
+		// Calculate CPU usage since start
+		const totalCpuUsage = {
+			user: currentCpuUsage.user - this.initialCpuUsage.user,
+			system: currentCpuUsage.system - this.initialCpuUsage.system,
+			total:
+				currentCpuUsage.user +
+				currentCpuUsage.system -
+				(this.initialCpuUsage.user + this.initialCpuUsage.system),
+		};
+
+		// Calculate memory usage since start
+		const totalMemoryUsage = {
+			rss: currentMemoryUsage.rss - this.initialMemoryUsage.rss,
+			heapUsed: currentMemoryUsage.heapUsed - this.initialMemoryUsage.heapUsed,
+			heapTotal:
+				currentMemoryUsage.heapTotal - this.initialMemoryUsage.heapTotal,
+			external: currentMemoryUsage.external - this.initialMemoryUsage.external,
+		};
+
+		// Get CPU info
+		const cpuInfo = cpus();
+		const cpuModel = cpuInfo[0]?.model || "Unknown";
+		const cpuCores = cpuInfo.length;
+
+		return {
+			uptime: {
+				process: uptime,
+				system: process.hrtime.bigint(),
+			},
+			cpu: {
+				model: cpuModel,
+				cores: cpuCores,
+				usage: {
+					current: currentCpuUsage,
+					total: totalCpuUsage,
+					percentage: {
+						user: (totalCpuUsage.user / 1000000 / uptime) * 100,
+						system: (totalCpuUsage.system / 1000000 / uptime) * 100,
+						total: (totalCpuUsage.total / 1000000 / uptime) * 100,
+					},
+				},
+			},
+			memory: {
+				current: currentMemoryUsage,
+				total: totalMemoryUsage,
+				percentage: {
+					rss: (currentMemoryUsage.rss / 1024 / 1024).toFixed(2) + " MB",
+					heapUsed:
+						(currentMemoryUsage.heapUsed / 1024 / 1024).toFixed(2) + " MB",
+					heapTotal:
+						(currentMemoryUsage.heapTotal / 1024 / 1024).toFixed(2) + " MB",
+					external:
+						(currentMemoryUsage.external / 1024 / 1024).toFixed(2) + " MB",
+				},
+			},
+			operations: {
+				total: this.metrics.size,
+				completed: Array.from(this.metrics.values()).filter(
+					(m) => m.status === "completed"
+				).length,
+				running: Array.from(this.metrics.values()).filter(
+					(m) => m.status === "running"
+				).length,
+			},
+		};
+	}
+
+	// Get performance summary for a specific operation type
+	getOperationSummary(operationName) {
+		const operations = Array.from(this.metrics.values()).filter(
+			(m) => m.name === operationName && m.status === "completed"
+		);
+
+		if (operations.length === 0) return null;
+
+		const durations = operations.map((op) => op.duration);
+		const cpuUsages = operations.map((op) => op.cpuUsage.total);
+		const memoryUsages = operations.map((op) => op.memoryUsage.heapUsed);
+
+		return {
+			operationName,
+			count: operations.length,
+			timing: {
+				min: Math.min(...durations),
+				max: Math.max(...durations),
+				avg: durations.reduce((a, b) => a + b, 0) / durations.length,
+				total: durations.reduce((a, b) => a + b, 0),
+			},
+			cpu: {
+				min: Math.min(...cpuUsages),
+				max: Math.max(...cpuUsages),
+				avg: cpuUsages.reduce((a, b) => a + b, 0) / cpuUsages.length,
+				total: cpuUsages.reduce((a, b) => a + b, 0),
+			},
+			memory: {
+				min: Math.min(...memoryUsages),
+				max: Math.max(...memoryUsages),
+				avg: memoryUsages.reduce((a, b) => a + b, 0) / memoryUsages.length,
+				total: memoryUsages.reduce((a, b) => a + b, 0),
+			},
+		};
+	}
+
+	// Get all performance metrics
+	getAllMetrics() {
+		return {
+			system: this.getSystemMetrics(),
+			operations: Array.from(this.metrics.values()),
+			summary: {
+				scrapUrl: this.getOperationSummary("scrap-url"),
+				crawlUrl: this.getOperationSummary("crawl-url"),
+				googleMaps: this.getOperationSummary("google-maps"),
+				airbnb: this.getOperationSummary("airbnb-scrap"),
+				wikipedia: this.getOperationSummary("wikipedia-scrap"),
+			},
+		};
+	}
+
+	// Clear old metrics (keep last 1000 operations)
+	cleanup() {
+		if (this.metrics.size > 1000) {
+			const sortedMetrics = Array.from(this.metrics.entries())
+				.sort(([, a], [, b]) => b.startTime - a.startTime)
+				.slice(0, 1000);
+
+			this.metrics.clear();
+			sortedMetrics.forEach(([key, value]) => this.metrics.set(key, value));
+		}
+	}
+
+	// Format metrics for console output
+	formatMetrics(metrics) {
+		return {
+			...metrics,
+			cpu: {
+				...metrics.cpu,
+				usage: {
+					...metrics.cpu.usage,
+					current: {
+						user: (metrics.cpu.usage.current.user / 1000000).toFixed(2) + "s",
+						system:
+							(metrics.cpu.usage.current.system / 1000000).toFixed(2) + "s",
+					},
+					total: {
+						user: (metrics.cpu.usage.total.user / 1000000).toFixed(2) + "s",
+						system: (metrics.cpu.usage.total.system / 1000000).toFixed(2) + "s",
+					},
+				},
+			},
+			memory: {
+				...metrics.memory,
+				current: {
+					rss: (metrics.memory.current.rss / 1024 / 1024).toFixed(2) + " MB",
+					heapUsed:
+						(metrics.memory.current.heapUsed / 1024 / 1024).toFixed(2) + " MB",
+					heapTotal:
+						(metrics.memory.current.heapTotal / 1024 / 1024).toFixed(2) + " MB",
+				},
+			},
+		};
+	}
+}
+
+// Initialize performance monitor
+const performanceMonitor = new PerformanceMonitor();
+
+// Performance monitoring middleware
+const performanceMiddleware = async (c, next) => {
+	const operationName = c.req.path;
+	const operationId = performanceMonitor.startOperation(operationName);
+
+	// Add performance info to context
+	c.performance = {
+		operationId,
+		startTime: Date.now(),
+	};
+
+	try {
+		await next();
+	} finally {
+		// End operation monitoring
+		const metrics = performanceMonitor.endOperation(operationId);
+		if (metrics) {
+			console.log(
+				`📊 Performance: ${operationName} completed in ${metrics.duration.toFixed(
+					2
+				)}ms`
+			);
+			console.log(
+				`   💻 CPU: ${(metrics.cpuUsage.total / 1000000).toFixed(2)}s`
+			);
+			console.log(
+				`   🧠 Memory: ${(metrics.memoryUsage.heapUsed / 1024 / 1024).toFixed(
+					2
+				)} MB`
+			);
+		}
+	}
+};
 
 // Proxy Management System
 class ProxyManager {
@@ -330,6 +608,9 @@ const supabase = createClient(
 );
 
 const app = new Hono();
+
+// Apply performance monitoring middleware
+app.use("*", performanceMiddleware);
 
 app.use("/");
 
@@ -2382,12 +2663,20 @@ app.post("/bing-search", async (c) => {
 	});
 });
 
+// scrap URL
 app.post("/scrap-url", async (c) => {
+	// Start performance monitoring for this operation
+	const operationId = performanceMonitor.startOperation("scrap-url");
+	const startTime = performance.now();
+	const startCpuUsage = process.cpuUsage();
+	const startMemoryUsage = process.memoryUsage();
+
 	const {
 		url,
 		selectors = {}, // Custom selectors for specific elements
 		waitForSelector = null, // Wait for specific element to load
 		timeout = 30000,
+		includeSemanticContent = true,
 		includeImages = true,
 		includeLinks = true,
 		extractMetadata = true,
@@ -2458,12 +2747,87 @@ app.post("/scrap-url", async (c) => {
 
 		const page = await context.newPage();
 
-		// Block unnecessary resources for faster loading
+		// Enhanced resource blocking for faster loading
+		let blockedResources = { images: 0, fonts: 0, stylesheets: 0, media: 0 };
+
 		await page.route("**/*", (route) => {
-			const type = route.request().resourceType();
-			if (["font", "stylesheet", "image"].includes(type) && !includeImages) {
+			const request = route.request();
+			const type = request.resourceType();
+			const url = request.url().toLowerCase();
+
+			// Enhanced resource blocking when includeImages is false
+			if (!includeImages) {
+				// Block all image-related resources
+				if (type === "image") {
+					blockedResources.images++;
+					return route.abort();
+				}
+
+				// Block image URLs by file extension
+				const imageExtensions = [
+					".jpg",
+					".jpeg",
+					".png",
+					".gif",
+					".bmp",
+					".webp",
+					".svg",
+					".ico",
+					".tiff",
+					".tif",
+					".heic",
+					".heif",
+					".avif",
+				];
+				const hasImageExtension = imageExtensions.some((ext) =>
+					url.includes(ext)
+				);
+				if (hasImageExtension) {
+					blockedResources.images++;
+					return route.abort();
+				}
+
+				// Block common image CDN and hosting services
+				const imageServices = [
+					"cdn",
+					"images",
+					"img",
+					"photo",
+					"pic",
+					"media",
+					"assets",
+				];
+				const hasImageService = imageServices.some((service) =>
+					url.includes(service)
+				);
+				if (
+					hasImageService &&
+					(url.includes(".jpg") || url.includes(".png") || url.includes(".gif"))
+				) {
+					blockedResources.images++;
+					return route.abort();
+				}
+
+				// Block data URLs (base64 encoded images)
+				if (url.startsWith("data:image/")) {
+					blockedResources.images++;
+					return route.abort();
+				}
+			}
+
+			// Always block fonts and stylesheets for faster loading
+			if (["font", "stylesheet"].includes(type)) {
+				if (type === "font") blockedResources.fonts++;
+				if (type === "stylesheet") blockedResources.stylesheets++;
 				return route.abort();
 			}
+
+			// Block media files (videos, audio) for faster loading
+			if (["media"].includes(type)) {
+				blockedResources.media++;
+				return route.abort();
+			}
+
 			return route.continue();
 		});
 
@@ -2557,108 +2921,112 @@ app.post("/scrap-url", async (c) => {
 					return true;
 				});
 
-				// Extract semantic content with optimized methods
-				const extractSemanticContent = (
-					selector,
-					processor = (el) => el.textContent.trim()
-				) => {
-					const elements = document.querySelectorAll(selector);
-					return elements.length > 0 ? Array.from(elements).map(processor) : [];
-				};
+				if (options.includeSemanticContent) {
+					// Extract semantic content with optimized methods
+					const extractSemanticContent = (
+						selector,
+						processor = (el) => el.textContent.trim()
+					) => {
+						const elements = document.querySelectorAll(selector);
+						return elements.length > 0
+							? Array.from(elements).map(processor)
+							: [];
+					};
 
-				const extractTableContent = (table) => {
-					const rows = Array.from(table.querySelectorAll("tr"));
-					return rows
-						.map((row) => {
-							const cells = Array.from(row.querySelectorAll("td, th")).map(
-								(cell) => cell.textContent.trim()
+					const extractTableContent = (table) => {
+						const rows = Array.from(table.querySelectorAll("tr"));
+						return rows
+							.map((row) => {
+								const cells = Array.from(row.querySelectorAll("td, th")).map(
+									(cell) => cell.textContent.trim()
+								);
+								return cells.filter((cell) => cell.length > 0);
+							})
+							.filter((row) => row.length > 0);
+					};
+
+					const extractListContent = (list) => {
+						return Array.from(list.querySelectorAll("li"))
+							.map((li) => li.textContent.trim())
+							.filter((item) => item.length > 0);
+					};
+
+					// Add semantic content to data.content structure
+					const rawSemanticContent = {
+						paragraphs: extractSemanticContent("p"),
+						divs: extractSemanticContent("div", (el) =>
+							el.textContent.trim().substring(0, 200)
+						),
+						tables: extractSemanticContent("table", extractTableContent),
+						blockquotes: extractSemanticContent("blockquote"),
+						preformatted: extractSemanticContent("pre"),
+						unorderedLists: extractSemanticContent("ul", extractListContent),
+						orderedLists: extractSemanticContent("ol", extractListContent),
+						codeBlocks: extractSemanticContent("code"),
+						articleSections: extractSemanticContent("article"),
+						sectionContent: extractSemanticContent("section"),
+						asideContent: extractSemanticContent("aside"),
+						mainContent: extractSemanticContent("main"),
+						headerContent: extractSemanticContent("header"),
+						footerContent: extractSemanticContent("footer"),
+						navContent: extractSemanticContent("aside"),
+						formContent: extractSemanticContent("form"),
+						fieldsetContent: extractSemanticContent("fieldset"),
+						labelContent: extractSemanticContent("label"),
+						spanContent: extractSemanticContent("span", (el) =>
+							el.textContent.trim().substring(0, 100)
+						),
+						strongContent: extractSemanticContent("strong"),
+						emContent: extractSemanticContent("em"),
+						markContent: extractSemanticContent("mark"),
+						smallContent: extractSemanticContent("small"),
+						citeContent: extractSemanticContent("cite"),
+						timeContent: extractSemanticContent("time"),
+						addressContent: extractSemanticContent("address"),
+						detailsContent: extractSemanticContent("details"),
+						summaryContent: extractSemanticContent("summary"),
+						figureContent: extractSemanticContent("figure"),
+						figcaptionContent: extractSemanticContent("figcaption"),
+						dlContent: extractSemanticContent("dl", (el) => {
+							const dts = Array.from(el.querySelectorAll("dt")).map((dt) =>
+								dt.textContent.trim()
 							);
-							return cells.filter((cell) => cell.length > 0);
-						})
-						.filter((row) => row.length > 0);
-				};
+							const dds = Array.from(el.querySelectorAll("dd")).map((dd) =>
+								dd.textContent.trim()
+							);
+							return { terms: dts, definitions: dds };
+						}),
+					};
 
-				const extractListContent = (list) => {
-					return Array.from(list.querySelectorAll("li"))
-						.map((li) => li.textContent.trim())
-						.filter((item) => item.length > 0);
-				};
-
-				// Add semantic content to data.content structure
-				const rawSemanticContent = {
-					paragraphs: extractSemanticContent("p"),
-					divs: extractSemanticContent("div", (el) =>
-						el.textContent.trim().substring(0, 200)
-					),
-					tables: extractSemanticContent("table", extractTableContent),
-					blockquotes: extractSemanticContent("blockquote"),
-					preformatted: extractSemanticContent("pre"),
-					unorderedLists: extractSemanticContent("ul", extractListContent),
-					orderedLists: extractSemanticContent("ol", extractListContent),
-					codeBlocks: extractSemanticContent("code"),
-					articleSections: extractSemanticContent("article"),
-					sectionContent: extractSemanticContent("section"),
-					asideContent: extractSemanticContent("aside"),
-					mainContent: extractSemanticContent("main"),
-					headerContent: extractSemanticContent("header"),
-					footerContent: extractSemanticContent("footer"),
-					navContent: extractSemanticContent("nav"),
-					formContent: extractSemanticContent("form"),
-					fieldsetContent: extractSemanticContent("fieldset"),
-					labelContent: extractSemanticContent("label"),
-					spanContent: extractSemanticContent("span", (el) =>
-						el.textContent.trim().substring(0, 100)
-					),
-					strongContent: extractSemanticContent("strong"),
-					emContent: extractSemanticContent("em"),
-					markContent: extractSemanticContent("mark"),
-					smallContent: extractSemanticContent("small"),
-					citeContent: extractSemanticContent("cite"),
-					timeContent: extractSemanticContent("time"),
-					addressContent: extractSemanticContent("address"),
-					detailsContent: extractSemanticContent("details"),
-					summaryContent: extractSemanticContent("summary"),
-					figureContent: extractSemanticContent("figure"),
-					figcaptionContent: extractSemanticContent("figcaption"),
-					dlContent: extractSemanticContent("dl", (el) => {
-						const dts = Array.from(el.querySelectorAll("dt")).map((dt) =>
-							dt.textContent.trim()
-						);
-						const dds = Array.from(el.querySelectorAll("dd")).map((dd) =>
-							dd.textContent.trim()
-						);
-						return { terms: dts, definitions: dds };
-					}),
-				};
-
-				// Remove duplicates from semantic content
-				const removeDuplicates = (array) => {
-					if (!Array.isArray(array)) return array;
-					const seen = new Set();
-					return array.filter((item) => {
-						if (typeof item === "string") {
-							const normalized = item.toLowerCase().trim();
-							if (seen.has(normalized)) return false;
-							seen.add(normalized);
+					// Remove duplicates from semantic content
+					const removeDuplicates = (array) => {
+						if (!Array.isArray(array)) return array;
+						const seen = new Set();
+						return array.filter((item) => {
+							if (typeof item === "string") {
+								const normalized = item.toLowerCase().trim();
+								if (seen.has(normalized)) return false;
+								seen.add(normalized);
+								return true;
+							} else if (typeof item === "object" && item !== null) {
+								// Handle complex objects like tables and definition lists
+								const key = JSON.stringify(item);
+								if (seen.has(key)) return false;
+								seen.add(key);
+								return true;
+							}
 							return true;
-						} else if (typeof item === "object" && item !== null) {
-							// Handle complex objects like tables and definition lists
-							const key = JSON.stringify(item);
-							if (seen.has(key)) return false;
-							seen.add(key);
-							return true;
-						}
-						return true;
-					});
-				};
+						});
+					};
 
-				// Apply duplicate removal to all semantic content
-				data.content.semanticContent = Object.fromEntries(
-					Object.entries(rawSemanticContent).map(([key, value]) => [
-						key,
-						removeDuplicates(value),
-					])
-				);
+					// Apply duplicate removal to all semantic content
+					data.content.semanticContent = Object.fromEntries(
+						Object.entries(rawSemanticContent).map(([key, value]) => [
+							key,
+							removeDuplicates(value),
+						])
+					);
+				}
 
 				// Extract images
 				if (options.includeImages) {
@@ -2693,7 +3061,13 @@ app.post("/scrap-url", async (c) => {
 
 				return data;
 			},
-			{ extractMetadata, includeImages, includeLinks, selectors }
+			{
+				extractMetadata,
+				includeImages,
+				includeLinks,
+				includeSemanticContent,
+				selectors,
+			}
 		);
 
 		// Add page info
@@ -2746,6 +3120,46 @@ app.post("/scrap-url", async (c) => {
 		// 	],
 		// });
 
+		// End performance monitoring
+		const endTime = performance.now();
+		const endCpuUsage = process.cpuUsage();
+		const endMemoryUsage = process.memoryUsage();
+
+		const performanceMetrics = {
+			duration: endTime - startTime,
+			cpuUsage: {
+				user: endCpuUsage.user - startCpuUsage.user,
+				system: endCpuUsage.system - startCpuUsage.system,
+				total:
+					endCpuUsage.user +
+					endCpuUsage.system -
+					(startCpuUsage.user + startCpuUsage.system),
+			},
+			memoryUsage: {
+				rss: endMemoryUsage.rss - startMemoryUsage.rss,
+				heapUsed: endMemoryUsage.heapUsed - startMemoryUsage.heapUsed,
+				heapTotal: endMemoryUsage.heapTotal - startMemoryUsage.heapTotal,
+			},
+			resourceBlocking: blockedResources,
+		};
+
+		// Log performance metrics
+		console.log(`📊 Scrap-URL Performance:`);
+		console.log(`   ⏱️ Duration: ${performanceMetrics.duration.toFixed(2)}ms`);
+		console.log(
+			`   💻 CPU: ${(performanceMetrics.cpuUsage.total / 1000000).toFixed(2)}s`
+		);
+		console.log(
+			`   🧠 Memory: ${(
+				performanceMetrics.memoryUsage.heapUsed /
+				1024 /
+				1024
+			).toFixed(2)} MB`
+		);
+		console.log(
+			`   🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
+		);
+
 		return c.json({
 			success: true,
 			data: scrapedData,
@@ -2761,6 +3175,7 @@ app.post("/scrap-url", async (c) => {
 					  }
 					: null,
 			useProxy: useProxy, // Include the flag to show what was used
+			performance: performanceMetrics,
 		});
 	} catch (error) {
 		console.error("❌ Web scraping error:", error);
@@ -2941,6 +3356,7 @@ app.post("/scrape-google-news", async (c) => {
 	}
 });
 
+// Scrap images for the internet
 app.post("/scrap-images", async (c) => {
 	const { query, platform } = await c.req.json();
 
@@ -4559,8 +4975,74 @@ app.get("/process-all-scraped-sources", async (c) => {
 // keep adding new hashed links in this table or just adding new ones with set when searched online
 // later one database optimisation we can do afterwards
 
+// Performance monitoring endpoints
+app.get("/performance", (c) => {
+	const metrics = performanceMonitor.getAllMetrics();
+	return c.json({
+		success: true,
+		timestamp: new Date().toISOString(),
+		metrics: performanceMonitor.formatMetrics(metrics),
+	});
+});
+
+app.get("/performance/system", (c) => {
+	const systemMetrics = performanceMonitor.getSystemMetrics();
+	return c.json({
+		success: true,
+		timestamp: new Date().toISOString(),
+		system: performanceMonitor.formatMetrics(systemMetrics),
+	});
+});
+
+app.get("/performance/operations", (c) => {
+	const operations = Array.from(performanceMonitor.metrics.values())
+		.filter((op) => op.status === "completed")
+		.sort((a, b) => b.startTime - a.startTime)
+		.slice(0, 50); // Return last 50 operations
+
+	return c.json({
+		success: true,
+		timestamp: new Date().toISOString(),
+		operations: operations.map((op) => ({
+			name: op.name,
+			duration: op.duration,
+			cpuUsage: op.cpuUsage,
+			memoryUsage: op.memoryUsage,
+			startTime: op.startTime,
+			completedAt: op.completedAt,
+		})),
+	});
+});
+
+app.get("/performance/summary", (c) => {
+	const summary = {
+		scrapUrl: performanceMonitor.getOperationSummary("scrap-url"),
+		crawlUrl: performanceMonitor.getOperationSummary("crawl-url"),
+		googleMaps: performanceMonitor.getOperationSummary("google-maps"),
+		airbnb: performanceMonitor.getOperationSummary("airbnb-scrap"),
+		wikipedia: performanceMonitor.getOperationSummary("wikipedia-scrap"),
+	};
+
+	return c.json({
+		success: true,
+		timestamp: new Date().toISOString(),
+		summary,
+	});
+});
+
+// Cleanup old metrics periodically
+setInterval(() => {
+	performanceMonitor.cleanup();
+}, 5 * 60 * 1000); // Every 5 minutes
+
 const port = 3001;
 console.log(`Server is running on port ${port}`);
+console.log(`📊 Performance monitoring enabled`);
+console.log(`   📈 /performance - All metrics`);
+console.log(`   💻 /performance/system - System metrics`);
+console.log(`   🔄 /performance/operations - Recent operations`);
+console.log(`   📋 /performance/summary - Operation summaries`);
+
 serve({
 	fetch: app.fetch,
 	port,
@@ -4573,12 +5055,14 @@ app.post("/crawl-url", async (c) => {
 		maxLinks = 20, // Maximum number of links to crawl from the parent page
 		batchSize = 5, // Number of links to process concurrently in each batch
 		delayBetweenBatches = 1000, // Delay between batches in milliseconds
+		includeSemanticContent = true, // Whether to include semantic content in scraped data
 		useProxy = false, // Whether to use proxy for crawling
 		includeImages = false, // Whether to include images in scraped data
 		includeLinks = true, // Whether to include links in scraped data
 		extractMetadata = true, // Whether to extract metadata
 		timeout = 30000, // Timeout for each request
 		validateLinks = true, // Whether to validate links before crawling
+		restrictToSeedDomain = true, // Whether to only allow links from the same domain as seed URL
 	} = await c.req.json();
 
 	if (!url) {
@@ -4612,6 +5096,7 @@ app.post("/crawl-url", async (c) => {
 				body: JSON.stringify({
 					url: targetUrl.href,
 					useProxy: useProxy,
+					includeSemanticContent: false,
 					includeImages: includeImages,
 					includeLinks: includeLinks,
 					extractMetadata: extractMetadata,
@@ -4636,12 +5121,20 @@ app.post("/crawl-url", async (c) => {
 		const allLinks = parentScrapeData.data?.links || [];
 		console.log(`🔗 Found ${allLinks.length} total links on parent page`);
 
-		// Step 2: Filter and validate links
-		console.log(`🔍 Step 2: Filtering and validating links...`);
-
 		const validLinks = [];
 		const invalidLinks = [];
 		const processedUrls = new Set([targetUrl.href]); // Track processed URLs to avoid duplicates
+
+		// Extract seed domain for filtering
+		const seedDomain = targetUrl.hostname.toLowerCase();
+		console.log(`🌐 Seed domain: ${seedDomain}`);
+		if (restrictToSeedDomain) {
+			console.log(
+				`🔒 Domain restriction: Only allowing links from ${seedDomain}`
+			);
+		} else {
+			console.log(`🌍 Domain restriction: Allowing links from any domain`);
+		}
 
 		for (const link of allLinks) {
 			try {
@@ -4670,32 +5163,303 @@ app.post("/crawl-url", async (c) => {
 					continue;
 				}
 
-				// Additional validation if enabled
+				// Domain filtering - only allow links from the same domain as seed URL
+				if (restrictToSeedDomain) {
+					const linkDomain = linkUrl.hostname.toLowerCase();
+
+					// Simple domain check: hostname must match seed domain exactly
+					if (linkDomain !== seedDomain) {
+						invalidLinks.push({
+							...link,
+							reason: `External domain: ${linkDomain}`,
+						});
+						continue;
+					}
+				}
+
+				// Enhanced link filtering for authentic content links only
 				if (validateLinks) {
-					// Skip certain types of links
+					// Skip non-HTTP/HTTPS protocols
 					if (
 						linkUrl.protocol === "mailto:" ||
 						linkUrl.protocol === "tel:" ||
 						linkUrl.protocol === "javascript:" ||
-						linkUrl.href.includes("#") ||
-						linkUrl.href.endsWith(".pdf") ||
-						linkUrl.href.endsWith(".doc") ||
-						linkUrl.href.endsWith(".docx") ||
-						linkUrl.href.endsWith(".xls") ||
-						linkUrl.href.endsWith(".xlsx") ||
-						linkUrl.href.endsWith(".zip") ||
-						linkUrl.href.endsWith(".rar")
+						linkUrl.protocol === "data:" ||
+						linkUrl.protocol === "blob:" ||
+						linkUrl.protocol === "file:" ||
+						linkUrl.protocol === "ftp:" ||
+						linkUrl.protocol === "sftp:"
 					) {
 						invalidLinks.push({
 							...link,
-							reason: "Unsupported protocol or file type",
+							reason: "Unsupported protocol",
 						});
 						continue;
 					}
 
-					// Skip very long URLs
+					// Skip anchor links and scroll-to links
+					if (linkUrl.href.includes("#") || linkUrl.hash) {
+						invalidLinks.push({
+							...link,
+							reason: "Anchor/scroll link",
+						});
+						continue;
+					}
+
+					// Skip image file extensions
+					const imageExtensions = [
+						".jpg",
+						".jpeg",
+						".png",
+						".gif",
+						".bmp",
+						".webp",
+						".svg",
+						".ico",
+						".tiff",
+						".tif",
+						".heic",
+						".heif",
+						".avif",
+						".jfif",
+						".pjpeg",
+						".pjp",
+					];
+					const hasImageExtension = imageExtensions.some((ext) =>
+						linkUrl.href.toLowerCase().includes(ext)
+					);
+					if (hasImageExtension) {
+						invalidLinks.push({
+							...link,
+							reason: "Image file link",
+						});
+						continue;
+					}
+
+					// Skip video file extensions
+					const videoExtensions = [
+						".mp4",
+						".avi",
+						".mov",
+						".wmv",
+						".flv",
+						".webm",
+						".mkv",
+						".m4v",
+						".3gp",
+						".ogv",
+						".ts",
+						".mts",
+						".m2ts",
+						".divx",
+						".xvid",
+					];
+					const hasVideoExtension = videoExtensions.some((ext) =>
+						linkUrl.href.toLowerCase().includes(ext)
+					);
+					if (hasVideoExtension) {
+						invalidLinks.push({
+							...link,
+							reason: "Video file link",
+						});
+						continue;
+					}
+
+					// Skip audio file extensions
+					const audioExtensions = [
+						".mp3",
+						".wav",
+						".flac",
+						".aac",
+						".ogg",
+						".wma",
+						".m4a",
+						".opus",
+						".amr",
+						".3ga",
+						".ra",
+						".mid",
+						".midi",
+					];
+					const hasAudioExtension = audioExtensions.some((ext) =>
+						linkUrl.href.toLowerCase().includes(ext)
+					);
+					if (hasAudioExtension) {
+						invalidLinks.push({
+							...link,
+							reason: "Audio file link",
+						});
+						continue;
+					}
+
+					// Skip document and archive file extensions
+					const documentExtensions = [
+						".pdf",
+						".doc",
+						".docx",
+						".xls",
+						".xlsx",
+						".ppt",
+						".pptx",
+						".txt",
+						".rtf",
+						".odt",
+						".ods",
+						".odp",
+						".csv",
+					];
+					const archiveExtensions = [
+						".zip",
+						".rar",
+						".7z",
+						".tar",
+						".gz",
+						".bz2",
+						".xz",
+						".lzma",
+					];
+					const hasDocumentExtension = documentExtensions.some((ext) =>
+						linkUrl.href.toLowerCase().includes(ext)
+					);
+					const hasArchiveExtension = archiveExtensions.some((ext) =>
+						linkUrl.href.toLowerCase().includes(ext)
+					);
+					if (hasDocumentExtension || hasArchiveExtension) {
+						invalidLinks.push({
+							...link,
+							reason: "Document/archive file link",
+						});
+						continue;
+					}
+
+					// Skip social media sharing and tracking links
+					const socialMediaPatterns = [
+						"share",
+						"shareArticle",
+						"sharethis",
+						"addthis",
+						"facebook.com/sharer",
+						"twitter.com/intent",
+						"linkedin.com/sharing",
+						"pinterest.com/pin/create",
+						"whatsapp.com/send",
+						"telegram.me/share",
+						"reddit.com/submit",
+						"buffer.com/add",
+						"digg.com/submit",
+						"stumbleupon.com/submit",
+					];
+					const hasSocialMediaPattern = socialMediaPatterns.some((pattern) =>
+						linkUrl.href.toLowerCase().includes(pattern)
+					);
+					if (hasSocialMediaPattern) {
+						invalidLinks.push({
+							...link,
+							reason: "Social media sharing link",
+						});
+						continue;
+					}
+
+					// Skip analytics and tracking links
+					const trackingPatterns = [
+						"google-analytics",
+						"googletagmanager",
+						"facebook.com/tr",
+						"pixel",
+						"tracking",
+						"analytics",
+						"stats",
+						"metrics",
+						"clicktrack",
+						"affiliate",
+						"ref=",
+						"utm_",
+						"campaign",
+					];
+					const hasTrackingPattern = trackingPatterns.some((pattern) =>
+						linkUrl.href.toLowerCase().includes(pattern)
+					);
+					if (hasTrackingPattern) {
+						invalidLinks.push({
+							...link,
+							reason: "Analytics/tracking link",
+						});
+						continue;
+					}
+
+					// Skip login, signup, and account-related links
+					const accountPatterns = [
+						"login",
+						"signin",
+						"signup",
+						"register",
+						"signout",
+						"logout",
+						"account",
+						"profile",
+						"dashboard",
+						"admin",
+						"user",
+						"member",
+						"auth",
+						"oauth",
+						"sso",
+						"password",
+						"reset",
+						"verify",
+					];
+					const hasAccountPattern = accountPatterns.some((pattern) =>
+						linkUrl.href.toLowerCase().includes(pattern)
+					);
+					if (hasAccountPattern) {
+						invalidLinks.push({
+							...link,
+							reason: "Account/authentication link",
+						});
+						continue;
+					}
+
+					// Skip very long URLs (likely generated or spam)
 					if (linkUrl.href.length > 500) {
 						invalidLinks.push({ ...link, reason: "URL too long" });
+						continue;
+					}
+
+					// Skip URLs with too many query parameters (likely tracking)
+					if (linkUrl.searchParams.size > 10) {
+						invalidLinks.push({ ...link, reason: "Too many query parameters" });
+						continue;
+					}
+
+					// Skip URLs that are just the domain (no meaningful path)
+					if (linkUrl.pathname === "/" || linkUrl.pathname === "") {
+						invalidLinks.push({ ...link, reason: "Just domain root" });
+						continue;
+					}
+
+					// Skip URLs with suspicious patterns
+					const suspiciousPatterns = [
+						"click",
+						"redirect",
+						"go",
+						"jump",
+						"visit",
+						"goto",
+						"out",
+						"external",
+						"away",
+						"exit",
+						"leave",
+						"depart",
+					];
+					const hasSuspiciousPattern = suspiciousPatterns.some((pattern) =>
+						linkUrl.href.toLowerCase().includes(pattern)
+					);
+					if (hasSuspiciousPattern) {
+						invalidLinks.push({
+							...link,
+							reason: "Suspicious redirect pattern",
+						});
 						continue;
 					}
 				}
@@ -4725,6 +5489,34 @@ app.post("/crawl-url", async (c) => {
 		console.log(
 			`✅ Validated ${validLinks.length} links (${invalidLinks.length} invalid)`
 		);
+
+		// Log detailed filtering statistics
+		if (invalidLinks.length > 0) {
+			console.log(`📊 Invalid links breakdown:`);
+			const reasonCounts = {};
+			invalidLinks.forEach((link) => {
+				const reason = link.reason || "Unknown reason";
+				reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
+			});
+
+			Object.entries(reasonCounts)
+				.sort(([, a], [, b]) => b - a) // Sort by count descending
+				.forEach(([reason, count]) => {
+					console.log(`   ❌ ${reason}: ${count} links`);
+				});
+		}
+
+		// Log domain filtering summary
+		if (restrictToSeedDomain) {
+			const externalDomainCount = invalidLinks.filter(
+				(link) => link.reason && link.reason.includes("External domain")
+			).length;
+
+			console.log(
+				`🌐 Domain filtering: ${externalDomainCount} external domain links blocked`
+			);
+			console.log(`✅ Links passing domain filter: ${validLinks.length}`);
+		}
 
 		// Step 3: Process links in batches
 		console.log(
@@ -4768,6 +5560,7 @@ app.post("/crawl-url", async (c) => {
 						body: JSON.stringify({
 							url: link.parsedUrl,
 							useProxy: useProxy,
+							includeSemanticContent: includeSemanticContent,
 							includeImages: includeImages,
 							includeLinks: includeLinks,
 							extractMetadata: extractMetadata,
@@ -4894,6 +5687,96 @@ app.post("/crawl-url", async (c) => {
 			0
 		);
 
+		// Collect all unique links from all nested scrap responses using Map to avoid duplicates
+		console.log(`🔗 Collecting all unique links from nested responses...`);
+		const uniqueLinksMap = new Map();
+
+		// Add links from parent URL
+		if (parentScrapeData.data?.links) {
+			parentScrapeData.data.links.forEach((link, index) => {
+				if (link.href && typeof link.href === "string") {
+					const key = link.href.toLowerCase().trim();
+					if (!uniqueLinksMap.has(key)) {
+						uniqueLinksMap.set(key, {
+							...link,
+							source: "parent",
+							sourceIndex: index,
+							discoveredAt: "parent_page",
+						});
+					}
+				}
+			});
+		}
+
+		// Add links from all crawled pages
+		successfulCrawls.forEach((crawl, crawlIndex) => {
+			if (crawl.content?.links && Array.isArray(crawl.content.links)) {
+				crawl.content.links.forEach((link, linkIndex) => {
+					if (link.href && typeof link.href === "string") {
+						const key = link.href.toLowerCase().trim();
+						if (!uniqueLinksMap.has(key)) {
+							uniqueLinksMap.set(key, {
+								...link,
+								source: "crawled_page",
+								sourceUrl: crawl.url,
+								sourceTitle: crawl.title,
+								crawlIndex: crawlIndex,
+								linkIndex: linkIndex,
+								discoveredAt: "nested_crawl",
+							});
+						}
+					}
+				});
+			}
+		});
+
+		// Convert Map to array and sort by source for better organization
+		const allUniqueLinks = Array.from(uniqueLinksMap.values()).sort((a, b) => {
+			// Sort by source priority: parent first, then crawled pages
+			if (a.source === "parent" && b.source !== "parent") return -1;
+			if (a.source !== "parent" && b.source === "parent") return 1;
+
+			// Then sort by crawl index and link index
+			if (a.source === "crawled_page" && b.source === "crawled_page") {
+				if (a.crawlIndex !== b.crawlIndex) return a.crawlIndex - b.crawlIndex;
+				return a.linkIndex - b.linkIndex;
+			}
+
+			// For parent links, sort by original index
+			if (a.source === "parent" && b.source === "parent") {
+				return a.sourceIndex - b.sourceIndex;
+			}
+
+			return 0;
+		});
+
+		console.log(
+			`🔗 Collected ${allUniqueLinks.length} unique links from all sources`
+		);
+
+		// Apply domain filtering to allUniqueLinks if restrictToSeedDomain is enabled
+		let filteredUniqueLinks = allUniqueLinks;
+		if (restrictToSeedDomain) {
+			const beforeFiltering = allUniqueLinks.length;
+			filteredUniqueLinks = allUniqueLinks.filter((link) => {
+				try {
+					const linkUrl = new URL(link.href);
+					const linkDomain = linkUrl.hostname.toLowerCase();
+					return linkDomain === seedDomain;
+				} catch (error) {
+					// If URL parsing fails, filter it out
+					return false;
+				}
+			});
+
+			const afterFiltering = filteredUniqueLinks.length;
+			const filteredOut = beforeFiltering - afterFiltering;
+			console.log(`🔒 Domain filtering applied to allUniqueLinks:`);
+			console.log(`   📊 Before filtering: ${beforeFiltering} links`);
+			console.log(`   ✅ After filtering: ${afterFiltering} links`);
+			console.log(`   ❌ Filtered out: ${filteredOut} external domain links`);
+		}
+
 		const finalResponse = {
 			success: true,
 			message: `Successfully crawled ${targetUrl.href} and processed ${validLinks.length} links`,
@@ -4939,6 +5822,29 @@ app.post("/crawl-url", async (c) => {
 				extractMetadata: extractMetadata,
 				timeout: timeout,
 				validateLinks: validateLinks,
+				restrictToSeedDomain: restrictToSeedDomain,
+				seedDomain: seedDomain,
+			},
+			allUniqueLinks: {
+				total: filteredUniqueLinks.length,
+				links: filteredUniqueLinks,
+				summary: {
+					fromParent: filteredUniqueLinks.filter(
+						(link) => link.source === "parent"
+					).length,
+					fromCrawledPages: filteredUniqueLinks.filter(
+						(link) => link.source === "crawled_page"
+					).length,
+					uniqueDomains: new Set(
+						filteredUniqueLinks.map((link) => {
+							try {
+								return new URL(link.href).hostname;
+							} catch {
+								return "invalid-url";
+							}
+						})
+					).size,
+				},
 			},
 			results: crawlResults,
 			timestamp: new Date().toISOString(),
@@ -4952,6 +5858,31 @@ app.post("/crawl-url", async (c) => {
 		console.log(`🖼️ Total images found: ${totalImages}`);
 		console.log(`🔗 Total links found: ${totalLinks}`);
 		console.log(`📝 Total paragraphs found: ${totalParagraphs}`);
+		console.log(`🔗 Unique Links Summary:`);
+		console.log(
+			`   📍 From parent page: ${
+				filteredUniqueLinks.filter((link) => link.source === "parent").length
+			}`
+		);
+		console.log(
+			`   🕷️ From crawled pages: ${
+				filteredUniqueLinks.filter((link) => link.source === "crawled_page")
+					.length
+			}`
+		);
+		console.log(
+			`   🌐 Unique domains: ${
+				new Set(
+					filteredUniqueLinks.map((link) => {
+						try {
+							return new URL(link.href).hostname;
+						} catch {
+							return "invalid-url";
+						}
+					})
+				).size
+			}`
+		);
 
 		return c.json(finalResponse);
 	} catch (error) {
@@ -4966,5 +5897,192 @@ app.post("/crawl-url", async (c) => {
 			},
 			500
 		);
+	}
+});
+
+// add endpoint scrap -chat - llm with link
+
+// ... existing code ...
+
+// Scrap-chat endpoint - LLM-powered chat about scraped URL content
+app.post("/scrap-chat", async (c) => {
+	try {
+		const { url, question, useProxy = false, includeImages = false } = await c.req.json();
+
+		if (!url) {
+			return c.json({ 
+				success: false, 
+				error: "URL is required" 
+			}, 400);
+		}
+
+		if (!question) {
+			return c.json({ 
+				success: false, 
+				error: "Question is required" 
+			}, 400);
+		}
+
+		console.log(`🤖 Starting scrap-chat for URL: ${url}`);
+		console.log(`❓ Question: ${question}`);
+
+		// Step 1: Scrape the URL using the existing scrap-url endpoint
+		console.log(`🔍 Step 1: Scraping URL to extract content...`);
+		
+		const scrapeResponse = await fetch(`http://localhost:3001/scrap-url`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				url: url,
+				useProxy: useProxy,
+				includeImages: includeImages,
+				includeLinks: false, // We don't need links for chat
+				extractMetadata: true,
+				includeSemanticContent: true, // We need this for context
+				timeout: 30000,
+			}),
+		});
+
+		if (!scrapeResponse.ok) {
+			throw new Error(`Failed to scrape URL: ${scrapeResponse.statusText}`);
+		}
+
+		const scrapeData = await scrapeResponse.json();
+
+		if (!scrapeData.success) {
+			throw new Error(`URL scraping failed: ${scrapeData.error}`);
+		}
+
+		console.log(`✅ URL scraped successfully`);
+
+		const allLinks = scrapeData.data?.links || [];
+		// Step 2: Extract relevant content for LLM context
+		const scrapedContent = scrapeData.data;
+		const semanticContent = scrapedContent?.content?.semanticContent || {};
+		
+		// Extract paragraphs and divs for context
+		const paragraphs = semanticContent.paragraphs || [];
+		const divs = semanticContent.divs || [];
+		const headings = scrapedContent?.content || {};
+		
+		// Combine all text content for context
+		const allTextContent = [];
+		
+		// Add headings
+		Object.entries(headings).forEach(([tag, texts]) => {
+			if (Array.isArray(texts) && texts.length > 0) {
+				allTextContent.push(`${tag.toUpperCase()}:`);
+				texts.forEach(text => allTextContent.push(`- ${text}`));
+			}
+		});
+		
+		// Add paragraphs
+		if (paragraphs.length > 0) {
+			allTextContent.push("PARAGRAPHS:");
+			paragraphs.forEach(para => allTextContent.push(para));
+		}
+		
+		// Add div content (limited to avoid too much context)
+		if (divs.length > 0) {
+			allTextContent.push("DIV CONTENT:");
+			divs.slice(0, 10).forEach(div => allTextContent.push(div)); // Limit to first 10 divs
+		}
+
+		// Join all content with proper spacing
+		const contextText = allTextContent.join("\n\n");
+		
+		console.log(`📝 Extracted ${paragraphs.length} paragraphs and ${divs.length} divs for context`);
+		console.log(`📊 Total context length: ${contextText.length} characters`);
+
+		// Step 3: Prepare prompt for Google GenAI
+		const prompt = `You are an AI assistant that helps users understand web content. 
+
+Here is the content from the webpage at ${url}:
+
+${contextText}
+
+The user's question is: ${question}
+
+Please provide a comprehensive answer based ONLY on the content above. If the information is not available in the provided content, clearly state that. 
+
+Guidelines:
+1. Answer the question directly and concisely
+2. Use information only from the scraped content
+3. If you need to reference specific parts, mention them
+4. If the question cannot be answered with the available content, explain why
+5. Keep your response focused and relevant to the question
+
+Below are the links scrapped from the URL page:
+${JSON.stringify(allLinks, null, 2)}
+
+Answer:`;
+
+		console.log(`🧠 Step 2: Sending content to Google GenAI for analysis...`);
+
+		// Step 4: Send to Google GenAI
+		const genaiResponse = await genai.models.generateContent({
+			model: "gemini-2.0-flash",
+			contents: [
+				{
+					role: "user",
+					parts: [{ text: prompt }],
+				},
+			],
+		});
+
+		const aiAnswer = genaiResponse.candidates[0].content.parts[0].text;
+		const thought = genaiResponse.candidates[0].content.parts[0].thought;
+
+		console.log(`✅ GenAI response generated successfully`);
+
+		// Step 5: Prepare final response
+		const finalResponse = {
+			success: true,
+			message: "Successfully analyzed URL content and generated AI response",
+			data: {
+				url: url,
+				question: question,
+				aiAnswer: aiAnswer,
+				thought: thought,
+				contentSummary: {
+					title: scrapedContent?.title || "No title",
+					totalParagraphs: paragraphs.length,
+					totalDivs: divs.length,
+					contextLength: contextText.length,
+					scrapedAt: scrapedContent?.pageInfo?.scrapedAt || new Date().toISOString(),
+				},
+				metadata: {
+					description: scrapedContent?.metadata?.description || scrapedContent?.metadata?.["og:description"] || "No description",
+					author: scrapedContent?.metadata?.author || scrapedContent?.metadata?.["og:author"] || "Unknown",
+					keywords: scrapedContent?.metadata?.keywords || "No keywords",
+				},
+				processingInfo: {
+					useProxy: useProxy,
+					includeImages: includeImages,
+					timestamp: new Date().toISOString(),
+				},
+			},
+		};
+
+		console.log(`🎉 Scrap-chat completed successfully`);
+		console.log(`�� Response summary:`);
+		console.log(`   - Question: ${question}`);
+		console.log(`   - Answer length: ${aiAnswer.length} characters`);
+		console.log(`   - Context used: ${contextText.length} characters`);
+
+		return c.json(finalResponse);
+
+	} catch (error) {
+		console.error("❌ Scrap-chat error:", error);
+		
+		return c.json({
+			success: false,
+			error: "Failed to process scrap-chat request",
+			details: error.message,
+			url: url || "Unknown",
+			timestamp: new Date().toISOString(),
+		}, 500);
 	}
 });

@@ -6,7 +6,9 @@ COPY package*.json ./
 COPY service-account-file.js ./
 
 # Install Node.js dependencies
-RUN npm i
+RUN npm ci
+
+RUN npx playwright install chromium
 
 # Copy application source code
 COPY . .
