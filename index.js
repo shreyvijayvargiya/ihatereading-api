@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
+import { cors } from "hono/cors";
 import { firestore } from "./firebase.js";
 import { GoogleGenAI } from "@google/genai";
 import { chromium } from "playwright";
@@ -620,6 +621,17 @@ const supabase = createClient(
 
 const app = new Hono();
 
+// Add CORS middleware
+app.use(
+	"*",
+	cors({
+		origin: ["*"], // Allow all origins (or specify your domain)
+		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+		allowHeaders: ["Content-Type", "Authorization"],
+		credentials: true,
+	})
+);
+
 // Apply performance monitoring middleware
 app.use("*", performanceMiddleware);
 
@@ -627,252 +639,6 @@ app.use("/");
 
 app.get("/", (c) => {
 	return c.text("Welcome to iHateReading API", 200);
-});
-
-app.get("/home", async (c) => {
-	try {
-		// Fetch blog posts from Firestore
-		const postsSnapshot = await firestore
-			.collection("publish")
-			.orderBy("timeStamp", "desc")
-			.get();
-		const posts = [];
-
-		postsSnapshot.docs.forEach(async (doc) => {
-			posts.push({
-				id: doc.id,
-				...doc.data(),
-			});
-		});
-
-		// Format timestamp (assuming it's a Firestore timestamp)
-		const formatDate = (timestamp) => {
-			if (!timestamp) return "Unknown date";
-			const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-			return date.toLocaleDateString("en-US", {
-				year: "numeric",
-				month: "long",
-				day: "numeric",
-			});
-		};
-
-		const calculateReadingTime = (htmlContent) => {
-			if (!htmlContent) return 0;
-			// Remove HTML tags
-			const text = htmlContent.replace(/<[^>]*>/g, " ");
-			// Remove extra whitespace and split into words
-			const words = text.trim().split(/\s+/);
-			const wordsPerMinute = 200; // average reading speed
-			const minutes = Math.ceil(words.length / wordsPerMinute);
-			return isNaN(minutes) ? 0 : minutes;
-		};
-
-		const bloghtml = `
-  <html>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <body class="bg-gray-50 min-h-screen">
-    <div class="container mx-auto px-4 py-8 max-w-7xl">
-      <header class="mb-12">
-        <h1 class="text-4xl font-bold text-gray-900 mb-2">Blog</h1>
-        <p class="text-gray-600">Latest articles by <a href="https://ihatereading.in" class="text-zinc-600 hover:text-zinc-800 underline cursor-pointer font-medium" target="_blank">iHateReading.in</a></p>
-      </header>
-      
-      <div class="space-y-2 grid grid-cols-1 md:grid-cols-1 lg:grid-cols-1 gap-4 justify-center items-start">
-        ${posts
-					.filter((item) => (item?.title?.length > 0 ? item : null))
-					.map(
-						(post) => `
-          <article class="bg-white cursor-pointer max-w-4xl mx-auto rounded-xl shadow-md p-6 hover:shadow-lg transition-shadow my-4"  onClick="window.location.href='/t/${post?.title.replace(
-						/\s+/g,
-						"-"
-					)}'">
-            <header class="mb-4">
-            
-              <h2 class="text-2xl font-bold text-gray-900 mb-2 hover:text-zinc-600 transition-colors">
-                ${post?.title || post?.name}
-              </h2>
-              <p class="text-gray-600 text-lg mb-3">
-                ${post?.description || post?.htmlContent?.substring(0, 150)}
-              </p>
-              <div class="flex items-center text-sm text-gray-500 space-x-4">
-                <span class="flex items-center">
-                  <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-                  </svg>
-                  ${formatDate(post?.timeStamp)}
-                </span>
-                <span class="flex items-center">
-                  <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                  </svg>
-                  ${calculateReadingTime(post?.content)} min read
-                </span>
-              </div>
-            </header>
-            <footer class="mt-6 pt-4 border-t border-gray-200">
-              <a href="/t/${post?.title.replace(
-								/\s+/g,
-								"-"
-							)}" class="text-zinc-600 cursor-pointer hover:text-zinc-800 font-medium">
-                Read blog →
-              </a>
-            </footer>
-          </article>
-        `
-					)
-					.join("")}
-      </div>
-    </div>
-  </body>
-  </html>
-  `;
-		return c.html(bloghtml);
-	} catch (error) {
-		console.error("Error fetching posts:", error);
-		return c.text("Error loading blog posts", 500);
-	}
-});
-
-app.get("/t/:slug", async (c) => {
-	try {
-		const slug = c.req.param("slug");
-
-		// Convert slug back to title by replacing hyphens with spaces
-		const title = slug.replace(/-/g, " ");
-
-		// Fetch the specific blog post from Firestore
-		const postsSnapshot = await firestore
-			.collection("publish")
-			.where("title", "==", title)
-			.get();
-
-		const post = {
-			id: postsSnapshot.docs[0].id,
-			...postsSnapshot.docs[0].data(),
-		};
-
-		// Format timestamp (assuming it's a Firestore timestamp)
-		const formatDate = (timestamp) => {
-			if (!timestamp) return "Unknown date";
-			const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-			return date.toLocaleDateString("en-US", {
-				year: "numeric",
-				month: "long",
-				day: "numeric",
-			});
-		};
-
-		const calculateReadingTime = (htmlContent) => {
-			if (!htmlContent) return 0;
-			// Remove HTML tags
-			const text = htmlContent.replace(/<[^>]*>/g, " ");
-			// Remove extra whitespace and split into words
-			const words = text.trim().split(/\s+/);
-			const wordsPerMinute = 200; // average reading speed
-			const minutes = Math.ceil(words.length / wordsPerMinute);
-			return isNaN(minutes) ? 0 : minutes;
-		};
-
-		const blogPostHtml = `
-  <html>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="/blog-styles.css" />
-  <script>
-    function copyToClipboard(text) {
-      navigator.clipboard.writeText(text).then(function() {
-        // Show a temporary success message
-        const button = event.target.closest('button');
-        const originalHTML = button.innerHTML;
-        button.innerHTML = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>';
-        button.classList.remove('text-gray-500', 'hover:text-green-600');
-        button.classList.add('text-green-600');
-        
-        setTimeout(() => {
-          button.innerHTML = originalHTML;
-          button.classList.remove('text-green-600');
-          button.classList.add('text-gray-500', 'hover:text-green-600');
-        }, 2000);
-      }).catch(function(err) {
-        console.error('Could not copy text: ', err);
-      });
-    }
-  </script>
-  <body class="bg-gray-50 min-h-screen">
-    <div class="container mx-auto px-4 py-8 max-w-4xl">
-      <a href="/home" class="text-zinc-600 hover:text-zinc-800 font-medium inline-block">
-        ← Back to Blog
-      </a>
-      <header class="mt-8 bg-white rounded-t-xl shadow-md px-8 pb-4 pt-8">
-        <h1 class="text-2xl font-bold text-gray-900">${
-					post?.title || post?.name
-				}</h1>
-        <p class="text-gray-600 text-lg mb-4">${post?.description || ""}</p>
-        <div class="flex items-center justify-between">
-          <div class="flex items-center text-sm text-gray-500 space-x-4">
-            <span class="flex items-center">
-              <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-              </svg>
-              ${formatDate(post?.timeStamp)}
-            </span>
-            <span class="flex items-center">
-              <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-              </svg>
-              ${calculateReadingTime(post?.content)} min read
-            </span>
-          </div>
-          
-          <div class="flex items-center justify-start space-x-3">
-            <!-- Twitter Icon -->
-            <a href="https://twitter.com/intent/tweet?text=${encodeURIComponent(
-							post?.title || post?.name
-						)}&url=${encodeURIComponent(`http://localhost:3001/t/${slug}`)}" 
-               target="_blank" 
-               class="text-gray-500 hover:text-blue-400 transition-colors duration-200">
-              <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M23.953 4.57a10 10 0 01-2.825.775 4.958 4.958 0 002.163-2.723c-.951.555-2.005.959-3.127 1.184a4.92 4.92 0 00-8.384 4.482C7.69 8.095 4.067 6.13 1.64 3.162a4.822 4.822 0 00-.666 2.475c0 1.71.87 3.213 2.188 4.096a4.904 4.904 0 01-2.228-.616v.06a4.923 4.923 0 003.946 4.827 4.996 4.996 0 01-2.212.085 4.936 4.936 0 004.604 3.417 9.867 9.867 0 01-6.102 2.105c-.39 0-.779-.023-1.17-.067a13.995 13.995 0 007.557 2.209c9.053 0 13.998-7.496 13.998-13.985 0-.21 0-.42-.015-.63A9.935 9.935 0 0024 4.59z"/>
-              </svg>
-            </a>
-            
-            <!-- LinkedIn Icon -->
-            <a href="https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(
-							`http://localhost:3001/t/${slug}`
-						)}" 
-               target="_blank" 
-               class="text-gray-500 hover:text-blue-600 transition-colors duration-200">
-              <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/>
-              </svg>
-            </a>
-            
-            <!-- Copy Link Icon -->
-            <button onclick="copyToClipboard('http://localhost:3001/t/${slug}')" 
-                    class="text-gray-500 hover:text-green-600 transition-colors duration-200">
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-      </header>
-      
-      <article class="bg-white rounded-b-xl shadow-md p-8">
-        <div class="prose prose-lg max-w-none">
-          ${post?.content || "Content not available"}
-        </div>
-      </article>
-    </div>
-  </body>
-  </html>
-  `;
-
-		return c.html(blogPostHtml);
-	} catch (error) {
-		console.error("Error fetching blog post:", error);
-		return c.text("Error loading blog post", 500);
-	}
 });
 
 app.post("/post-to-devto", async (c) => {
@@ -4677,10 +4443,6 @@ async function processAllScrapedSources() {
 		const successful = results.filter((r) => r.success).length;
 		const failed = results.filter((r) => !r.success).length;
 
-		console.log(`\n=== PROCESSING COMPLETE ===`);
-		console.log(`Total sources: ${sources.length}`);
-		console.log(`Successful: ${successful}`);
-		console.log(`Failed: ${failed}`);
 		console.log(
 			`Success rate: ${((successful / sources.length) * 100).toFixed(2)}%`
 		);
@@ -5627,211 +5389,6 @@ app.post("/crawl-url", async (c) => {
 	}
 });
 
-// Scrap-chat endpoint - LLM-powered chat about scraped URL content
-app.post("/scrap-chat", async (c) => {
-	try {
-		const {
-			url,
-			question,
-			useProxy = false,
-			includeImages = false,
-		} = await c.req.json();
-
-		if (!url) {
-			return c.json(
-				{
-					success: false,
-					error: "URL is required",
-				},
-				400
-			);
-		}
-
-		if (!question) {
-			return c.json(
-				{
-					success: false,
-					error: "Question is required",
-				},
-				400
-			);
-		}
-
-		console.log(`🤖 Starting scrap-chat for URL: ${url}`);
-		console.log(`❓ Question: ${question}`);
-
-		// Step 1: Scrape the URL using the existing scrap-url endpoint
-		console.log(`🔍 Step 1: Scraping URL to extract content...`);
-
-		const scrapeResponse = await fetch(`http://localhost:3001/scrap-url`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				url: url,
-				useProxy: useProxy,
-				includeImages: includeImages,
-				includeLinks: false, // We don't need links for chat
-				extractMetadata: true, // We need this for context
-				includeSemanticContent: true, // We need this for context
-				timeout: 30000,
-			}),
-		});
-
-		if (!scrapeResponse.ok) {
-			throw new Error(`Failed to scrape URL: ${scrapeResponse.statusText}`);
-		}
-
-		const scrapeData = await scrapeResponse.json();
-
-		if (!scrapeData.success) {
-			throw new Error(`URL scraping failed: ${scrapeData.error}`);
-		}
-
-		console.log(`✅ URL scraped successfully`);
-
-		const allLinks = scrapeData.data?.links || [];
-		// Step 2: Extract relevant content for LLM context
-		const scrapedContent = scrapeData.data;
-		const semanticContent = scrapedContent?.content?.semanticContent || {};
-
-		// Extract paragraphs and divs for context
-		const paragraphs = semanticContent.paragraphs || [];
-		const divs = semanticContent.divs || [];
-		const headings = scrapedContent?.content || {};
-
-		// Combine all text content for context
-		const allTextContent = [];
-
-		// Add headings
-		Object.entries(headings).forEach(([tag, texts]) => {
-			if (Array.isArray(texts) && texts.length > 0) {
-				allTextContent.push(`${tag.toUpperCase()}:`);
-				texts.forEach((text) => allTextContent.push(`- ${text}`));
-			}
-		});
-
-		// Add paragraphs
-		if (paragraphs.length > 0) {
-			allTextContent.push("PARAGRAPHS:");
-			paragraphs.forEach((para) => allTextContent.push(para));
-		}
-
-		// Add div content (limited to avoid too much context)
-		if (divs.length > 0) {
-			allTextContent.push("DIV CONTENT:");
-			divs.slice(0, 10).forEach((div) => allTextContent.push(div)); // Limit to first 10 divs
-		}
-
-		// Join all content with proper spacing
-		const contextText = allTextContent.join("\n\n");
-
-		console.log(
-			`📝 Extracted ${paragraphs.length} paragraphs and ${divs.length} divs for context`
-		);
-		console.log(`📊 Total context length: ${contextText.length} characters`);
-
-		// Step 3: Prepare prompt for Google GenAI
-		const prompt = `You are an AI assistant that helps users understand web content. 
-
-Here is the content from the webpage at ${url}:
-
-${contextText}
-
-The user's question is: ${question}
-
-Please provide a comprehensive answer based ONLY on the content above. If the information is not available in the provided content, clearly state that. 
-
-Guidelines:
-1. Answer the question directly and concisely
-2. Use information only from the scraped content
-3. If you need to reference specific parts, mention them
-4. If the question cannot be answered with the available content, explain why
-5. Keep your response focused and relevant to the question
-
-Below are the links scrapped from the URL page:
-${JSON.stringify(allLinks, null, 2)}
-
-Answer:`;
-
-		console.log(`🧠 Step 2: Sending content to Google GenAI for analysis...`);
-
-		// Step 4: Send to Google GenAI
-		const genaiResponse = await genai.models.generateContent({
-			model: "gemini-2.0-flash",
-			contents: [
-				{
-					role: "user",
-					parts: [{ text: prompt }],
-				},
-			],
-		});
-
-		const aiAnswer = genaiResponse.candidates[0].content.parts[0].text;
-		const thought = genaiResponse.candidates[0].content.parts[0].thought;
-
-		console.log(`✅ GenAI response generated successfully`);
-
-		// Step 5: Prepare final response
-		const finalResponse = {
-			success: true,
-			message: "Successfully analyzed URL content and generated AI response",
-			data: {
-				url: url,
-				question: question,
-				aiAnswer: aiAnswer,
-				thought: thought,
-				contentSummary: {
-					title: scrapedContent?.title || "No title",
-					totalParagraphs: paragraphs.length,
-					totalDivs: divs.length,
-					contextLength: contextText.length,
-					scrapedAt:
-						scrapedContent?.pageInfo?.scrapedAt || new Date().toISOString(),
-				},
-				metadata: {
-					description:
-						scrapedContent?.metadata?.description ||
-						scrapedContent?.metadata?.["og:description"] ||
-						"No description",
-					author:
-						scrapedContent?.metadata?.author ||
-						scrapedContent?.metadata?.["og:author"] ||
-						"Unknown",
-					keywords: scrapedContent?.metadata?.keywords || "No keywords",
-				},
-				processingInfo: {
-					useProxy: useProxy,
-					includeImages: includeImages,
-					timestamp: new Date().toISOString(),
-				},
-			},
-		};
-
-		console.log(`🎉 Scrap-chat completed successfully`);
-		console.log(`�� Response summary:`);
-		console.log(`   - Question: ${question}`);
-		console.log(`   - Answer length: ${aiAnswer.length} characters`);
-		console.log(`   - Context used: ${contextText.length} characters`);
-
-		return c.json(finalResponse);
-	} catch (error) {
-		console.error("❌ Scrap-chat error:", error);
-
-		return c.json(
-			{
-				success: false,
-				error: "Failed to process scrap-chat request",
-				details: error.message,
-				url: url || "Unknown",
-				timestamp: new Date().toISOString(),
-			},
-			500
-		);
-	}
-});
-
 async function main() {
 	const locations = await supabase.from("locations").select("*").limit(5);
 	// console.log(locations.data, "locations");
@@ -5869,53 +5426,27 @@ app.post("/ai-url-chat", async (c) => {
 	}
 
 	try {
-		let scrapedData;
-
-		// Check if URL already exists in Supabase
-		const { data: existingData, error: fetchError } = await supabase
-			.from("universo")
-			.select("scraped_data, scraped_at")
-			.eq("url", link)
-			.single();
-
-
-		if (existingData && existingData.scraped_data) {
-			console.log("✅ Using cached data from Supabase");
-			scrapedData = existingData.scraped_data;
-		} else {
-			console.log("🔄 Scraping new URL data");
-			// Fetch new data from puppeteer endpoint
-			const data = await fetch(`${origin}/scrap-url-puppeteer`, {
-				method: "POST",
-				body: JSON.stringify({
-					url: link,
-				}),
-			});
-
-			const results = await data.json();
-			scrapedData = results.data;
-
-			// Store new data in Supabase
-			const { error: insertError } = await supabase.from("universo").insert({
-				title: scrapedData.title || "No Title",
+		// Fetch data from puppeteer endpoint
+		const data = await fetch(`${origin}/scrap-url-puppeteer`, {
+			method: "POST",
+			body: JSON.stringify({
 				url: link,
-				scraped_at: new Date().toISOString(),
-				scraped_data: scrapedData,
-			});
+			}),
+		});
 
-			if (insertError) {
-				console.error("❌ Error storing data in Supabase:", insertError);
-			} else {
-				console.log("✅ New data stored in Supabase");
-			}
-		}
+		const results = await data.json();
+		const scrapedData = results.data;
 
 		const modelPrompt = `You are a helpful AI assistant. A user is asking a question about a website. 
 Please provide a helpful answer based on the data from the link/url provided by the user.
 Website: ${link}
 
 Question: ${prompt}
-The data for the website is as follows in JSON format:${JSON.stringify(scrapedData, null, 2)}
+The data for the website is as follows in JSON format:${JSON.stringify(
+			scrapedData,
+			null,
+			2
+		)}
 Read the data and answer the user question as given above.
 `;
 
@@ -5949,7 +5480,6 @@ Read the data and answer the user question as given above.
 			scrapedData: scrapedData,
 			url: link,
 			timestamp: new Date().toISOString(),
-			cached: !!existingData,
 		});
 	} catch (error) {
 		console.error("❌ AI URL Chat error:", error);
@@ -5983,6 +5513,27 @@ app.post("/scrap-url-puppeteer", async (c) => {
 	if (!url) {
 		return c.json({ error: "URL is required" }, 400);
 	}
+
+	// Check if URL already exists in Supabase
+	const { data: existingData, error: fetchError } = await supabase
+		.from("universo")
+		.select("scraped_data, scraped_at")
+		.eq("url", url)
+		.single();
+
+	if (existingData && existingData.scraped_data) {
+		console.log("✅ Using cached data from Supabase");
+		return c.json({
+			success: true,
+			data: existingData.scraped_data,
+			url: url,
+			timestamp: existingData.scraped_at,
+			cached: true,
+			note: "Data retrieved from Supabase cache",
+		});
+	}
+
+	console.log("🔄 Scraping new URL data");
 
 	let browser;
 	let scrapedData = {};
@@ -6415,6 +5966,24 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			`   🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
 		);
 
+		// Store new data in Supabase
+		try {
+			const { error: insertError } = await supabase.from("universo").insert({
+				title: scrapedData.title || "No Title",
+				url: url,
+				scraped_at: new Date().toISOString(),
+				scraped_data: JSON.stringify(scrapedData),
+			});
+
+			if (insertError) {
+				console.error("❌ Error storing data in Supabase:", insertError);
+			} else {
+				console.log("✅ New data stored in Supabase");
+			}
+		} catch (supabaseError) {
+			console.error("❌ Supabase storage error:", supabaseError);
+		}
+
 		return c.json({
 			success: true,
 			data: scrapedData,
@@ -6423,6 +5992,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			proxyUsed: null, // Proxy not supported in this version
 			useProxy: false,
 			performance: performanceMetrics,
+			cached: false,
 			note: "This endpoint uses Puppeteer with @sparticuz/chromium instead of Playwright",
 		});
 	} catch (error) {
