@@ -5855,43 +5855,86 @@ async function main() {
 	console.log(response2.candidates[0].content.parts[0].text, "response");
 }
 
+const isDevelopment = process.env.NODE_ENV === "development";
+const origin = isDevelopment
+	? "http://localhost:3001"
+	: "https://ihatereading-ai.vercel.app";
+
 app.post("/ai-url-chat", async (c) => {
 	const { link, prompt } = await c.req.json();
+	console.log(`${origin}/scrap-url-puppeteer`);
 
 	if (!link || !prompt) {
 		return c.json({ error: "Both link and prompt are required" }, 400);
 	}
 
 	try {
-		// For now, let's create a simple response without web scraping
-		// This will allow the form to work while we fix the Puppeteer issue
-		const mockScrapedData = {
-			title: "Website Analysis",
-			url: link,
-			content: {
-				headings: ["Sample Heading"],
-				paragraphs: ["Sample content from the website"],
-			},
-			metadata: {
-				description: "Website content analysis",
-			},
-			links: [],
-		};
+		let scrapedData;
+
+		// Check if URL already exists in Supabase
+		const { data: existingData, error: fetchError } = await supabase
+			.from("universo")
+			.select("scraped_data, scraped_at")
+			.eq("url", link)
+			.single();
+
+			
+		if (existingData && existingData.scraped_data) {
+			console.log("✅ Using cached data from Supabase");
+			scrapedData = existingData.scraped_data;
+		} else {
+			console.log("🔄 Scraping new URL data");
+			// Fetch new data from puppeteer endpoint
+			const data = await fetch(`${origin}/scrap-url-puppeteer`, {
+				method: "POST",
+				body: JSON.stringify({
+					url: link,
+				}),
+			});
+
+			const results = await data.json();
+			scrapedData = results.data;
+
+			// Store new data in Supabase
+			const { error: insertError } = await supabase.from("universo").insert({
+				title: scrapedData.title || "No Title",
+				url: link,
+				scraped_at: new Date().toISOString(),
+				scraped_data: scrapedData,
+			});
+
+			if (insertError) {
+				console.error("❌ Error storing data in Supabase:", insertError);
+			} else {
+				console.log("✅ New data stored in Supabase");
+			}
+		}
+
+		const modelPrompt = `Answer this question using ONLY the scraped website data below. If the data doesn't contain relevant information, respond with "I cannot answer this question based on the available website data."
+
+Question: ${prompt}
+Website: ${link}
+Data: ${JSON.stringify(scrapedData, null, 2)}`;
 
 		// Use Google GenAI to answer the question
 		const response = await genai.models.generateContent({
 			model: "gemini-2.0-flash",
 			contents: [
 				{
+					role: "model",
+					parts: [
+						{
+							text: modelPrompt,
+						},
+					],
+				},
+				{
 					role: "user",
 					parts: [
 						{
 							text: `You are a helpful AI assistant. A user is asking a question about a website. Please provide a helpful answer based on the context.
-
-Website URL: ${link}
-User Question: ${prompt}
-
-Please provide a thoughtful and helpful response. If the question is about specific content on the website, explain that you would need to analyze the actual website content to provide a detailed answer. Otherwise, provide general guidance about the topic.`,
+							
+							Question: ${prompt}`,
 						},
 					],
 				},
@@ -5900,9 +5943,10 @@ Please provide a thoughtful and helpful response. If the question is about speci
 
 		return c.json({
 			answer: response.candidates[0].content.parts[0].text,
-			scrapedData: mockScrapedData,
+			scrapedData: scrapedData,
 			url: link,
 			timestamp: new Date().toISOString(),
+			cached: !!existingData,
 		});
 	} catch (error) {
 		console.error("❌ AI URL Chat error:", error);
