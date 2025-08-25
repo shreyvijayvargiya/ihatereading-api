@@ -5878,7 +5878,7 @@ app.post("/ai-url-chat", async (c) => {
 			.eq("url", link)
 			.single();
 
-			
+
 		if (existingData && existingData.scraped_data) {
 			console.log("✅ Using cached data from Supabase");
 			scrapedData = existingData.scraped_data;
@@ -5910,11 +5910,14 @@ app.post("/ai-url-chat", async (c) => {
 			}
 		}
 
-		const modelPrompt = `Answer this question using ONLY the scraped website data below. If the data doesn't contain relevant information, respond with "I cannot answer this question based on the available website data."
+		const modelPrompt = `You are a helpful AI assistant. A user is asking a question about a website. 
+Please provide a helpful answer based on the data from the link/url provided by the user.
+Website: ${link}
 
 Question: ${prompt}
-Website: ${link}
-Data: ${JSON.stringify(scrapedData, null, 2)}`;
+The data for the website is as follows in JSON format:${JSON.stringify(scrapedData, null, 2)}
+Read the data and answer the user question as given above.
+`;
 
 		// Use Google GenAI to answer the question
 		const response = await genai.models.generateContent({
