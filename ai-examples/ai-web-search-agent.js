@@ -1,10 +1,10 @@
 import { Type, GoogleGenAI } from "@google/genai";
 import { Hono } from "hono";
-import { ChatOllama, Ollama } from "@langchain/ollama";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { chromium } from "playwright";
 import dotenv from "dotenv";
+import { ChatOllama, Ollama } from "@langchain/ollama";
 
 dotenv.config();
 

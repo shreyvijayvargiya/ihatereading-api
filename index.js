@@ -7,6 +7,15 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
+import { ChatOllama, Ollama } from "@langchain/ollama";
+const { request } = await import("undici");
+import aiWebSearchAgent from "./ai-examples/ai-web-search-agent.js";
+
+const ollama = new ChatOllama({
+	// model: "gemma:2b",
+	model: "nemotron-mini:latest",
+	baseURL: "http://localhost:11434",
+});
 
 // Load environment variables
 dotenv.config();
@@ -2309,8 +2318,6 @@ app.post("/google-search", async (c) => {
 
 		// Search Google using undici HTTP client for better stealth
 		try {
-			const { request } = await import("undici");
-
 			// Random user agent rotation
 			const userAgents = [
 				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -5900,27 +5907,34 @@ app.post("/crawl-url", async (c) => {
 	}
 });
 
-// add endpoint scrap -chat - llm with link
-
-// ... existing code ...
-
 // Scrap-chat endpoint - LLM-powered chat about scraped URL content
 app.post("/scrap-chat", async (c) => {
 	try {
-		const { url, question, useProxy = false, includeImages = false } = await c.req.json();
+		const {
+			url,
+			question,
+			useProxy = false,
+			includeImages = false,
+		} = await c.req.json();
 
 		if (!url) {
-			return c.json({ 
-				success: false, 
-				error: "URL is required" 
-			}, 400);
+			return c.json(
+				{
+					success: false,
+					error: "URL is required",
+				},
+				400
+			);
 		}
 
 		if (!question) {
-			return c.json({ 
-				success: false, 
-				error: "Question is required" 
-			}, 400);
+			return c.json(
+				{
+					success: false,
+					error: "Question is required",
+				},
+				400
+			);
 		}
 
 		console.log(`🤖 Starting scrap-chat for URL: ${url}`);
@@ -5928,7 +5942,7 @@ app.post("/scrap-chat", async (c) => {
 
 		// Step 1: Scrape the URL using the existing scrap-url endpoint
 		console.log(`🔍 Step 1: Scraping URL to extract content...`);
-		
+
 		const scrapeResponse = await fetch(`http://localhost:3001/scrap-url`, {
 			method: "POST",
 			headers: {
@@ -5939,7 +5953,7 @@ app.post("/scrap-chat", async (c) => {
 				useProxy: useProxy,
 				includeImages: includeImages,
 				includeLinks: false, // We don't need links for chat
-				extractMetadata: true,
+				extractMetadata: true, // We need this for context
 				includeSemanticContent: true, // We need this for context
 				timeout: 30000,
 			}),
@@ -5961,39 +5975,41 @@ app.post("/scrap-chat", async (c) => {
 		// Step 2: Extract relevant content for LLM context
 		const scrapedContent = scrapeData.data;
 		const semanticContent = scrapedContent?.content?.semanticContent || {};
-		
+
 		// Extract paragraphs and divs for context
 		const paragraphs = semanticContent.paragraphs || [];
 		const divs = semanticContent.divs || [];
 		const headings = scrapedContent?.content || {};
-		
+
 		// Combine all text content for context
 		const allTextContent = [];
-		
+
 		// Add headings
 		Object.entries(headings).forEach(([tag, texts]) => {
 			if (Array.isArray(texts) && texts.length > 0) {
 				allTextContent.push(`${tag.toUpperCase()}:`);
-				texts.forEach(text => allTextContent.push(`- ${text}`));
+				texts.forEach((text) => allTextContent.push(`- ${text}`));
 			}
 		});
-		
+
 		// Add paragraphs
 		if (paragraphs.length > 0) {
 			allTextContent.push("PARAGRAPHS:");
-			paragraphs.forEach(para => allTextContent.push(para));
+			paragraphs.forEach((para) => allTextContent.push(para));
 		}
-		
+
 		// Add div content (limited to avoid too much context)
 		if (divs.length > 0) {
 			allTextContent.push("DIV CONTENT:");
-			divs.slice(0, 10).forEach(div => allTextContent.push(div)); // Limit to first 10 divs
+			divs.slice(0, 10).forEach((div) => allTextContent.push(div)); // Limit to first 10 divs
 		}
 
 		// Join all content with proper spacing
 		const contextText = allTextContent.join("\n\n");
-		
-		console.log(`📝 Extracted ${paragraphs.length} paragraphs and ${divs.length} divs for context`);
+
+		console.log(
+			`📝 Extracted ${paragraphs.length} paragraphs and ${divs.length} divs for context`
+		);
 		console.log(`📊 Total context length: ${contextText.length} characters`);
 
 		// Step 3: Prepare prompt for Google GenAI
@@ -6051,11 +6067,18 @@ Answer:`;
 					totalParagraphs: paragraphs.length,
 					totalDivs: divs.length,
 					contextLength: contextText.length,
-					scrapedAt: scrapedContent?.pageInfo?.scrapedAt || new Date().toISOString(),
+					scrapedAt:
+						scrapedContent?.pageInfo?.scrapedAt || new Date().toISOString(),
 				},
 				metadata: {
-					description: scrapedContent?.metadata?.description || scrapedContent?.metadata?.["og:description"] || "No description",
-					author: scrapedContent?.metadata?.author || scrapedContent?.metadata?.["og:author"] || "Unknown",
+					description:
+						scrapedContent?.metadata?.description ||
+						scrapedContent?.metadata?.["og:description"] ||
+						"No description",
+					author:
+						scrapedContent?.metadata?.author ||
+						scrapedContent?.metadata?.["og:author"] ||
+						"Unknown",
 					keywords: scrapedContent?.metadata?.keywords || "No keywords",
 				},
 				processingInfo: {
@@ -6073,16 +6096,640 @@ Answer:`;
 		console.log(`   - Context used: ${contextText.length} characters`);
 
 		return c.json(finalResponse);
-
 	} catch (error) {
 		console.error("❌ Scrap-chat error:", error);
-		
+
+		return c.json(
+			{
+				success: false,
+				error: "Failed to process scrap-chat request",
+				details: error.message,
+				url: url || "Unknown",
+				timestamp: new Date().toISOString(),
+			},
+			500
+		);
+	}
+});
+
+async function main() {
+	const locations = await supabase.from("locations").select("*").limit(5);
+	// console.log(locations.data, "locations");
+
+	const question = `What all other keys or columns i can fetch in locations table to make it better production ready`;
+
+	const prompt = `I am providing you the locations of cities in India with other details including 
+	google_maps_url, wikipedia_content, airbnb_url,airbnb_listings, unsplash_images, google_images
+	and more. locations: ${JSON.stringify(locations.data, null, 2)}
+	
+	Your job is to answer the questions related as per using locations data: ${question}`;
+	const response2 = await genai.models.generateContent({
+		model: "gemini-2.0-flash",
+		contents: [
+			{
+				role: "user",
+				parts: [{ text: prompt }],
+			},
+		],
+	});
+	console.log(response2.candidates[0].content.parts[0].text, "response");
+}
+
+const firecrawlUrlScrapFunction = async (query) => {
+	try {
+		const response = await fetch("https://api.firecrawl.dev/v1/scrape", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				query: query,
+				onlyMainContent: true,
+				parsers: ["pdf"],
+				formats: ["markdown"],
+			}),
+		});
+
+		if (!response.ok) {
+			throw new Error(
+				`Firecrawl API error: ${response.status} ${response.statusText}`
+			);
+		}
+
+		const data = await response.json();
+		return { result: data, success: true };
+	} catch (error) {
+		return { error: error.message, success: false };
+	}
+};
+
+app.post("/ai-url-chat", async (c) => {
+	const { link, prompt } = await c.req.json();
+
+	// Use the new scrap-url-puppeteer endpoint instead of firecrawl
+	const puppeteerResponse = await fetch(
+		`http://localhost:3001/scrap-url-puppeteer`,
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				url: link,
+				includeSemanticContent: true,
+				includeImages: false,
+				includeLinks: true,
+				extractMetadata: true,
+				timeout: 30000,
+			}),
+		}
+	);
+
+	if (!puppeteerResponse.ok) {
+		return c.json({ error: "Failed to scrape URL using Puppeteer" }, 500);
+	}
+
+	const puppeteerData = await puppeteerResponse.json();
+	console.log("Puppeteer scraping result:", puppeteerData);
+
+	if (!puppeteerData.success) {
+		return c.json(
+			{ error: "Puppeteer scraping failed", details: puppeteerData.error },
+			500
+		);
+	}
+
+	// Extract the scraped content for the LLM
+	const scrapedContent = puppeteerData.data;
+	const contentForLLM = {
+		title: scrapedContent.title,
+		url: scrapedContent.url,
+		content: scrapedContent.content,
+		metadata: scrapedContent.metadata,
+		links: scrapedContent.links,
+		semanticContent: scrapedContent.content.semanticContent || {},
+	};
+
+	const response = await genai.models.generateContent({
+		model: "gemini-2.0-flash",
+		contents: [
+			{
+				role: "model",
+				parts: [
+					{
+						text: `You are a helpful assistant. I am providing you with scraped content from a website. Your job is to answer the user's questions related to the content of this website.
+
+Website URL: ${link}
+Website Title: ${contentForLLM.title}
+
+Scraped Content Summary:
+- Headings: ${JSON.stringify(contentForLLM.content)}
+- Metadata: ${JSON.stringify(contentForLLM.metadata)}
+- Semantic Content: ${JSON.stringify(contentForLLM.semanticContent)}
+- Links: ${JSON.stringify(contentForLLM.links)}
+
+Please use this information to answer the user's question about the website content.`,
+					},
+				],
+			},
+			{
+				role: "user",
+				parts: [{ text: prompt }],
+			},
+		],
+	});
+
+	return c.json({
+		answer: response.candidates[0].content.parts[0].text,
+		scrapedData: contentForLLM,
+		url: link,
+		timestamp: new Date().toISOString(),
+	});
+});
+
+// New Puppeteer-based URL scraping endpoint
+app.post("/scrap-url-puppeteer", async (c) => {
+	// Start performance monitoring for this operation
+	const operationId = performanceMonitor.startOperation("scrap-url-puppeteer");
+	const startTime = performance.now();
+	const startCpuUsage = process.cpuUsage();
+	const startMemoryUsage = process.memoryUsage();
+
+	const {
+		url,
+		selectors = {}, // Custom selectors for specific elements
+		waitForSelector = null, // Wait for specific element to load
+		timeout = 30000,
+		includeSemanticContent = true,
+		includeImages = true,
+		includeLinks = true,
+		extractMetadata = true,
+		useProxy = false, // Note: Proxy support would need additional implementation
+	} = await c.req.json();
+
+	if (!url) {
+		return c.json({ error: "URL is required" }, 400);
+	}
+
+	let browser;
+	let scrapedData = {};
+
+	try {
+		// Import puppeteer-core and chromium
+		const puppeteer = await import("puppeteer-core");
+		const chromium = (await import("@sparticuz/chromium")).default;
+
+		// Try to launch browser with @sparticuz/chromium first
+		try {
+			const executablePath = await chromium.executablePath();
+			console.log(`🔍 Chromium executable path: ${executablePath}`);
+
+			browser = await puppeteer.launch({
+				headless: true,
+				args: chromium.args,
+				executablePath: executablePath,
+				ignoreDefaultArgs: ["--disable-extensions"],
+			});
+			console.log("✅ Successfully launched browser with @sparticuz/chromium");
+		} catch (chromiumError) {
+			console.warn(
+				"⚠️ Failed to launch with @sparticuz/chromium, trying fallback..."
+			);
+			console.warn("Chromium error:", chromiumError.message);
+
+			// Fallback: try to use system Chrome or let puppeteer find a browser
+			browser = await puppeteer.launch({
+				headless: true,
+				executablePath:
+					"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				args: [
+					"--no-sandbox",
+					"--disable-setuid-sandbox",
+					"--disable-dev-shm-usage",
+					"--disable-gpu",
+					"--disable-web-security",
+				],
+			});
+			console.log(
+				"✅ Successfully launched browser with fallback configuration"
+			);
+		}
+
+		const page = await browser.newPage();
+
+		// Set viewport and user agent
+		await page.setViewport({ width: 1920, height: 1080 });
+		await page.setUserAgent(
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		);
+
+		// Set extra headers
+		await page.setExtraHTTPHeaders({
+			dnt: "1",
+			"upgrade-insecure-requests": "1",
+			accept:
+				"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+			"sec-fetch-site": "none",
+			"sec-fetch-mode": "navigate",
+			"sec-fetch-user": "?1",
+			"sec-fetch-dest": "document",
+			"accept-language": "en-US,en;q=0.9",
+		});
+
+		// Enhanced resource blocking for faster loading
+		let blockedResources = { images: 0, fonts: 0, stylesheets: 0, media: 0 };
+
+		// Set request interception
+		await page.setRequestInterception(true);
+		page.on("request", (request) => {
+			const resourceType = request.resourceType();
+			const url = request.url().toLowerCase();
+
+			// Enhanced resource blocking when includeImages is false
+			if (!includeImages) {
+				// Block all image-related resources
+				if (resourceType === "image") {
+					blockedResources.images++;
+					request.abort();
+					return;
+				}
+
+				// Block image URLs by file extension
+				const imageExtensions = [
+					".jpg",
+					".jpeg",
+					".png",
+					".gif",
+					".bmp",
+					".webp",
+					".svg",
+					".ico",
+					".tiff",
+					".tif",
+					".heic",
+					".heif",
+					".avif",
+				];
+				const hasImageExtension = imageExtensions.some((ext) =>
+					url.includes(ext)
+				);
+				if (hasImageExtension) {
+					blockedResources.images++;
+					request.abort();
+					return;
+				}
+
+				// Block common image CDN and hosting services
+				const imageServices = [
+					"cdn",
+					"images",
+					"img",
+					"photo",
+					"pic",
+					"media",
+					"assets",
+				];
+				const hasImageService = imageServices.some((service) =>
+					url.includes(service)
+				);
+				if (
+					hasImageService &&
+					(url.includes(".jpg") || url.includes(".png") || url.includes(".gif"))
+				) {
+					blockedResources.images++;
+					request.abort();
+					return;
+				}
+
+				// Block data URLs (base64 encoded images)
+				if (url.startsWith("data:image/")) {
+					blockedResources.images++;
+					request.abort();
+					return;
+				}
+			}
+
+			// Always block fonts and stylesheets for faster loading
+			if (["font", "stylesheet"].includes(resourceType)) {
+				if (resourceType === "font") blockedResources.fonts++;
+				if (resourceType === "stylesheet") blockedResources.stylesheets++;
+				request.abort();
+				return;
+			}
+
+			// Block media files (videos, audio) for faster loading
+			if (["media"].includes(resourceType)) {
+				blockedResources.media++;
+				request.abort();
+				return;
+			}
+
+			request.continue();
+		});
+
+		// Navigate to URL
+		await page.goto(url, {
+			waitUntil: "domcontentloaded",
+			timeout: timeout,
+		});
+
+		// Wait for specific selector if provided
+		if (waitForSelector) {
+			try {
+				await page.waitForSelector(waitForSelector, { timeout: 10000 });
+			} catch (error) {
+				console.warn(`Selector ${waitForSelector} not found within timeout`);
+			}
+		}
+
+		// Wait a bit for dynamic content to load
+		//await page.waitForTimeout(2000);
+
+		// Extract page content
+		scrapedData = await page.evaluate(
+			(options) => {
+				const data = {
+					url: window.location.href,
+					title: document.title,
+					timestamp: new Date().toISOString(),
+					content: {},
+					metadata: {},
+					links: [],
+					images: [],
+				};
+
+				["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
+					data.content[tag] = Array.from(document.querySelectorAll(tag)).map(
+						(h) => h.textContent.trim()
+					);
+				});
+
+				// Extract metadata
+				if (options.extractMetadata) {
+					// Meta tags
+					const metaTags = document.querySelectorAll("meta");
+					metaTags.forEach((meta) => {
+						const name =
+							meta.getAttribute("name") || meta.getAttribute("property");
+						const content = meta.getAttribute("content");
+						if (name && content) {
+							data.metadata[name] = content;
+						}
+					});
+
+					// Open Graph tags
+					const ogTags = document.querySelectorAll('meta[property^="og:"]');
+					ogTags.forEach((meta) => {
+						const property = meta.getAttribute("property");
+						const content = meta.getAttribute("content");
+						if (property && content) {
+							data.metadata[property] = content;
+						}
+					});
+
+					// Twitter Card tags
+					const twitterTags = document.querySelectorAll(
+						'meta[name^="twitter:"]'
+					);
+					twitterTags.forEach((meta) => {
+						const name = meta.getAttribute("name");
+						const content = meta.getAttribute("content");
+						if (name && content) {
+							data.metadata[name] = content;
+						}
+					});
+				}
+
+				// Extract links
+				const links = document.querySelectorAll("a");
+				const rawLinks = Array.from(links).map((link) => ({
+					text: link.textContent.trim(),
+					href: link.href,
+					title: link.getAttribute("title") || "",
+				}));
+
+				// Remove duplicate links based on text, href, or title
+				const seenLinks = new Set();
+				data.links = rawLinks.filter((link) => {
+					const key = `${link.text}|${link.href}|${link.title}`;
+					if (seenLinks.has(key)) return false;
+					seenLinks.add(key);
+					return true;
+				});
+
+				if (options.includeSemanticContent) {
+					// Extract semantic content with optimized methods
+					const extractSemanticContent = (
+						selector,
+						processor = (el) => el.textContent.trim()
+					) => {
+						const elements = document.querySelectorAll(selector);
+						return elements.length > 0
+							? Array.from(elements).map(processor)
+							: [];
+					};
+
+					const extractTableContent = (table) => {
+						const rows = Array.from(table.querySelectorAll("tr"));
+						return rows
+							.map((row) => {
+								const cells = Array.from(row.querySelectorAll("td, th")).map(
+									(cell) => cell.textContent.trim()
+								);
+								return cells.filter((cell) => cell.length > 0);
+							})
+							.filter((row) => row.length > 0);
+					};
+
+					const extractListContent = (list) => {
+						return Array.from(list.querySelectorAll("li"))
+							.map((li) => li.textContent.trim())
+							.filter((item) => item.length > 0);
+					};
+
+					// Add semantic content to data.content structure
+					const rawSemanticContent = {
+						paragraphs: extractSemanticContent("p"),
+						divs: extractSemanticContent("div", (el) =>
+							el.textContent.trim().substring(0, 200)
+						),
+						tables: extractSemanticContent("table", extractTableContent),
+						blockquotes: extractSemanticContent("blockquote"),
+						preformatted: extractSemanticContent("pre"),
+						unorderedLists: extractSemanticContent("ul", extractListContent),
+						orderedLists: extractSemanticContent("ol", extractListContent),
+						codeBlocks: extractSemanticContent("code"),
+						articleSections: extractSemanticContent("article"),
+						sectionContent: extractSemanticContent("section"),
+						asideContent: extractSemanticContent("aside"),
+						mainContent: extractSemanticContent("main"),
+						headerContent: extractSemanticContent("header"),
+						footerContent: extractSemanticContent("footer"),
+						navContent: extractSemanticContent("aside"),
+						formContent: extractSemanticContent("form"),
+						fieldsetContent: extractSemanticContent("fieldset"),
+						labelContent: extractSemanticContent("label"),
+						spanContent: extractSemanticContent("span", (el) =>
+							el.textContent.trim().substring(0, 100)
+						),
+						strongContent: extractSemanticContent("strong"),
+						emContent: extractSemanticContent("em"),
+						markContent: extractSemanticContent("mark"),
+						smallContent: extractSemanticContent("small"),
+						citeContent: extractSemanticContent("cite"),
+						timeContent: extractSemanticContent("time"),
+						addressContent: extractSemanticContent("address"),
+						detailsContent: extractSemanticContent("details"),
+						summaryContent: extractSemanticContent("summary"),
+						figureContent: extractSemanticContent("figure"),
+						figcaptionContent: extractSemanticContent("figcaption"),
+						dlContent: extractSemanticContent("dl", (el) => {
+							const dts = Array.from(el.querySelectorAll("dt")).map((dt) =>
+								dt.textContent.trim()
+							);
+							const dds = Array.from(el.querySelectorAll("dd")).map((dd) =>
+								dd.textContent.trim()
+							);
+							return { terms: dts, definitions: dds };
+						}),
+					};
+
+					// Remove duplicates from semantic content
+					const removeDuplicates = (array) => {
+						if (!Array.isArray(array)) return array;
+						const seen = new Set();
+						return array.filter((item) => {
+							if (typeof item === "string") {
+								const normalized = item.toLowerCase().trim();
+								if (seen.has(normalized)) return false;
+								seen.add(normalized);
+								return true;
+							} else if (typeof item === "object" && item !== null) {
+								// Handle complex objects like tables and definition lists
+								const key = JSON.stringify(item);
+								if (seen.has(key)) return false;
+								seen.add(key);
+								return true;
+							}
+							return true;
+						});
+					};
+
+					// Apply duplicate removal to all semantic content
+					data.content.semanticContent = Object.fromEntries(
+						Object.entries(rawSemanticContent).map(([key, value]) => [
+							key,
+							removeDuplicates(value),
+						])
+					);
+				}
+
+				// Extract images
+				if (options.includeImages) {
+					const images = document.querySelectorAll("img[src]");
+					data.images = Array.from(images).map((img) => ({
+						src: img.src,
+						alt: img.alt || "",
+						title: img.title || "",
+						width: img.naturalWidth || img.width,
+						height: img.naturalHeight || img.height,
+					}));
+				}
+
+				// Extract custom selectors if provided
+				if (options.selectors && Object.keys(options.selectors).length > 0) {
+					data.customSelectors = {};
+					for (const [key, selector] of Object.entries(options.selectors)) {
+						try {
+							const elements = document.querySelectorAll(selector);
+							if (elements.length === 1) {
+								data.customSelectors[key] = elements[0].textContent.trim();
+							} else if (elements.length > 1) {
+								data.customSelectors[key] = Array.from(elements).map((el) =>
+									el.textContent.trim()
+								);
+							}
+						} catch (error) {
+							data.customSelectors[key] = null;
+						}
+					}
+				}
+
+				return data;
+			},
+			{
+				extractMetadata,
+				includeImages,
+				includeLinks,
+				includeSemanticContent,
+				selectors,
+			}
+		);
+
+		// Add page info - PUPPETEER ENDPOINT
+		scrapedData.pageInfo = {
+			url: url,
+			scrapedAt: new Date().toISOString(),
+			userAgent: await page.evaluate(() => navigator.userAgent),
+			viewport: await page.viewport(),
+			proxyInfo: null, // Proxy support not implemented in this version
+		};
+
+		await page.close();
+
+		// End performance monitoring
+		const endTime = performance.now();
+		const endCpuUsage = process.cpuUsage();
+		const endMemoryUsage = process.memoryUsage();
+
+		const performanceMetrics = {
+			duration: endTime - startTime,
+			cpuUsage: {
+				user: endCpuUsage.user - startCpuUsage.user,
+				system: endCpuUsage.system - startCpuUsage.system,
+				total:
+					endCpuUsage.user +
+					endCpuUsage.system -
+					(startCpuUsage.user + startCpuUsage.system),
+			},
+			memoryUsage: {
+				rss: endMemoryUsage.rss - startMemoryUsage.rss,
+				heapUsed: endMemoryUsage.heapUsed - startMemoryUsage.heapUsed,
+				heapTotal: endMemoryUsage.heapTotal - startMemoryUsage.heapTotal,
+			},
+			resourceBlocking: blockedResources,
+		};
+
+		console.log(
+			`   🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
+		);
+
 		return c.json({
-			success: false,
-			error: "Failed to process scrap-chat request",
-			details: error.message,
-			url: url || "Unknown",
+			success: true,
+			data: scrapedData,
+			url: url,
 			timestamp: new Date().toISOString(),
-		}, 500);
+			proxyUsed: null, // Proxy not supported in this version
+			useProxy: false,
+			performance: performanceMetrics,
+			note: "This endpoint uses Puppeteer with @sparticuz/chromium instead of Playwright",
+		});
+	} catch (error) {
+		console.error("❌ Web scraping error (Puppeteer):", error);
+
+		return c.json(
+			{
+				success: false,
+				error: "Failed to scrape URL using Puppeteer",
+				details: error.message,
+				url: url,
+			},
+			500
+		);
+	} finally {
+		if (browser) {
+			await browser.close();
+		}
 	}
 });

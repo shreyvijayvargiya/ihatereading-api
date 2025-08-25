@@ -23,3 +23,7 @@ app = "ihatereading-api"
 
 [processes]
   app = "node index.js"
+
+[deploy]
+  npx playwright instlll chromium
+

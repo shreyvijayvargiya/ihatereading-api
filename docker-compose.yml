@@ -1,11 +1,29 @@
-version: '3.7'
 services:
-  qdrant:
-    image: qdrant/qdrant
+  api:
+    build: .
     ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_storage:/qdrant/storage
+      - "3001:3001"
+    environment:
+      - FIREBASE_DATABASE_URL=https://ihatereading-4ba52-default-rtdb.firebaseio.com/
+      - FIREBASE_PROJECT_ID=ihatereading-4ba52
+      - FIREBASE_API_KEY=AIzaSyAz-hjGhuQ4wczQMYOAMI9vR2gT7Sw9L6E
+      - FIREBASE_BUCKET=ihatereading-4ba52.appspot.com
+
+      - LEMON_SQUEEZY_API_KEY=eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiI5NGQ1OWNlZi1kYmI4LTRlYTUtYjE3OC1kMjU0MGZjZDY5MTkiLCJqdGkiOiI5ZGQ2MWMwMjViOTU4MDBhYjg2OGZmOWM2YmJiOGI2MjcwMDZjMzk3NjU2MzI4YzQ4ZmVlNTQwNjI0MzUwYzY5ZWY1NmM2MmM2MDg2NTJkZiIsImlhdCI6MTc0ODU3NzczOS44MzM5OTYsIm5iZiI6MTc0ODU3NzczOS44MzM5OTgsImV4cCI6MjA2NDExMDUzOS43OTAxNjIsInN1YiI6IjE5MDI3OCIsInNjb3BlcyI6W119.knvc-jAdvTVWCCN8M5ItdqgrIysUYnsTJIjU6ZeVe0y1jSv4EkJxlRWa15dq-gcnYprN-UavwmK0A8HO_RyfsbcXtOGiwhb6Sv2FTLusu64UoreScEcWMqQxjImi7PdYPVXTznPJknVJaUdUEt3qZ8gAdrJWGGQ1P5DW-0_7CBJOupJR3fX8jTffFCgLde-SXivfAK1ap1fBGyZNCKQqLvkqWJSMyJreulDkmwPymCNy53PzWcPZTZddQUwJnD0Qe8yI61XS0uqtU9sEW39IyqIt0c13-R6eezuCAHUSBzy8R8U3fvUzRJSdsRmHheSjdc88czaY-8FBhwhjibmAsXTHljPysqkNchujeH7-iT8T9S1EaisW9zxmUdJ3RK-M95HeurD1DW5RLbHDt0G20d-bK-oJsRdmMXoEI6S_owp9khA8JrAFl_zmErZJD7XKzWPLDvq2b_P1orFTGiMzp20MIz57LFazjtTzOWWoOrSEKyqHAHeWxrEGxxPxx1EE
+      - LEMON_SQUEEZY_STORE_ID=12787
+      - LEMON_SQUEEZY_WEBHOOK_SECRET=payment_secret
+      - POLAR_ACCESS_TOKEN=polar_oat_6RfsX7bLiCJKSdfU3p8ZHqDqLIP0CwWPc5JVs0rB26W
+
+      - GOOGLE_GENAI_API_KEY=AIzaSyDZ5jAUygnE6iwxZK6SSpJ-kH3bVR3IxCg
+      - MEDIUM_TOKEN=2a30ec7de381af1ea176580698b5844746129a01daba6acff376c8c55a373140b
+
+      - FIRECRAWL_API_KEY=fc-e9fcef36e3bf4a13baef8d45c41158c9
+      - DEV_TO_API_TOKEN=fyPdBfuPZpVRcRsZaQEuiaj6
+
+      - SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJidmlld21zcWd0ZXB3a2JwYWtsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTY2ODc3MDYyMCwiZXhwIjoxOTg0MzQ2NjIwfQ.quS6qtS81uaJ2QRgoZ4PyDXIQQvmbk0nHyaZs-xOOEM
+      - SUPABASE_URL=https://bbviewmsqgtepwkbpakl.supabase.co
+    env_file:
+      - .env
 
 volumes:
   qdrant_storage:
