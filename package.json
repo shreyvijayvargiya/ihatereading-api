@@ -5,8 +5,7 @@
 	"main": "index.js",
 	"scripts": {
 		"start": "node index.js",
-		"dev": "nodemon index.js",
-		"build": "npx playwright install chromium"
+		"dev": "nodemon index.js"
 	},
 	"dependencies": {
 		"@google/genai": "^1.10.0",

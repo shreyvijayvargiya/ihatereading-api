@@ -8,8 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
 import { ChatOllama, Ollama } from "@langchain/ollama";
-const { request } = await import("undici");
-import aiWebSearchAgent from "./ai-examples/ai-web-search-agent.js";
+
 
 const ollama = new ChatOllama({
 	// model: "gemma:2b",
