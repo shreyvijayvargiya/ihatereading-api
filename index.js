@@ -8,7 +8,9 @@ import { createClient } from "@supabase/supabase-js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
 import { ChatOllama, Ollama } from "@langchain/ollama";
+import UserAgent from "user-agents";
 
+const userAgents = new UserAgent();
 
 const ollama = new ChatOllama({
 	// model: "gemma:2b",
@@ -2249,7 +2251,6 @@ app.post("/find-latest-jobs", async (c) => {
 	});
 });
 
-
 // Dedicated Bing Search endpoint using Playwright (like multi-search)
 app.post("/bing-search", async (c) => {
 	const {
@@ -2803,7 +2804,7 @@ app.post("/scrap-url", async (c) => {
 		scrapedData.pageInfo = {
 			url: url,
 			scrapedAt: new Date().toISOString(),
-			userAgent: await page.evaluate(() => navigator.userAgent),
+			userAgent: userAgents.random().toString(),
 			viewport: await page.viewportSize(),
 			proxyInfo:
 				useProxy && context.proxyInfo
@@ -5889,48 +5890,120 @@ const firecrawlUrlScrapFunction = async (query) => {
 app.post("/ai-url-chat", async (c) => {
 	const { link, prompt } = await c.req.json();
 
-	// Use the new scrap-url-puppeteer endpoint instead of firecrawl
-	const puppeteerResponse = await fetch(
-		`http://localhost:3001/scrap-url-puppeteer`,
-		{
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				url: link,
-				includeSemanticContent: true,
-				includeImages: false,
-				includeLinks: true,
-				extractMetadata: true,
-				timeout: 30000,
-			}),
-		}
-	);
+	// Call the puppeteer scraping logic directly instead of making HTTP request
+	let scrapedData = {};
+	let browser;
 
-	if (!puppeteerResponse.ok) {
-		return c.json({ error: "Failed to scrape URL using Puppeteer" }, 500);
-	}
+	try {
+		// Import puppeteer-core and chromium
+		const puppeteer = await import("puppeteer-core");
+		const chromium = (await import("@sparticuz/chromium")).default;
 
-	const puppeteerData = await puppeteerResponse.json();
-	console.log("Puppeteer scraping result:", puppeteerData);
+		// Launch browser with @sparticuz/chromium for Vercel environment
+		browser = await puppeteer.launch({
+			headless: true,
+			args: chromium.args,
+			executablePath: await chromium.executablePath(),
+			ignoreDefaultArgs: ["--disable-extensions"],
+		});
 
-	if (!puppeteerData.success) {
+		const page = await browser.newPage();
+		await page.setViewport({ width: 1920, height: 1080 });
+		await page.setUserAgent(userAgents.random().toString());
+
+		// Navigate to URL
+		await page.goto(link, {
+			waitUntil: "domcontentloaded",
+			timeout: 30000,
+		});
+
+		// Extract page content
+		scrapedData = await page.evaluate(() => {
+			const data = {
+				url: window.location.href,
+				title: document.title,
+				content: {},
+				metadata: {},
+				links: [],
+			};
+
+			// Extract headings
+			["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
+				data.content[tag] = Array.from(document.querySelectorAll(tag)).map(
+					(h) => h.textContent.trim()
+				);
+			});
+
+			// Extract metadata
+			const metaTags = document.querySelectorAll("meta");
+			metaTags.forEach((meta) => {
+				const name = meta.getAttribute("name") || meta.getAttribute("property");
+				const content = meta.getAttribute("content");
+				if (name && content) {
+					data.metadata[name] = content;
+				}
+			});
+
+			// Extract links with optimization
+			const links = document.querySelectorAll("a");
+			const rawLinks = Array.from(links).map((link) => ({
+				text: link.textContent.trim(),
+				href: link.href,
+				title: link.getAttribute("title") || "",
+			}));
+
+			// Remove empty href links and duplicates using Set
+			const seenHrefs = new Set();
+			data.links = rawLinks.filter((link) => {
+				// Remove links with empty href
+				if (
+					!link.href ||
+					link.href === "" ||
+					link.href === "undefined" ||
+					link.href === "null"
+				)
+					return false;
+
+				// Remove duplicate hrefs
+				if (seenHrefs.has(link.href)) return false;
+				seenHrefs.add(link.href);
+				return true;
+			});
+
+			// Extract semantic content
+			data.content.paragraphs = Array.from(document.querySelectorAll("p")).map(
+				(p) => p.textContent.trim()
+			);
+			data.content.lists = Array.from(document.querySelectorAll("ul, ol")).map(
+				(list) =>
+					Array.from(list.querySelectorAll("li")).map((li) =>
+						li.textContent.trim()
+					)
+			);
+
+			return data;
+		});
+
+		await page.close();
+	} catch (error) {
+		console.error("❌ Puppeteer scraping error:", error);
 		return c.json(
-			{ error: "Puppeteer scraping failed", details: puppeteerData.error },
+			{ error: "Failed to scrape URL", details: error.message },
 			500
 		);
+	} finally {
+		if (browser) {
+			await browser.close();
+		}
 	}
 
 	// Extract the scraped content for the LLM
-	const scrapedContent = puppeteerData.data;
 	const contentForLLM = {
-		title: scrapedContent.title,
-		url: scrapedContent.url,
-		content: scrapedContent.content,
-		metadata: scrapedContent.metadata,
-		links: scrapedContent.links,
-		semanticContent: scrapedContent.content.semanticContent || {},
+		title: scrapedData.title,
+		url: scrapedData.url,
+		content: scrapedData.content,
+		metadata: scrapedData.metadata,
+		links: scrapedData.links,
 	};
 
 	const response = await genai.models.generateContent({
@@ -6042,9 +6115,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 		// Set viewport and user agent
 		await page.setViewport({ width: 1920, height: 1080 });
-		await page.setUserAgent(
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-		);
+		await page.setUserAgent(userAgents.random().toString());
 
 		// Set extra headers
 		await page.setExtraHTTPHeaders({
@@ -6453,5 +6524,36 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		if (browser) {
 			await browser.close();
 		}
+	}
+});
+
+app.post("/repo", async (c) => {
+	const { name } = await c.req.json();
+
+	const owner = "rumca-js";
+
+	//https://github.com/rumca-js/RSS-Link-Database-2025/tree/main
+	try {
+		const url = `https://api.github.com/repos/${owner}/${name}`;
+		const response = await fetch(
+			`https://api.github.com/repos/${owner}/${name}/contents`,
+			{
+				headers: {
+					Authorization: `token ${process.env.GITHUB_TOKEN}`,
+					"User-Agent": "node-fetch", // GitHub requires User-Agent
+					Accept: "application/vnd.github+json",
+				},
+			}
+		);
+
+		if (!response.ok) {
+			return c.json({ error: "Failed to fetch repo" }, response.status);
+		}
+
+		const data = await response.json();
+		return c.json(data);
+	} catch (error) {
+		console.error(error);
+		return c.json({ error: "Internal Server Error" }, 500);
 	}
 });
