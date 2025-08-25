@@ -625,7 +625,11 @@ const app = new Hono();
 app.use(
 	"*",
 	cors({
-		origin: ["*"], // Allow all origins (or specify your domain)
+		origin: [
+			"http://localhost:4001",
+			"http://localhost:3000",
+			"http://localhost:3001",
+		], // Allow specific origins
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 		allowHeaders: ["Content-Type", "Authorization"],
 		credentials: true,
