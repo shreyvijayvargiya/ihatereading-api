@@ -5708,7 +5708,6 @@ app.post("/take-screenshot", async (c) => {
 				const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
 
 				// Clean up local file
-				await fs.rm(screenshotFileName, { force: true });
 
 				return c.json({
 					success: true,
@@ -5719,13 +5718,6 @@ app.post("/take-screenshot", async (c) => {
 				});
 			} catch (firebaseError) {
 				console.error("❌ Error uploading to Firebase storage:", firebaseError);
-
-				// Clean up local file if it exists
-				try {
-					await fs.rm(screenshotFileName, { force: true });
-				} catch (cleanupError) {
-					console.warn("⚠️ Could not clean up screenshot file:", cleanupError);
-				}
 
 				return c.json(
 					{
@@ -5738,13 +5730,6 @@ app.post("/take-screenshot", async (c) => {
 			}
 		} catch (captureError) {
 			console.error("❌ Error capturing screenshot:", captureError);
-
-			// Clean up local file if it exists
-			try {
-				await fs.rm(screenshotFileName, { force: true });
-			} catch (cleanupError) {
-				console.warn("⚠️ Could not clean up screenshot file:", cleanupError);
-			}
 
 			return c.json(
 				{
