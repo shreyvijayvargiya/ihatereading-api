@@ -12,8 +12,8 @@ import { ChatOllama, Ollama } from "@langchain/ollama";
 import UserAgent from "user-agents";
 import { Markdown } from "markdown-to-html";
 import { pipeline } from "@xenova/transformers";
-import captureWebsite from "capture-website";
 import fs from "fs/promises";
+import { v4 as uuidv4 } from "uuid";
 
 const userAgents = new UserAgent();
 
@@ -5014,6 +5014,46 @@ Read the data and answer the user question as given above.
 	}
 });
 
+const uploadImageToFirebaseStorage = async () => {
+	// Upload to Firebase storage
+	const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+	const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
+
+	try {
+		await file.save(websiteScreenshot, {
+			metadata: {
+				contentType: "image/png",
+				cacheControl: "public, max-age=3600",
+			},
+		});
+
+		// Make the file publicly accessible
+		await file.makePublic();
+
+		// Get the public URL
+		const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+
+		// Clean up local file
+		await fs.rm(screenshotFileName, { force: true });
+
+		return {
+			success: true,
+			url: url,
+			title: title,
+			screenshot: screenshotUrl,
+			storagePath: `ihr-website-screenshot/${uniqueFileName}`,
+			timestamp: new Date().toISOString(),
+		};
+	} catch (firebaseError) {
+		console.error("❌ Error uploading to Firebase storage:", firebaseError);
+
+		return {
+			success: false,
+			error: "Failed to upload screenshot to Firebase storage",
+			details: firebaseError.message,
+		};
+	}
+};
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
 	const {
@@ -5479,7 +5519,13 @@ app.post("/scrap-url-puppeteer", async (c) => {
 // Take Screenshot API Endpoint
 app.post("/take-screenshot", async (c) => {
 	try {
-		const { url, title = "Website Screenshot" } = await c.req.json();
+		const {
+			url,
+			title = "Website Screenshot",
+			waitForSelector,
+			timeout = 30000,
+			includeImages = false,
+		} = await c.req.json();
 
 		if (!url) {
 			return c.json(
@@ -5504,8 +5550,6 @@ app.post("/take-screenshot", async (c) => {
 			);
 		}
 
-		console.log(`📸 Taking screenshot of: ${url}`);
-
 		// Capture website screenshot
 		const screenshotFileName = `screenshot-${title.replaceAll(
 			" ",
@@ -5513,19 +5557,134 @@ app.post("/take-screenshot", async (c) => {
 		)}-${Date.now()}.png`;
 
 		try {
-			await captureWebsite.file(url, screenshotFileName, {
-				width: 1920,
-				height: 1080,
-				deviceScaleFactor: 1,
-				waitForElement: "body",
-				timeout: 30000,
+			// Import puppeteer-core and chromium
+			const puppeteer = await import("puppeteer-core");
+			const chromium = (await import("@sparticuz/chromium")).default;
+
+			let browser;
+			let scrapedData;
+
+			// Try to launch browser with @sparticuz/chromium first
+			try {
+				const executablePath = await chromium.executablePath();
+
+				browser = await puppeteer.launch({
+					headless: true,
+					args: chromium.args,
+					executablePath: executablePath,
+					ignoreDefaultArgs: ["--disable-extensions"],
+				});
+			} catch (chromiumError) {
+				// Fallback: try to use system Chrome or let puppeteer find a browser
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath:
+						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+					args: [
+						"--no-sandbox",
+						"--disable-setuid-sandbox",
+						"--disable-dev-shm-usage",
+						"--disable-gpu",
+						"--disable-web-security",
+					],
+				});
+			}
+
+			const page = await browser.newPage();
+
+			// Set viewport and user agent
+			await page.setViewport({ width: 1920, height: 1080 });
+			await page.setUserAgent(userAgents.random().toString());
+
+			// Set extra headers
+			await page.setExtraHTTPHeaders({
+				dnt: "1",
+				"upgrade-insecure-requests": "1",
+				accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+				"sec-fetch-site": "none",
+				"sec-fetch-mode": "navigate",
+				"sec-fetch-user": "?1",
+				"sec-fetch-dest": "document",
+				"accept-language": "en-US,en;q=0.9",
 			});
 
-			// Read the screenshot file
-			const websiteScreenshot = await fs.readFile(screenshotFileName);
+			// Set request interception
+			await page.setRequestInterception(true);
+			await page.setJavaScriptEnabled(true);
+			page.on("request", (request) => {
+				request.continue();
+			});
+
+			// Navigate to URL
+			await page.goto(url, {
+				waitUntil: "domcontentloaded",
+				timeout: timeout,
+			});
+
+			// Wait for specific selector if provided
+			if (waitForSelector) {
+				try {
+					await page.waitForSelector(waitForSelector, { timeout: 10000 });
+				} catch (error) {
+					console.warn(`Selector ${waitForSelector} not found within timeout`);
+				}
+			}
+
+			const screenshotBuffer = await page.screenshot({
+				path: screenshotFileName,
+				fullPage: false,
+				optimizeForSpeed: true,
+				encoding: "binary",
+			});
+
+			// Extract page content
+			scrapedData = await page.evaluate(async () => {
+				const data = {
+					url: window.location.href,
+					timestamp: new Date().toISOString(),
+					metadata: {},
+					screenshot: null,
+				};
+
+				// Meta tags
+				const metaTags = document.querySelectorAll("meta");
+				metaTags.forEach((meta) => {
+					const name =
+						meta.getAttribute("name") || meta.getAttribute("property");
+					const content = meta.getAttribute("content");
+					if (name && content) {
+						data.metadata[name] = content;
+					}
+				});
+
+				// Open Graph tags
+				const ogTags = document.querySelectorAll('meta[property^="og:"]');
+				ogTags.forEach((meta) => {
+					const property = meta.getAttribute("property");
+					const content = meta.getAttribute("content");
+					if (property && content) {
+						data.metadata[property] = content;
+					}
+				});
+
+				// Twitter Card tags
+				const twitterTags = document.querySelectorAll('meta[name^="twitter:"]');
+				twitterTags.forEach((meta) => {
+					const name = meta.getAttribute("name");
+					const content = meta.getAttribute("content");
+					if (name && content) {
+						data.metadata[name] = content;
+					}
+				});
+
+				return data;
+			});
+
+			await page.close();
 
 			// Generate a unique filename for Supabase storage
-			const uniqueFileName = `screenshots/${Date.now()}-${url.replace(
+			const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(
 				/[^a-zA-Z0-9]/g,
 				""
 			)}.png`;
@@ -5535,7 +5694,7 @@ app.post("/take-screenshot", async (c) => {
 			const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
 
 			try {
-				await file.save(websiteScreenshot, {
+				await file.save(screenshotBuffer, {
 					metadata: {
 						contentType: "image/png",
 						cacheControl: "public, max-age=3600",
@@ -5554,9 +5713,8 @@ app.post("/take-screenshot", async (c) => {
 				return c.json({
 					success: true,
 					url: url,
-					title: title,
+					metadata: scrapedData.metadata,
 					screenshot: screenshotUrl,
-					storagePath: `ihr-website-screenshot/${uniqueFileName}`,
 					timestamp: new Date().toISOString(),
 				});
 			} catch (firebaseError) {
