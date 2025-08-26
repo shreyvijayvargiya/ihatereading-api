@@ -864,6 +864,7 @@ app.use(
 			"http://localhost:4001",
 			"http://localhost:3000",
 			"http://localhost:3001",
+			"https://ihatereading-api.vercel.app/",
 		], // Allow specific origins
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 		allowHeaders: ["Content-Type", "Authorization"],
