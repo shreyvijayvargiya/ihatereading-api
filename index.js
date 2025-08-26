@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import { firestore } from "./firebase.js";
+import { firestore, storage } from "./firebase.js";
 import { GoogleGenAI } from "@google/genai";
 import { chromium } from "playwright";
 import dotenv from "dotenv";
@@ -11,6 +11,9 @@ import { cpus } from "os";
 import { ChatOllama, Ollama } from "@langchain/ollama";
 import UserAgent from "user-agents";
 import { Markdown } from "markdown-to-html";
+import { pipeline } from "@xenova/transformers";
+import captureWebsite from "capture-website";
+import fs from "fs/promises";
 
 const userAgents = new UserAgent();
 
@@ -618,6 +621,238 @@ const supabase = createClient(
 	process.env.SUPABASE_URL,
 	process.env.SUPABASE_KEY
 );
+
+// Initialize the embedding model
+let embedder = null;
+
+// Initialize embedding model asynchronously
+async function initializeEmbedder() {
+	try {
+		console.log("🔄 Initializing embedding model...");
+		embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+		console.log("✅ Embedding model initialized successfully");
+	} catch (error) {
+		console.error("❌ Failed to initialize embedding model:", error);
+	}
+}
+
+// Initialize the embedder when the server starts
+initializeEmbedder();
+
+// Function to create embeddings for text
+async function createEmbedding(text) {
+	if (!embedder) {
+		throw new Error(
+			"Embedding model not initialized. Please wait for initialization to complete."
+		);
+	}
+
+	try {
+		const embedding = await embedder(text);
+		return embedding;
+	} catch (error) {
+		console.error("Error creating embedding:", error);
+		throw new Error(`Failed to create embedding: ${error.message}`);
+	}
+}
+
+// Function to create embeddings for multiple text chunks
+async function embedChunks(chunks) {
+	if (!embedder) {
+		throw new Error(
+			"Embedding model not initialized. Please wait for initialization to complete."
+		);
+	}
+
+	try {
+		return Promise.all(
+			chunks.map(async (chunk) => {
+				const embedding = await embedder(chunk);
+				return { chunk, embedding };
+			})
+		);
+	} catch (error) {
+		console.error("Error creating embeddings for chunks:", error);
+		throw new Error(`Failed to create embeddings for chunks: ${error.message}`);
+	}
+}
+
+// Function to convert scraped data to markdown format
+function toMarkdown(data) {
+	if (!data || typeof data !== "object") {
+		throw new Error("Invalid data provided for markdown conversion");
+	}
+
+	let md = "";
+
+	// Add title if available
+	if (data.title) {
+		md += `# ${data.title}\n\n`;
+	}
+
+	// Add H1 headings if available
+	if (data.content && data.content.h1 && Array.isArray(data.content.h1)) {
+		data.content.h1.forEach((h) => {
+			if (h && h.trim()) {
+				md += `# ${h.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add H2 headings if available
+	if (data.content && data.content.h2 && Array.isArray(data.content.h2)) {
+		data.content.h2.forEach((h) => {
+			if (h && h.trim()) {
+				md += `## ${h.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add H3 headings if available
+	if (data.content && data.content.h3 && Array.isArray(data.content.h3)) {
+		data.content.h3.forEach((h) => {
+			if (h && h.trim()) {
+				md += `### ${h.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add H4 headings if available
+	if (data.content && data.content.h4 && Array.isArray(data.content.h4)) {
+		data.content.h4.forEach((h) => {
+			if (h && h.trim()) {
+				md += `#### ${h.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add H5 headings if available
+	if (data.content && data.content.h5 && Array.isArray(data.content.h5)) {
+		data.content.h5.forEach((h) => {
+			if (h && h.trim()) {
+				md += `##### ${h.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add H6 headings if available
+	if (data.content && data.content.h6 && Array.isArray(data.content.h6)) {
+		data.content.h6.forEach((h) => {
+			if (h && h.trim()) {
+				md += `###### ${h.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add paragraphs from semantic content if available
+	if (
+		data.content &&
+		data.content.semanticContent &&
+		data.content.semanticContent.paragraphs &&
+		Array.isArray(data.content.semanticContent.paragraphs)
+	) {
+		data.content.semanticContent.paragraphs.forEach((p) => {
+			if (p && p.trim()) {
+				md += `${p.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add regular paragraphs if available
+	if (
+		data.content &&
+		data.content.paragraphs &&
+		Array.isArray(data.content.paragraphs)
+	) {
+		data.content.paragraphs.forEach((p) => {
+			if (p && p.trim()) {
+				md += `${p.trim()}\n\n`;
+			}
+		});
+	}
+
+	// Add lists if available
+	if (data.content && data.content.lists && Array.isArray(data.content.lists)) {
+		data.content.lists.forEach((list) => {
+			if (list && Array.isArray(list.items)) {
+				list.items.forEach((item) => {
+					if (item && item.trim()) {
+						md += `- ${item.trim()}\n`;
+					}
+				});
+				md += "\n";
+			}
+		});
+	}
+
+	// Add ordered lists if available
+	if (
+		data.content &&
+		data.content.orderedLists &&
+		Array.isArray(data.content.orderedLists)
+	) {
+		data.content.orderedLists.forEach((list) => {
+			if (list && Array.isArray(list.items)) {
+				list.items.forEach((item, index) => {
+					if (item && item.trim()) {
+						md += `${index + 1}. ${item.trim()}\n`;
+					}
+				});
+				md += "\n";
+			}
+		});
+	}
+
+	// Add links if available
+	if (data.content && data.content.links && Array.isArray(data.content.links)) {
+		md += "## Links\n\n";
+		data.content.links.forEach((link) => {
+			if (link && link.href && link.text) {
+				md += `- [${link.text.trim()}](${link.href})\n`;
+			}
+		});
+		md += "\n";
+	}
+
+	// Add images if available
+	if (
+		data.content &&
+		data.content.images &&
+		Array.isArray(data.content.images)
+	) {
+		md += "## Images\n\n";
+		data.content.images.forEach((img) => {
+			if (img && img.src) {
+				const alt = img.alt || img.title || "Image";
+				md += `![${alt}](${img.src})\n\n`;
+			}
+		});
+	}
+
+	// Add metadata if available
+	if (data.meta) {
+		md += "## Metadata\n\n";
+		if (data.meta.description) {
+			md += `**Description:** ${data.meta.description}\n\n`;
+		}
+		if (data.meta.keywords) {
+			md += `**Keywords:** ${data.meta.keywords.join(", ")}\n\n`;
+		}
+		if (data.meta.author) {
+			md += `**Author:** ${data.meta.author}\n\n`;
+		}
+	}
+
+	// Add URL information
+	if (data.url) {
+		md += `**Source URL:** ${data.url}\n\n`;
+	}
+
+	// Add timestamp
+	md += `**Generated:** ${new Date().toISOString()}\n\n`;
+
+	return md.trim();
+}
 
 const app = new Hono();
 
@@ -2705,158 +2940,6 @@ app.post("/scrap-url", async (c) => {
 	}
 });
 
-// Google News Scraping API - Scrape news from Google News search
-app.post("/scrape-google-news", async (c) => {
-	const {
-		city,
-		state,
-		country = "IN",
-		language = "en-IN",
-		timeout = 30000,
-		maxArticles = 20,
-		includeImages = false,
-		includeLinks = true,
-	} = await c.req.json();
-
-	if (!city || !state) {
-		return c.json({ error: "City and state are required" }, 400);
-	}
-
-	// Construct Google News URL
-	const query = `${city}%20${state}`;
-	const googleNewsUrl = `https://news.google.com/search?q=${query}&hl=${language}&gl=${country}&ceid=${country}:${
-		language.split("-")[0]
-	}`;
-
-	let browser;
-	let scrapedData = {};
-
-	try {
-		// Launch browser with anti-detection settings
-		browser = await chromium.launch({
-			headless: true,
-			args: [
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-dev-shm-usage",
-				"--disable-gpu",
-				"--disable-web-security",
-				"--disable-features=VizDisplayCompositor",
-			],
-		});
-
-		const context = await browser.newContext({
-			userAgent:
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			viewport: { width: 1920, height: 1080 },
-			extraHTTPHeaders: {
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-				"sec-fetch-site": "none",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				"accept-language": "en-US,en;q=0.9",
-			},
-		});
-
-		const page = await context.newPage();
-
-		// Block unnecessary resources for faster loading
-		await page.route("**/*", (route) => {
-			const type = route.request().resourceType();
-			if (["font", "stylesheet", "image"].includes(type) && !includeImages) {
-				return route.abort();
-			}
-			return route.continue();
-		});
-
-		// Navigate to Google News URL
-		await page.goto(googleNewsUrl, {
-			waitUntil: "domcontentloaded",
-			timeout: timeout,
-		});
-
-		// Wait for news articles to load
-		await page.waitForTimeout(3000);
-
-		// Use the existing scrap-url logic by calling it internally
-		const scrapeRequest = {
-			url: googleNewsUrl,
-			userQuestion: `Extract news articles about ${city} ${state} from this Google News page. Focus on the main news articles, their titles, sources, and timestamps.`,
-			selectors: {
-				articles:
-					"article[data-n-tid], div[data-n-tid], div[jslog], div[data-ved]",
-				searchQuery: 'input[aria-label*="Search"], input[name="q"]',
-				relatedTopics:
-					'a[href*="search?q="], div[role="button"], span[role="button"]',
-			},
-			waitForSelector: "article[data-n-tid], div[data-n-tid]",
-			timeout: timeout,
-			includeImages: includeImages,
-			includeLinks: includeLinks,
-			extractMetadata: true,
-		};
-
-		// Call the existing scrap-url endpoint logic
-		const response = await fetch(`http://localhost:3001/scrap-url`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify(scrapeRequest),
-		});
-
-		if (!response.ok) {
-			throw new Error(`Scraping failed: ${response.statusText}`);
-		}
-
-		const scrapeResult = await response.json();
-		scrapedData = scrapeResult.data || scrapeResult;
-
-		// Add page info
-		scrapedData.pageInfo = {
-			url: googleNewsUrl,
-			scrapedAt: new Date().toISOString(),
-			searchQuery: `${city} ${state}`,
-			city,
-			state,
-			country,
-			language,
-			userAgent: await page.evaluate(() => navigator.userAgent),
-			viewport: await page.viewportSize(),
-		};
-
-		await page.close();
-		await context.close();
-
-		return c.json({
-			success: true,
-			data: scrapedData,
-			url: googleNewsUrl,
-			timestamp: new Date().toISOString(),
-		});
-	} catch (error) {
-		console.error("❌ Google News scraping error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to scrape Google News",
-				details: error.message,
-				url: googleNewsUrl,
-				searchQuery: `${city} ${state}`,
-			},
-			500
-		);
-	} finally {
-		if (browser) {
-			await browser.close();
-		}
-	}
-});
-
 // Scrap images for the internet
 app.post("/scrap-images", async (c) => {
 	const { query, platform } = await c.req.json();
@@ -3510,482 +3593,6 @@ const wikipediaScrapingQueue = {
 	},
 };
 
-// Bulk Wikipedia scraping endpoint
-// Required columns in locations table:
-// - id, name, state, latitude, longitude
-// Optional columns (will be created if they don't exist):
-// - wikipedia_content, wikipedia_url
-app.post("/bulk-wikipedia-scrap", async (c) => {
-	try {
-		const {
-			batchSize = 50,
-			maxConcurrentBrowsers = 3,
-			useProxy = false,
-			forceRestart = false,
-		} = await c.req.json();
-
-		// Force restart if requested
-		if (forceRestart) {
-			wikipediaScrapingQueue.batches.clear();
-			wikipediaScrapingQueue.currentBatch = 0;
-			wikipediaScrapingQueue.isProcessing = false;
-			console.log("🔄 Wikipedia scraping queue restarted");
-		}
-
-		// Check if already processing
-		if (wikipediaScrapingQueue.isProcessing) {
-			return c.json(
-				{
-					success: false,
-					error: "Wikipedia scraping is already in progress",
-					currentStatus: wikipediaScrapingQueue.getStats(),
-					suggestion: "Use forceRestart: true to restart the queue",
-				},
-				409
-			);
-		}
-
-		console.log("🚀 Starting bulk Wikipedia scraping...");
-
-		// Fetch locations from Supabase
-		// Note: Only selecting columns that actually exist in the table
-		const { data: locations, error: fetchError } = await supabase
-			.from("locations")
-			.select("id, name, state, latitude, longitude")
-			.order("id", { ascending: false })
-			.limit(40);
-
-		if (fetchError) {
-			console.error("❌ Error fetching locations from Supabase:", fetchError);
-			return c.json(
-				{
-					success: false,
-					error: "Failed to fetch locations from database",
-					details: fetchError.message,
-				},
-				500
-			);
-		}
-
-		if (!locations || locations.length === 0) {
-			return c.json(
-				{
-					success: false,
-					error: "No locations found in database",
-					suggestion:
-						"Ensure the locations table has data before running Wikipedia scraping",
-				},
-				404
-			);
-		}
-
-		console.log(`📊 Found ${locations.length} locations to process`);
-		console.log(`📋 Sample location data:`, locations[0]);
-
-		// Create batches
-		const batches = [];
-		for (let i = 0; i < locations.length; i += batchSize) {
-			const batch = locations.slice(i, i + batchSize);
-			const batchNumber = batches.length;
-			batches.push({ batchNumber, locations: batch });
-
-			// Add to queue
-			wikipediaScrapingQueue.addBatch(batchNumber, batch);
-		}
-
-		console.log(
-			`📦 Created ${batches.length} batches of ${batchSize} locations each`
-		);
-
-		// Start processing in background
-		wikipediaScrapingQueue.isProcessing = true;
-		processWikipediaBatches(batches, maxConcurrentBrowsers, useProxy);
-
-		return c.json({
-			success: true,
-			message: "Bulk Wikipedia scraping started successfully",
-			data: {
-				totalLocations: locations.length,
-				batchSize,
-				totalBatches: batches.length,
-				maxConcurrentBrowsers,
-				useProxy,
-				queueStatus: wikipediaScrapingQueue.getStats(),
-			},
-			endpoints: {
-				status: "/wikipedia-scraping-status",
-				results: "/wikipedia-scraping-results",
-			},
-		});
-	} catch (error) {
-		console.error("❌ Bulk Wikipedia scraping error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to start bulk Wikipedia scraping",
-				details: error.message,
-			},
-			500
-		);
-	}
-});
-
-// Wikipedia scraping status endpoint
-app.get("/wikipedia-scraping-status", (c) => {
-	return c.json({
-		success: true,
-		status: wikipediaScrapingQueue.getStats(),
-		timestamp: new Date().toISOString(),
-	});
-});
-
-// Wikipedia scraping results endpoint
-app.get("/wikipedia-scraping-results", (c) => {
-	const { batchNumber } = c.req.query();
-
-	if (batchNumber !== undefined) {
-		const batch = wikipediaScrapingQueue.batches.get(parseInt(batchNumber));
-		if (!batch) {
-			return c.json(
-				{
-					success: false,
-					error: `Batch ${batchNumber} not found`,
-				},
-				404
-			);
-		}
-
-		return c.json({
-			success: true,
-			batchNumber: parseInt(batchNumber),
-			data: batch,
-		});
-	}
-
-	// Return all completed batches
-	const completedBatches = Array.from(wikipediaScrapingQueue.batches.entries())
-		.filter(([_, batch]) => batch.status === "completed")
-		.map(([number, batch]) => ({
-			batchNumber: number,
-			status: batch.status,
-			startedAt: batch.startedAt,
-			completedAt: batch.completedAt,
-			successCount: batch.successCount,
-			failedCount: batch.failedCount,
-			results: batch.results.slice(0, 10), // Return first 10 results for preview
-		}));
-
-	return c.json({
-		success: true,
-		completedBatches,
-		totalCompleted: completedBatches.length,
-	});
-});
-
-// Background processing function
-async function processWikipediaBatches(
-	batches,
-	maxConcurrentBrowsers,
-	useProxy
-) {
-	try {
-		// Process batches sequentially to avoid overwhelming Wikipedia
-		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-			const { batchNumber, locations } = batches[batchIndex];
-
-			// Mark batch as started
-			wikipediaScrapingQueue.markBatchStarted(batchNumber);
-
-			// Process current batch
-			const batchResults = await processWikipediaBatch(
-				locations,
-				maxConcurrentBrowsers,
-				useProxy
-			);
-
-			// Mark batch as completed
-			wikipediaScrapingQueue.markBatchCompleted(batchNumber, batchResults);
-
-			// Store results in Supabase
-			await storeWikipediaResults(batchResults);
-
-			// Add delay between batches to be respectful to Wikipedia
-			if (batchIndex < batches.length - 1) {
-				const delay = Math.min(5000, locations.length * 100); // Adaptive delay
-				console.log(`⏳ Waiting ${delay}ms before next batch...`);
-				await new Promise((resolve) => setTimeout(resolve, delay));
-			}
-		}
-
-		console.log("🎉 All Wikipedia batches completed successfully!");
-		wikipediaScrapingQueue.isProcessing = false;
-	} catch (error) {
-		console.error("❌ Error processing Wikipedia batches:", error);
-		wikipediaScrapingQueue.isProcessing = false;
-	}
-}
-
-// Process a single batch of locations
-async function processWikipediaBatch(
-	locations,
-	maxConcurrentBrowsers,
-	useProxy
-) {
-	const results = [];
-
-	try {
-		// Process locations with controlled concurrency
-		const concurrencyLimit = Math.min(maxConcurrentBrowsers, 5); // Cap at 5 concurrent requests
-		const chunks = [];
-
-		// Split locations into chunks for controlled concurrency
-		for (let i = 0; i < locations.length; i += concurrencyLimit) {
-			chunks.push(locations.slice(i, i + concurrencyLimit));
-		}
-
-		// Process chunks sequentially to avoid overwhelming the API
-		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-			const chunk = chunks[chunkIndex];
-			let chunkStats = {
-				totalUrls: 0,
-				validUrls: 0,
-				invalidUrls: 0,
-				successfulScrapes: 0,
-			};
-
-			// Process current chunk in parallel
-			const chunkPromises = chunk.map(async (location) => {
-				// Generate Wikipedia URLs (handle cases where state might be null)
-				const urls = generateWikipediaURLs(
-					location.name,
-					location.state || null
-				);
-
-				// Track URL validation stats for this location
-				chunkStats.totalUrls += urls.length;
-
-				// Try each URL strategy until one works
-				for (const url of urls) {
-					try {
-						// First check if the URL is valid and accessible
-						const isUrlValid = await checkWikipediaURL(url);
-
-						if (!isUrlValid) {
-							console.warn(`⚠️ URL not accessible: ${url}`);
-							chunkStats.invalidUrls++;
-							continue;
-						}
-
-						chunkStats.validUrls++;
-						const result = await extractWikipediaContent(url, useProxy);
-
-						if (result.success) {
-							chunkStats.successfulScrapes++;
-							return {
-								locationId: location.id,
-								locationName: location.name,
-								locationState: location.state,
-								success: true,
-								wikipediaUrl: url,
-								content: result.data,
-							};
-						}
-					} catch (error) {
-						console.warn(`⚠️ Failed to extract from ${url}:`, error.message);
-						continue;
-					}
-				}
-
-				return {
-					locationId: location.id,
-					locationName: location.name,
-					locationState: location.state,
-					success: false,
-					error: "All Wikipedia URL strategies failed",
-					attemptedUrls: urls,
-				};
-			});
-
-			// Wait for current chunk to complete
-			const chunkResults = await Promise.all(chunkPromises);
-			results.push(...chunkResults);
-
-			// Add small delay between chunks to be respectful
-			if (chunkIndex < chunks.length - 1) {
-				const delay = 1000; // 1 second delay between
-				await new Promise((resolve) => setTimeout(resolve, delay));
-			}
-		}
-	} catch (error) {
-		console.error("❌ Error processing Wikipedia batch:", error);
-	}
-
-	return results;
-}
-
-// Store Wikipedia results in Supabase
-async function storeWikipediaResults(results) {
-	const successfulResults = results.filter((r) => r.success);
-	const failedResults = results.filter((r) => !r.success);
-
-	// Update successful results
-	for (const result of successfulResults) {
-		try {
-			// Extract paragraphs from the content and join them into readable text
-			const paragraphs = result.content?.paragraphs || [];
-			const wikipediaContent =
-				paragraphs.length > 0 ? paragraphs.join("\n\n") : null;
-
-			const { error } = await supabase
-				.from("locations")
-				.update({
-					wikipedia_content: wikipediaContent,
-					wikipedia_url: result.wikipediaUrl,
-				})
-				.eq("id", result.locationId);
-
-			if (error) {
-				console.error(
-					`❌ Failed to update location ${result.locationId}:`,
-					error
-				);
-			} else {
-				console.log(
-					`✅ Updated location ${result.locationId} with Wikipedia content (${paragraphs.length} paragraphs)`
-				);
-			}
-		} catch (error) {
-			console.error(`❌ Error updating location ${result.locationId}:`, error);
-		}
-	}
-}
-
-// Airbnb Scraping Endpoint
-app.post("/scrap-airbnb", async (c) => {
-	const {
-		city,
-		state,
-		country = "India",
-		checkin,
-		checkout,
-		useProxy = false,
-	} = await c.req.json();
-
-	if (!city || !state) {
-		return c.json({ error: "City and state are required" }, 400);
-	}
-
-	// Generate Airbnb search URL
-	const searchQuery = `${city.replaceAll(" ", "-")}--${state.replaceAll(
-		" ",
-		"-"
-	)}`;
-	const airbnbUrl = `https://www.airbnb.com/s/${searchQuery}--${country}/homes`;
-
-	// Add query parameters if provided
-	const urlParams = new URLSearchParams();
-	if (checkin) urlParams.append("checkin", checkin);
-	if (checkout) urlParams.append("checkout", checkout);
-
-	const fullUrl = urlParams.toString()
-		? `${airbnbUrl}?${urlParams.toString()}`
-		: airbnbUrl;
-
-	console.log(`🏠 Scraping Airbnb listings from: ${fullUrl}`);
-
-	let scrapedData = {};
-
-	try {
-		const response = await fetch(`http://localhost:3001/scrap-url`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				url: fullUrl,
-				useProxy: false,
-			}),
-		});
-
-		if (!response.ok) {
-			throw new Error(`HTTP error! status: ${response.status}`);
-		}
-
-		const scrapData = await response.json();
-
-		const allLinks = scrapData.data.links;
-
-		const listings = [];
-		// Process each listing link
-		const elementsToProcess = allLinks.length;
-
-		for (let i = 0; i < elementsToProcess; i++) {
-			const link = allLinks[i];
-
-			try {
-				// Extract listing URL
-				const listingUrl = link.href || link.url || "N/A";
-
-				// Only include links that match the required Airbnb room URL pattern
-				if (
-					typeof listingUrl === "string" &&
-					listingUrl.startsWith("https://www.airbnb.co.in/rooms")
-				) {
-					// Extract title from link text
-					const title = link.text ? link.text : link.title;
-
-					// Create listing data object
-					const listingData = {
-						title: title,
-						url: listingUrl,
-					};
-
-					listings.push(listingData);
-				}
-			} catch (error) {
-				console.warn(`Error processing listing ${i}:`, error);
-				continue;
-			}
-		}
-
-		// Get page info from scrap-url response
-		const pageInfo = {
-			title:
-				scrapData.data?.pageInfo?.title ||
-				scrapData.data?.title ||
-				scrapData.title ||
-				"Airbnb Search Results",
-			url: fullUrl,
-			description:
-				scrapData.data?.pageInfo?.description ||
-				scrapData.data?.description ||
-				scrapData.description ||
-				"",
-		};
-
-		scrapedData = {
-			success: true,
-			url: fullUrl,
-			searchQuery: searchQuery,
-			checkin: checkin || null,
-			checkout: checkout || null,
-			listings: listings,
-			totalListings: listings.length,
-			pageInfo: pageInfo,
-			timestamp: new Date().toISOString(),
-			useProxy: useProxy,
-		};
-	} catch (error) {
-		console.error("❌ Error scraping Airbnb:", error);
-		scrapedData = {
-			success: false,
-			error: error.message,
-			url: fullUrl,
-			timestamp: new Date().toISOString(),
-		};
-	}
-
-	return c.json(scrapedData);
-});
-
 // Bulk Airbnb scraping with queue management
 const airbnbScrapingQueue = {
 	batches: new Map(),
@@ -4467,70 +4074,6 @@ app.get("/process-all-scraped-sources", async (c) => {
 	const result = await processAllScrapedSources();
 	return c.json(result);
 });
-
-// one table for all links only unique ones hashing links and if scraped or not we have that table
-// keep adding new hashed links in this table or just adding new ones with set when searched online
-// later one database optimisation we can do afterwards
-
-// Performance monitoring endpoints
-app.get("/performance", (c) => {
-	const metrics = performanceMonitor.getAllMetrics();
-	return c.json({
-		success: true,
-		timestamp: new Date().toISOString(),
-		metrics: performanceMonitor.formatMetrics(metrics),
-	});
-});
-
-app.get("/performance/system", (c) => {
-	const systemMetrics = performanceMonitor.getSystemMetrics();
-	return c.json({
-		success: true,
-		timestamp: new Date().toISOString(),
-		system: performanceMonitor.formatMetrics(systemMetrics),
-	});
-});
-
-app.get("/performance/operations", (c) => {
-	const operations = Array.from(performanceMonitor.metrics.values())
-		.filter((op) => op.status === "completed")
-		.sort((a, b) => b.startTime - a.startTime)
-		.slice(0, 50); // Return last 50 operations
-
-	return c.json({
-		success: true,
-		timestamp: new Date().toISOString(),
-		operations: operations.map((op) => ({
-			name: op.name,
-			duration: op.duration,
-			cpuUsage: op.cpuUsage,
-			memoryUsage: op.memoryUsage,
-			startTime: op.startTime,
-			completedAt: op.completedAt,
-		})),
-	});
-});
-
-app.get("/performance/summary", (c) => {
-	const summary = {
-		scrapUrl: performanceMonitor.getOperationSummary("scrap-url"),
-		crawlUrl: performanceMonitor.getOperationSummary("crawl-url"),
-		googleMaps: performanceMonitor.getOperationSummary("google-maps"),
-		airbnb: performanceMonitor.getOperationSummary("airbnb-scrap"),
-		wikipedia: performanceMonitor.getOperationSummary("wikipedia-scrap"),
-	};
-
-	return c.json({
-		success: true,
-		timestamp: new Date().toISOString(),
-		summary,
-	});
-});
-
-// Cleanup old metrics periodically
-setInterval(() => {
-	performanceMonitor.cleanup();
-}, 5 * 60 * 1000); // Every 5 minutes
 
 const port = 3001;
 console.log(`Server is running on port ${port}`);
@@ -5393,29 +4936,6 @@ app.post("/crawl-url", async (c) => {
 	}
 });
 
-async function main() {
-	const locations = await supabase.from("locations").select("*").limit(5);
-	// console.log(locations.data, "locations");
-
-	const question = `What all other keys or columns i can fetch in locations table to make it better production ready`;
-
-	const prompt = `I am providing you the locations of cities in India with other details including 
-	google_maps_url, wikipedia_content, airbnb_url,airbnb_listings, unsplash_images, google_images
-	and more. locations: ${JSON.stringify(locations.data, null, 2)}
-	
-	Your job is to answer the questions related as per using locations data: ${question}`;
-	const response2 = await genai.models.generateContent({
-		model: "gemini-2.0-flash",
-		contents: [
-			{
-				role: "user",
-				parts: [{ text: prompt }],
-			},
-		],
-	});
-	console.log(response2.candidates[0].content.parts[0].text, "response");
-}
-
 const isDevelopment = process.env.NODE_ENV === "development";
 const origin = isDevelopment
 	? "http://localhost:3001"
@@ -5496,12 +5016,6 @@ Read the data and answer the user question as given above.
 
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
-	// Start performance monitoring for this operation
-	const operationId = performanceMonitor.startOperation("scrap-url-puppeteer");
-	const startTime = performance.now();
-	const startCpuUsage = process.cpuUsage();
-	const startMemoryUsage = process.memoryUsage();
-
 	const {
 		url,
 		selectors = {}, // Custom selectors for specific elements
@@ -5511,33 +5025,34 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		includeImages = true,
 		includeLinks = true,
 		extractMetadata = true,
-		useProxy = false, // Note: Proxy support would need additional implementation
+		includeCache = false,
 	} = await c.req.json();
 
 	if (!url) {
 		return c.json({ error: "URL is required" }, 400);
 	}
 
-	// Check if URL already exists in Supabase
-	const { data: existingData, error: fetchError } = await supabase
+	// Check if URL already exists in Supabase using an 'eq' filter for exact match
+	const { data, error: fetchError } = await supabase
 		.from("universo")
-		.select("scraped_data, scraped_at")
-		.eq("url", url)
-		.single();
+		.select("scraped_data, scraped_at, url, markdown, screenshot")
+		.eq("url", url);
 
-	if (existingData && existingData.scraped_data) {
-		console.log("✅ Using cached data from Supabase");
+	const existingData = data[0];
+
+	if (existingData && existingData.scraped_data && includeCache) {
+		// Check if cached data matches current request parameters
+		const scrapedData = existingData.scraped_data;
+
 		return c.json({
 			success: true,
-			data: existingData.scraped_data,
+			data: JSON.parse(scrapedData),
+			markdown: existingData.markdown,
+			screenshot: existingData.screenshot,
 			url: url,
 			timestamp: existingData.scraped_at,
-			cached: true,
-			note: "Data retrieved from Supabase cache",
 		});
 	}
-
-	console.log("🔄 Scraping new URL data");
 
 	let browser;
 	let scrapedData = {};
@@ -5550,7 +5065,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		// Try to launch browser with @sparticuz/chromium first
 		try {
 			const executablePath = await chromium.executablePath();
-			console.log(`🔍 Chromium executable path: ${executablePath}`);
 
 			browser = await puppeteer.launch({
 				headless: true,
@@ -5558,13 +5072,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				executablePath: executablePath,
 				ignoreDefaultArgs: ["--disable-extensions"],
 			});
-			console.log("✅ Successfully launched browser with @sparticuz/chromium");
 		} catch (chromiumError) {
-			console.warn(
-				"⚠️ Failed to launch with @sparticuz/chromium, trying fallback..."
-			);
-			console.warn("Chromium error:", chromiumError.message);
-
 			// Fallback: try to use system Chrome or let puppeteer find a browser
 			browser = await puppeteer.launch({
 				headless: true,
@@ -5578,9 +5086,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					"--disable-web-security",
 				],
 			});
-			console.log(
-				"✅ Successfully launched browser with fallback configuration"
-			);
 		}
 
 		const page = await browser.newPage();
@@ -5708,12 +5213,9 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			}
 		}
 
-		// Wait a bit for dynamic content to load
-		//await page.waitForTimeout(2000);
-
 		// Extract page content
 		scrapedData = await page.evaluate(
-			(options) => {
+			async (options) => {
 				const data = {
 					url: window.location.href,
 					title: document.title,
@@ -5722,6 +5224,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					metadata: {},
 					links: [],
 					images: [],
+					screenshot: null,
 				};
 
 				["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
@@ -5766,25 +5269,49 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					});
 				}
 
-				// Extract links
-				const links = document.querySelectorAll("a");
-				const rawLinks = Array.from(links).map((link) => ({
-					text: link.textContent.trim(),
-					href: link.href,
-					title: link.getAttribute("title") || "",
-				}));
+				if (options.includeLinks) {
+					// Extract links
+					const links = document.querySelectorAll("a");
 
-				// Remove duplicate links based on text, href, or title
-				const seenLinks = new Set();
-				data.links = rawLinks.filter((link) => {
-					const key = `${link.text}|${link.href}|${link.title}`;
-					if (seenLinks.has(key)) return false;
-					seenLinks.add(key);
-					return true;
-				});
+					// Get seed domain from current URL
+					const currentUrl = new URL(window.location.href);
+					const seedDomain = currentUrl.hostname;
+
+					const rawLinks = Array.from(links).map((link) => ({
+						text: link.textContent.trim(),
+						href: link.href,
+						title: link.getAttribute("title") || "",
+					}));
+
+					// Filter links by domain and remove duplicates
+					const seenLinks = new Set();
+					data.links = rawLinks.filter((link) => {
+						// Skip if no meaningful text or title
+						if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
+							return false;
+						}
+
+						try {
+							// Check if link URL is valid and matches seed domain
+							const linkUrl = new URL(link.href);
+							if (linkUrl.hostname !== seedDomain) {
+								return false; // Skip external links
+							}
+						} catch (error) {
+							// Skip invalid URLs
+							return false;
+						}
+
+						// Remove duplicates based on text, href, or title
+						const key = `${link.text}|${link.href}|${link.title}`;
+						if (seenLinks.has(key)) return false;
+						seenLinks.add(key);
+						return true;
+					});
+				}
 
 				if (options.includeSemanticContent) {
-					// Extract semantic content with optimized methods
+					// Extract semantic content with optimized methods - prioritizing important content
 					const extractSemanticContent = (
 						selector,
 						processor = (el) => el.textContent.trim()
@@ -5813,51 +5340,17 @@ app.post("/scrap-url-puppeteer", async (c) => {
 							.filter((item) => item.length > 0);
 					};
 
-					// Add semantic content to data.content structure
+					// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
 					const rawSemanticContent = {
-						paragraphs: extractSemanticContent("p"),
-						divs: extractSemanticContent("div", (el) =>
-							el.textContent.trim().substring(0, 200)
-						),
-						tables: extractSemanticContent("table", extractTableContent),
-						blockquotes: extractSemanticContent("blockquote"),
-						preformatted: extractSemanticContent("pre"),
-						unorderedLists: extractSemanticContent("ul", extractListContent),
-						orderedLists: extractSemanticContent("ol", extractListContent),
-						codeBlocks: extractSemanticContent("code"),
-						articleSections: extractSemanticContent("article"),
-						sectionContent: extractSemanticContent("section"),
-						asideContent: extractSemanticContent("aside"),
+						// High priority: Main content elements
 						mainContent: extractSemanticContent("main"),
-						headerContent: extractSemanticContent("header"),
-						footerContent: extractSemanticContent("footer"),
-						navContent: extractSemanticContent("aside"),
-						formContent: extractSemanticContent("form"),
-						fieldsetContent: extractSemanticContent("fieldset"),
-						labelContent: extractSemanticContent("label"),
-						spanContent: extractSemanticContent("span", (el) =>
-							el.textContent.trim().substring(0, 100)
-						),
-						strongContent: extractSemanticContent("strong"),
-						emContent: extractSemanticContent("em"),
-						markContent: extractSemanticContent("mark"),
-						smallContent: extractSemanticContent("small"),
-						citeContent: extractSemanticContent("cite"),
-						timeContent: extractSemanticContent("time"),
-						addressContent: extractSemanticContent("address"),
-						detailsContent: extractSemanticContent("details"),
-						summaryContent: extractSemanticContent("summary"),
-						figureContent: extractSemanticContent("figure"),
-						figcaptionContent: extractSemanticContent("figcaption"),
-						dlContent: extractSemanticContent("dl", (el) => {
-							const dts = Array.from(el.querySelectorAll("dt")).map((dt) =>
-								dt.textContent.trim()
-							);
-							const dds = Array.from(el.querySelectorAll("dd")).map((dd) =>
-								dd.textContent.trim()
-							);
-							return { terms: dts, definitions: dds };
-						}),
+						articleContent: extractSemanticContent("article"),
+
+						// High priority: Core text content
+						paragraphs: extractSemanticContent("p"),
+						blockquotes: extractSemanticContent("blockquote"),
+						codeBlocks: extractSemanticContent("code"),
+						preformatted: extractSemanticContent("pre"),
 					};
 
 					// Remove duplicates from semantic content
@@ -5871,7 +5364,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 								seen.add(normalized);
 								return true;
 							} else if (typeof item === "object" && item !== null) {
-								// Handle complex objects like tables and definition lists
+								// Handle complex objects like tables
 								const key = JSON.stringify(item);
 								if (seen.has(key)) return false;
 								seen.add(key);
@@ -5881,7 +5374,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 						});
 					};
 
-					// Apply duplicate removal to all semantic content
+					// Apply duplicate removal to prioritized semantic content
 					data.content.semanticContent = Object.fromEntries(
 						Object.entries(rawSemanticContent).map(([key, value]) => [
 							key,
@@ -5931,40 +5424,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				selectors,
 			}
 		);
-
-		// Add page info - PUPPETEER ENDPOINT
-		scrapedData.pageInfo = {
-			url: url,
-			scrapedAt: new Date().toISOString(),
-			userAgent: await page.evaluate(() => navigator.userAgent),
-			viewport: await page.viewport(),
-			proxyInfo: null, // Proxy support not implemented in this version
-		};
-
 		await page.close();
-
-		// End performance monitoring
-		const endTime = performance.now();
-		const endCpuUsage = process.cpuUsage();
-		const endMemoryUsage = process.memoryUsage();
-
-		const performanceMetrics = {
-			duration: endTime - startTime,
-			cpuUsage: {
-				user: endCpuUsage.user - startCpuUsage.user,
-				system: endCpuUsage.system - startCpuUsage.system,
-				total:
-					endCpuUsage.user +
-					endCpuUsage.system -
-					(startCpuUsage.user + startCpuUsage.system),
-			},
-			memoryUsage: {
-				rss: endMemoryUsage.rss - startMemoryUsage.rss,
-				heapUsed: endMemoryUsage.heapUsed - startMemoryUsage.heapUsed,
-				heapTotal: endMemoryUsage.heapTotal - startMemoryUsage.heapTotal,
-			},
-			resourceBlocking: blockedResources,
-		};
 
 		console.log(
 			`   🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
@@ -5975,6 +5435,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			const { error: insertError } = await supabase.from("universo").insert({
 				title: scrapedData.title || "No Title",
 				url: url,
+				markdown: toMarkdown(scrapedData),
 				scraped_at: new Date().toISOString(),
 				scraped_data: JSON.stringify(scrapedData),
 			});
@@ -5982,7 +5443,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			if (insertError) {
 				console.error("❌ Error storing data in Supabase:", insertError);
 			} else {
-				console.log("✅ New data stored in Supabase");
 			}
 		} catch (supabaseError) {
 			console.error("❌ Supabase storage error:", supabaseError);
@@ -5991,13 +5451,9 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		return c.json({
 			success: true,
 			data: scrapedData,
+			markdown: toMarkdown(scrapedData),
 			url: url,
 			timestamp: new Date().toISOString(),
-			proxyUsed: null, // Proxy not supported in this version
-			useProxy: false,
-			performance: performanceMetrics,
-			cached: false,
-			note: "This endpoint uses Puppeteer with @sparticuz/chromium instead of Playwright",
 		});
 	} catch (error) {
 		console.error("❌ Web scraping error (Puppeteer):", error);
@@ -6015,6 +5471,141 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		if (browser) {
 			await browser.close();
 		}
+	}
+});
+
+// Take Screenshot API Endpoint
+app.post("/take-screenshot", async (c) => {
+	try {
+		const { url, title = "Website Screenshot" } = await c.req.json();
+
+		if (!url) {
+			return c.json(
+				{
+					success: false,
+					error: "URL is required",
+				},
+				400
+			);
+		}
+
+		// Validate URL format
+		try {
+			new URL(url);
+		} catch (error) {
+			return c.json(
+				{
+					success: false,
+					error: "Invalid URL format",
+				},
+				400
+			);
+		}
+
+		console.log(`📸 Taking screenshot of: ${url}`);
+
+		// Capture website screenshot
+		const screenshotFileName = `screenshot-${title.replaceAll(
+			" ",
+			"-"
+		)}-${Date.now()}.png`;
+
+		try {
+			await captureWebsite.file(url, screenshotFileName, {
+				width: 1920,
+				height: 1080,
+				deviceScaleFactor: 1,
+				waitForElement: "body",
+				timeout: 30000,
+			});
+
+			// Read the screenshot file
+			const websiteScreenshot = await fs.readFile(screenshotFileName);
+
+			// Generate a unique filename for Supabase storage
+			const uniqueFileName = `screenshots/${Date.now()}-${url.replace(
+				/[^a-zA-Z0-9]/g,
+				""
+			)}.png`;
+
+			// Upload to Firebase storage
+			const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+			const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
+
+			try {
+				await file.save(websiteScreenshot, {
+					metadata: {
+						contentType: "image/png",
+						cacheControl: "public, max-age=3600",
+					},
+				});
+
+				// Make the file publicly accessible
+				await file.makePublic();
+
+				// Get the public URL
+				const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+				console.log("✅ Screenshot uploaded to Firebase:", screenshotUrl);
+
+				// Clean up local file
+				await fs.rm(screenshotFileName, { force: true });
+
+				return c.json({
+					success: true,
+					url: url,
+					title: title,
+					screenshot: screenshotUrl,
+					storagePath: `ihr-website-screenshot/${uniqueFileName}`,
+					timestamp: new Date().toISOString(),
+				});
+			} catch (firebaseError) {
+				console.error("❌ Error uploading to Firebase storage:", firebaseError);
+
+				// Clean up local file if it exists
+				try {
+					await fs.rm(screenshotFileName, { force: true });
+				} catch (cleanupError) {
+					console.warn("⚠️ Could not clean up screenshot file:", cleanupError);
+				}
+
+				return c.json(
+					{
+						success: false,
+						error: "Failed to upload screenshot to Firebase storage",
+						details: firebaseError.message,
+					},
+					500
+				);
+			}
+		} catch (captureError) {
+			console.error("❌ Error capturing screenshot:", captureError);
+
+			// Clean up local file if it exists
+			try {
+				await fs.rm(screenshotFileName, { force: true });
+			} catch (cleanupError) {
+				console.warn("⚠️ Could not clean up screenshot file:", cleanupError);
+			}
+
+			return c.json(
+				{
+					success: false,
+					error: "Failed to capture screenshot",
+					details: captureError.message,
+				},
+				500
+			);
+		}
+	} catch (error) {
+		console.error("❌ Screenshot API error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Internal server error",
+				details: error.message,
+			},
+			500
+		);
 	}
 });
 
