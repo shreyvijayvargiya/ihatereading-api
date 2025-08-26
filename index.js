@@ -8,11 +8,9 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
-import { ChatOllama, Ollama } from "@langchain/ollama";
+import { ChatOllama } from "@langchain/ollama";
 import UserAgent from "user-agents";
-import { Markdown } from "markdown-to-html";
 import { pipeline } from "@xenova/transformers";
-import fs from "fs/promises";
 import { v4 as uuidv4 } from "uuid";
 
 const userAgents = new UserAgent();
@@ -864,7 +862,7 @@ app.use(
 			"http://localhost:4001",
 			"http://localhost:3000",
 			"http://localhost:3001",
-			"https://ihatereading-api.vercel.app/",
+			"https://ihatereading.in",
 		], // Allow specific origins
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 		allowHeaders: ["Content-Type", "Authorization"],
@@ -5034,9 +5032,6 @@ const uploadImageToFirebaseStorage = async () => {
 		// Get the public URL
 		const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
 
-		// Clean up local file
-		await fs.rm(screenshotFileName, { force: true });
-
 		return {
 			success: true,
 			url: url,
@@ -5552,10 +5547,6 @@ app.post("/take-screenshot", async (c) => {
 		}
 
 		// Capture website screenshot
-		const screenshotFileName = `screenshot-${title.replaceAll(
-			" ",
-			"-"
-		)}-${Date.now()}.png`;
 
 		try {
 			// Import puppeteer-core and chromium
@@ -5633,7 +5624,6 @@ app.post("/take-screenshot", async (c) => {
 			}
 
 			const screenshotBuffer = await page.screenshot({
-				path: screenshotFileName,
 				fullPage: false,
 				optimizeForSpeed: true,
 				encoding: "binary",
@@ -5707,8 +5697,6 @@ app.post("/take-screenshot", async (c) => {
 
 				// Get the public URL
 				const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
-
-				// Clean up local file
 
 				return c.json({
 					success: true,
@@ -5901,39 +5889,6 @@ app.post("/push-repo", async (c) => {
 		);
 	}
 });
-
-// Markdown to HTML conversion function
-function convertMarkdownToHtml(markdown) {
-	return new Promise((resolve, reject) => {
-		try {
-			const md = new Markdown();
-			md.bufmax = 2048;
-
-			let htmlOutput = "";
-
-			md.on("data", function (chunk) {
-				htmlOutput += chunk.toString();
-			});
-
-			md.once("end", function () {
-				resolve(htmlOutput);
-			});
-
-			md.once("error", function (err) {
-				reject(err);
-			});
-
-			// Convert markdown string to HTML
-			md.render(markdown, {}, function (err) {
-				if (err) {
-					reject(err);
-				}
-			});
-		} catch (error) {
-			reject(error);
-		}
-	});
-}
 
 app.get("/ai-chat-form", async (c) => {
 	const htmlContent = `<!DOCTYPE html>
