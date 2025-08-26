@@ -5269,11 +5269,10 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					});
 				}
 
+				// Extract links
 				if (options.includeLinks) {
-					// Extract links
 					const links = document.querySelectorAll("a");
 
-					// Get seed domain from current URL
 					const currentUrl = new URL(window.location.href);
 					const seedDomain = currentUrl.hostname;
 
@@ -5424,6 +5423,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				selectors,
 			}
 		);
+
 		await page.close();
 
 		console.log(
@@ -5432,17 +5432,19 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 		// Store new data in Supabase
 		try {
-			const { error: insertError } = await supabase.from("universo").insert({
-				title: scrapedData.title || "No Title",
-				url: url,
-				markdown: toMarkdown(scrapedData),
-				scraped_at: new Date().toISOString(),
-				scraped_data: JSON.stringify(scrapedData),
-			});
+			if (!includeCache) {
+				const { error: insertError } = await supabase.from("universo").insert({
+					title: scrapedData.title || "No Title",
+					url: url,
+					markdown: toMarkdown(scrapedData),
+					scraped_at: new Date().toISOString(),
+					scraped_data: JSON.stringify(scrapedData),
+				});
 
-			if (insertError) {
-				console.error("❌ Error storing data in Supabase:", insertError);
-			} else {
+				if (insertError) {
+					console.error("❌ Error storing data in Supabase:", insertError);
+					throw insertError;
+				}
 			}
 		} catch (supabaseError) {
 			console.error("❌ Supabase storage error:", supabaseError);
@@ -5545,7 +5547,6 @@ app.post("/take-screenshot", async (c) => {
 
 				// Get the public URL
 				const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
-				console.log("✅ Screenshot uploaded to Firebase:", screenshotUrl);
 
 				// Clean up local file
 				await fs.rm(screenshotFileName, { force: true });
