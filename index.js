@@ -14,13 +14,30 @@ import { pipeline } from "@xenova/transformers";
 import { v4 as uuidv4 } from "uuid";
 import { imageDimensionsFromStream } from "image-dimensions";
 import toMarkdown from "./lib/toMarkdown.js";
-import { Readability, isProbablyReaderable } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
-import { load } from "cheerio";
-import extractImagesFromContent from "./lib/extractImages.js";
+import axios from "axios";
 import TurndownService from "turndown";
+import https from "https";
 
 const userAgents = new UserAgent();
+const getRandomInt = (min, max) =>
+	Math.floor(Math.random() * (max - min + 1)) + min;
+function get_useragent() {
+	const lynx_version = `Lynx/${getRandomInt(2, 3)}.${getRandomInt(
+		8,
+		9
+	)}.${getRandomInt(0, 2)}`;
+	const libwww_version = `libwww-FM/${getRandomInt(2, 3)}.${getRandomInt(
+		13,
+		15
+	)}`;
+	const ssl_mm_version = `SSL-MM/${getRandomInt(1, 2)}.${getRandomInt(3, 5)}`;
+	const openssl_version = `OpenSSL/${getRandomInt(1, 3)}.${getRandomInt(
+		0,
+		4
+	)}.${getRandomInt(0, 9)}`;
+	return `${lynx_version} ${libwww_version} ${ssl_mm_version} ${openssl_version}`;
+}
 
 const ollama = new ChatOllama({
 	// model: "gemma:2b",
@@ -1992,6 +2009,84 @@ app.post("/bing-search", async (c) => {
 	});
 });
 
+app.post("/google-search", async (c) => {
+	const {
+		query,
+		num = 10,
+		language = "en",
+		country = "in",
+	} = await c.req.json();
+
+	const results = [];
+	try {
+		const response = await axios.get(`https://www.google.com/search`, {
+			headers: {
+				"User-Agent": get_useragent(),
+				Accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+				"Accept-Charset": "utf-8", // Explicitly request UTF-8
+				"Accept-Encoding": "gzip, deflate",
+			},
+
+			params: {
+				q: encodeURIComponent(query),
+				results: num,
+				hl: language,
+				gl: country,
+				safe: "active",
+			},
+			withCredentials: true,
+			httpsAgent: new https.Agent({
+				rejectUnauthorized: true,
+			}),
+		});
+
+		console.log("Response data type:", typeof response.data);
+		console.log("Response data length:", response.data.length);
+
+		// Use response.data directly - axios already handles UTF-8
+		const dom = new JSDOM(response.data, {
+			contentType: "text/html",
+			includeNodeLocations: false,
+			storageQuota: 10000000,
+		});
+		const document = dom.window.document;
+
+		const result_block = document.querySelectorAll("div.ezO2md");
+
+		for (const result of result_block) {
+			const link_tag = result.querySelector("a[href]");
+			const title_tag = link_tag ? link_tag.querySelector("span.CVA68e") : null;
+			const description_tag = result.querySelector("span.FrIlee");
+
+			if (link_tag && title_tag && description_tag) {
+				const link = decodeURIComponent(
+					link_tag.href.split("&")[0].replace("/url?q=", "")
+				);
+
+				const title = (title_tag.textContent || "").trim().normalize("NFC");
+				const description = (description_tag.textContent || "")
+					.trim()
+					.normalize("NFC");
+
+				results.push({
+					title,
+					description,
+					link,
+				});
+			}
+		}
+		return c.json({
+			query,
+			results,
+		});
+	} catch (error) {
+		console.error("Google search error:", error);
+		return c.json({ error: error.message }, 500);
+	}
+});
+
 // scrap URL
 app.post("/scrap-url", async (c) => {
 	// Start performance monitoring for this operation
@@ -3904,7 +3999,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 		// Set viewport and user agent
 		await page.setViewport({ width: 1920, height: 1080 });
-		await page.setUserAgent(userAgents.random().toString());
+		await page.setUserAgent(get_useragent());
 
 		// Set extra headers
 		await page.setExtraHTTPHeaders({
@@ -4028,11 +4123,9 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		const html = await page.content();
 
 		const dom = new JSDOM(html, { url: url });
-		const isReadable = isProbablyReaderable(dom.window.document);
-
 		let markdownContent;
 
-		if (isReadable) {
+		if (dom.window.document.body.innerHTML) {
 			const turndown = new TurndownService();
 			markdownContent = turndown.turndown(dom.window.document.body.innerHTML);
 		}
@@ -4265,8 +4358,33 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			console.error("❌ Supabase storage error:", supabaseError);
 		}
 
-		removeEmptyKeys(scrapedData.content.semanticContent);
-		removeEmptyKeys(scrapedData.content);
+		// Remove empty keys from content
+		if (scrapedData.content && scrapedData.content.semanticContent) {
+			Object.keys(scrapedData.content.semanticContent).forEach((key) => {
+				const value = scrapedData.content.semanticContent[key];
+				if (
+					value === null ||
+					(Array.isArray(value) && value.length === 0) ||
+					(typeof value === "string" && value.trim() === "")
+				) {
+					delete scrapedData.content.semanticContent[key];
+				}
+			});
+		}
+
+		// Remove empty keys from main content
+		if (scrapedData.content) {
+			Object.keys(scrapedData.content).forEach((key) => {
+				const value = scrapedData.content[key];
+				if (
+					value === null ||
+					(Array.isArray(value) && value.length === 0) ||
+					(typeof value === "string" && value.trim() === "")
+				) {
+					delete scrapedData.content[key];
+				}
+			});
+		}
 
 		return c.json({
 			success: true,
