@@ -12,6 +12,12 @@ import { ChatOllama } from "@langchain/ollama";
 import UserAgent from "user-agents";
 import { pipeline } from "@xenova/transformers";
 import { v4 as uuidv4 } from "uuid";
+import { imageDimensionsFromStream } from "image-dimensions";
+import toMarkdown from "./lib/toMarkdown.js";
+import { Readability, isProbablyReaderable } from "@mozilla/readability";
+import { JSDOM } from "jsdom";
+import { load } from "cheerio";
+import extractImagesFromContent from "./lib/extractImages.js";
 
 const userAgents = new UserAgent();
 
@@ -675,183 +681,6 @@ async function embedChunks(chunks) {
 	}
 }
 
-// Function to convert scraped data to markdown format
-function toMarkdown(data) {
-	if (!data || typeof data !== "object") {
-		throw new Error("Invalid data provided for markdown conversion");
-	}
-
-	let md = "";
-
-	// Add title if available
-	if (data.title) {
-		md += `# ${data.title}\n\n`;
-	}
-
-	// Add H1 headings if available
-	if (data.content && data.content.h1 && Array.isArray(data.content.h1)) {
-		data.content.h1.forEach((h) => {
-			if (h && h.trim()) {
-				md += `# ${h.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add H2 headings if available
-	if (data.content && data.content.h2 && Array.isArray(data.content.h2)) {
-		data.content.h2.forEach((h) => {
-			if (h && h.trim()) {
-				md += `## ${h.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add H3 headings if available
-	if (data.content && data.content.h3 && Array.isArray(data.content.h3)) {
-		data.content.h3.forEach((h) => {
-			if (h && h.trim()) {
-				md += `### ${h.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add H4 headings if available
-	if (data.content && data.content.h4 && Array.isArray(data.content.h4)) {
-		data.content.h4.forEach((h) => {
-			if (h && h.trim()) {
-				md += `#### ${h.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add H5 headings if available
-	if (data.content && data.content.h5 && Array.isArray(data.content.h5)) {
-		data.content.h5.forEach((h) => {
-			if (h && h.trim()) {
-				md += `##### ${h.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add H6 headings if available
-	if (data.content && data.content.h6 && Array.isArray(data.content.h6)) {
-		data.content.h6.forEach((h) => {
-			if (h && h.trim()) {
-				md += `###### ${h.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add paragraphs from semantic content if available
-	if (
-		data.content &&
-		data.content.semanticContent &&
-		data.content.semanticContent.paragraphs &&
-		Array.isArray(data.content.semanticContent.paragraphs)
-	) {
-		data.content.semanticContent.paragraphs.forEach((p) => {
-			if (p && p.trim()) {
-				md += `${p.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add regular paragraphs if available
-	if (
-		data.content &&
-		data.content.paragraphs &&
-		Array.isArray(data.content.paragraphs)
-	) {
-		data.content.paragraphs.forEach((p) => {
-			if (p && p.trim()) {
-				md += `${p.trim()}\n\n`;
-			}
-		});
-	}
-
-	// Add lists if available
-	if (data.content && data.content.lists && Array.isArray(data.content.lists)) {
-		data.content.lists.forEach((list) => {
-			if (list && Array.isArray(list.items)) {
-				list.items.forEach((item) => {
-					if (item && item.trim()) {
-						md += `- ${item.trim()}\n`;
-					}
-				});
-				md += "\n";
-			}
-		});
-	}
-
-	// Add ordered lists if available
-	if (
-		data.content &&
-		data.content.orderedLists &&
-		Array.isArray(data.content.orderedLists)
-	) {
-		data.content.orderedLists.forEach((list) => {
-			if (list && Array.isArray(list.items)) {
-				list.items.forEach((item, index) => {
-					if (item && item.trim()) {
-						md += `${index + 1}. ${item.trim()}\n`;
-					}
-				});
-				md += "\n";
-			}
-		});
-	}
-
-	// Add links if available
-	if (data.content && data.content.links && Array.isArray(data.content.links)) {
-		md += "## Links\n\n";
-		data.content.links.forEach((link) => {
-			if (link && link.href && link.text) {
-				md += `- [${link.text.trim()}](${link.href})\n`;
-			}
-		});
-		md += "\n";
-	}
-
-	// Add images if available
-	if (
-		data.content &&
-		data.content.images &&
-		Array.isArray(data.content.images)
-	) {
-		md += "## Images\n\n";
-		data.content.images.forEach((img) => {
-			if (img && img.src) {
-				const alt = img.alt || img.title || "Image";
-				md += `![${alt}](${img.src})\n\n`;
-			}
-		});
-	}
-
-	// Add metadata if available
-	if (data.meta) {
-		md += "## Metadata\n\n";
-		if (data.meta.description) {
-			md += `**Description:** ${data.meta.description}\n\n`;
-		}
-		if (data.meta.keywords) {
-			md += `**Keywords:** ${data.meta.keywords.join(", ")}\n\n`;
-		}
-		if (data.meta.author) {
-			md += `**Author:** ${data.meta.author}\n\n`;
-		}
-	}
-
-	// Add URL information
-	if (data.url) {
-		md += `**Source URL:** ${data.url}\n\n`;
-	}
-
-	// Add timestamp
-	md += `**Generated:** ${new Date().toISOString()}\n\n`;
-
-	return md.trim();
-}
-
 const app = new Hono();
 
 // Add CORS middleware
@@ -1488,242 +1317,6 @@ const scrapeGoogleMapsBulk = async (queries, maxConcurrentBrowsers = 3) => {
 	}
 };
 
-// 1. Bulk Scraping Job Creation (with single query optimization)
-app.post("/scrap-google-maps-bulk", async (c) => {
-	try {
-		// Validate request body
-		let requestBody;
-		try {
-			requestBody = await c.req.json();
-		} catch (jsonError) {
-			console.error("JSON parsing error:", jsonError);
-			return c.json(
-				{
-					success: false,
-					error: "Invalid JSON in request body. Please send valid JSON data.",
-					example: {
-						region: "india",
-						singleQuery: "Mumbai restaurant",
-					},
-				},
-				400
-			);
-		}
-
-		// Validate request body is not null/undefined
-		if (!requestBody || typeof requestBody !== "object") {
-			return c.json(
-				{
-					success: false,
-					error: "Request body must be a valid JSON object",
-					example: {
-						region: "india",
-						singleQuery: "Mumbai restaurant",
-					},
-				},
-				400
-			);
-		}
-
-		const {
-			region = "india",
-			batchSize = 1000,
-			priority = "normal",
-			singleQuery = null,
-		} = requestBody;
-
-		if (singleQuery && typeof singleQuery === "string" && singleQuery.trim()) {
-			const cleanQuery = singleQuery.trim();
-
-			const result = await scrapeGoogleMapsLocation(cleanQuery);
-
-			if (result.success && result.data) {
-				// Store result directly in locations table
-				try {
-					const locationData = {
-						name: result.data.name || "",
-						address: result.data.address || "",
-						google_maps_url: result.data.url || "",
-						scraped_at: new Date().toISOString(),
-					};
-
-					// Add optional columns if they exist in the schema
-					if (result.data.coordinates?.lat && result.data.coordinates?.lng) {
-						locationData.latitude = result.data.coordinates.lat;
-						locationData.longitude = result.data.coordinates.lng;
-					}
-
-					// Try to insert with all columns, fallback to minimal if needed
-					try {
-						await supabase.from("locations").insert(locationData);
-					} catch (insertError) {
-						// If insert fails, try with minimal columns
-						const minimalData = {
-							name: locationData.name,
-							address: locationData.address,
-							scraped_at: locationData.scraped_at,
-						};
-						await supabase.from("locations").insert(minimalData);
-					}
-				} catch (dbError) {
-					console.error("Failed to store location:", dbError);
-				}
-			}
-
-			return c.json({
-				success: true,
-				message: "Single query processed successfully",
-				data: {
-					query: singleQuery,
-					result: result.data,
-				},
-			});
-		}
-
-		let queries, batchInfo;
-
-		if (region === "india") {
-			const batchNumber = parseInt(requestBody.batchNumber) || 0;
-			const batchSize = parseInt(requestBody.batchSize) || 50;
-
-			batchInfo = addBatchToQueue(batchNumber, batchSize);
-			queries = batchInfo.queries;
-		} else {
-			queries = [];
-		}
-
-		if (queries.length === 0) {
-			return c.json(
-				{
-					success: false,
-					error: `No queries generated for region: ${region}. Currently only 'india' is supported.`,
-					supportedRegions: ["india"],
-				},
-				400
-			);
-		}
-
-		// Start bulk scraping and store results directly
-		console.log(`🚀 Starting bulk scraping for ${queries.length} queries`);
-
-		const startTime = Date.now();
-		const results = await scrapeGoogleMapsBulk(queries, 3);
-		const totalTime = Date.now() - startTime;
-
-		let storedCount = 0;
-		let storageErrors = [];
-
-		console.log(`📊 Processing ${results.length} results for storage...`);
-
-		for (const { query, result } of results) {
-			if (result.success && result.data) {
-				try {
-					const locationData = {
-						name: result.data.name || "",
-						address: result.data.address || "",
-						google_maps_url: result.data.url || "",
-						scraped_at: new Date().toISOString(),
-					};
-
-					if (result.data.coordinates?.lat && result.data.coordinates?.lng) {
-						locationData.latitude = result.data.coordinates.lat;
-						locationData.longitude = result.data.coordinates.lng;
-					}
-
-					console.log(`💾 Attempting to store: ${result.data.name || query}`);
-
-					const { error: insertError } = await supabase
-						.from("locations")
-						.insert(locationData);
-
-					if (insertError) {
-						throw new Error(`Supabase insert error: ${insertError.message}`);
-					}
-
-					storedCount++;
-					console.log(`✅ Stored successfully: ${result.data.name || query}`);
-
-					// Track successful location in queue
-					trackSuccessfulLocation(batchInfo.batchNumber);
-				} catch (error) {
-					console.error(`❌ Failed to store location for "${query}":`, error);
-					storageErrors.push({ query, error: error.message });
-
-					// Track failed storage
-					trackFailedLocation(
-						batchInfo.batchNumber,
-						query,
-						`Storage error: ${error.message}`
-					);
-				}
-			} else {
-				console.log(
-					`⚠️ Skipping failed result for "${query}": ${result.error}`
-				);
-				// Track failed scraping
-				trackFailedLocation(
-					batchInfo.batchNumber,
-					query,
-					result.error || "Unknown error"
-				);
-			}
-		}
-
-		// Calculate statistics
-		const successfulQueries = results.filter((r) => r.result.success).length;
-		const failedQueries = results.filter((r) => !r.result.success).length;
-		const successRate = ((successfulQueries / results.length) * 100).toFixed(2);
-
-		// Mark batch as completed in queue
-		markBatchCompleted(batchInfo.batchNumber, results);
-
-		console.log(
-			`📊 Storage Summary: ${storedCount}/${results.length} locations stored successfully`
-		);
-		if (storageErrors.length > 0) {
-			console.log(
-				`❌ Storage Errors: ${storageErrors.length} locations failed to store`
-			);
-			storageErrors.forEach((err) =>
-				console.log(`  - ${err.query}: ${err.error}`)
-			);
-		}
-
-		return c.json({
-			success: true,
-			message: "Bulk scraping completed successfully",
-			data: {
-				totalQueries: queries.length,
-				successfulQueries,
-				failedQueries,
-				storedInDatabase: storedCount,
-				successRate: `${successRate}%`,
-				processingTime: `${totalTime}ms`,
-				estimatedTime: `${Math.ceil(totalTime / 1000)} seconds`,
-				method: "scrape-then-store",
-				storageErrors: storageErrors.length > 0 ? storageErrors : undefined,
-				results: results.slice(0, 10), // Return first 10 results for preview
-				batch: {
-					currentBatch: batchInfo.batchNumber + 1,
-					totalBatches: batchInfo.totalBatches,
-					hasMore: batchInfo.hasMore,
-					progress: batchInfo.progress,
-					nextBatch: batchInfo.hasMore ? batchInfo.batchNumber + 1 : null,
-				},
-			},
-		});
-	} catch (error) {
-		console.error("Bulk scraping job creation error:", error);
-		return c.json(
-			{
-				success: false,
-				error: error.message,
-			},
-			500
-		);
-	}
-});
-
 // Google Maps scraping endpoint using headless Chrome
 app.post("/scrap-google-maps", async (c) => {
 	try {
@@ -1798,63 +1391,63 @@ app.post("/scrap-google-maps", async (c) => {
 							}
 						);
 
-						// Wait for the map to load
-						await page.waitForSelector('div[role="main"]', { timeout: 30000 });
-
 						// Wait a bit for the location to be fully loaded
 						await page.waitForTimeout(5000);
 
-						// Extract location data
-						const locationData = await page.evaluate(() => {
-							const url = window.location.href;
-							const coordsMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-							const locationName =
-								document.querySelector("h1")?.textContent || "";
-							const address =
-								document.querySelector('button[data-item-id="address"]')
-									?.textContent || "";
+						const locationResults = await page.evaluate(() => {
+							// Select the results container with role feed and aria-label with Results for ...
+							const resultsContainer = Array.from(
+								document.querySelectorAll('div[role="feed"]')
+							).find((el) =>
+								el.getAttribute("aria-label")?.includes("Results for")
+							);
 
-							// Determine type based on content
-							let type = "Location";
-							if (
-								locationName.toLowerCase().includes("restaurant") ||
-								locationName.toLowerCase().includes("cafe")
-							)
-								type = "Restaurant";
-							else if (
-								locationName.toLowerCase().includes("hotel") ||
-								locationName.toLowerCase().includes("inn")
-							)
-								type = "Accommodation";
-							else if (
-								locationName.toLowerCase().includes("museum") ||
-								locationName.toLowerCase().includes("gallery")
-							)
-								type = "Cultural";
-							else if (
-								locationName.toLowerCase().includes("park") ||
-								locationName.toLowerCase().includes("garden")
-							)
-								type = "Recreation";
+							if (!resultsContainer) return [];
 
-							return {
-								name: locationName,
-								address: address,
-								coordinates: coordsMatch
-									? {
-											lat: parseFloat(coordsMatch[1]),
-											lng: parseFloat(coordsMatch[2]),
-									  }
-									: null,
-								url: url,
-								details: details,
-								rating: rating,
-								reviews: reviews,
-								type: type,
-							};
+							// Each child div under feed represents a location card
+							const cards = Array.from(
+								resultsContainer.querySelectorAll("div")
+							).slice(0, 10);
+
+							return cards.map((card) => {
+								// Name
+								const name =
+									card
+										.querySelector('[class*="fontHeadlineSmall"]')
+										?.textContent?.trim() || "";
+
+								// Rating text (e.g. "Rated 4.5 stars out of 5")
+								const ratingLabel =
+									card
+										.querySelector('[class*="fontBodyMedium"]')
+										?.getAttribute("aria-label") || "";
+								const ratingMatch = ratingLabel.match(/Rated ([0-9.]+) stars?/);
+								const rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
+
+								// Review count text (e.g. "200 reviews")
+								const reviewsText =
+									card
+										.querySelector('[aria-label$="reviews"]')
+										?.getAttribute("aria-label") || "";
+								const reviewsMatch = reviewsText.match(/(\d+,?\d*) reviews/);
+								const reviews = reviewsMatch
+									? reviewsMatch[1].replace(/,/g, "")
+									: null;
+
+								// Google Maps URL link
+								const url =
+									card.querySelector(
+										'a[href*="https://lh3.googleusercontent.com/gps-cs-s"]'
+									)?.href || "";
+
+								// Image URL (if exists)
+								const image = card.querySelector("img[src]")?.src || "";
+
+								return { name, rating, reviews, url, image };
+							});
 						});
 
-						return { query, ...locationData };
+						return { query, ...locationResults };
 					} catch (error) {
 						console.error(`Error processing query "${query}":`, error);
 						return {
@@ -3404,6 +2997,7 @@ app.post("/reddit-post", async (c) => {
 	}
 });
 
+// goverment website to register complain or individual contact to share complaints
 // Wikipedia URL validation utility
 async function checkWikipediaURL(url) {
 	try {
@@ -4083,858 +3677,6 @@ serve({
 	port,
 });
 
-// URL Crawling Endpoint - Crawls a single URL and processes up to 20 links found on that page
-app.post("/crawl-url", async (c) => {
-	const {
-		url,
-		maxLinks = 20, // Maximum number of links to crawl from the parent page
-		batchSize = 5, // Number of links to process concurrently in each batch
-		delayBetweenBatches = 1000, // Delay between batches in milliseconds
-		includeSemanticContent = true, // Whether to include semantic content in scraped data
-		useProxy = false, // Whether to use proxy for crawling
-		includeImages = false, // Whether to include images in scraped data
-		includeLinks = true, // Whether to include links in scraped data
-		extractMetadata = true, // Whether to extract metadata
-		timeout = 30000, // Timeout for each request
-		validateLinks = true, // Whether to validate links before crawling
-		restrictToSeedDomain = true, // Whether to only allow links from the same domain as seed URL
-	} = await c.req.json();
-
-	if (!url) {
-		return c.json({ error: "URL is required" }, 400);
-	}
-
-	// Validate URL format
-	let targetUrl;
-	try {
-		targetUrl = new URL(url);
-	} catch (error) {
-		return c.json({ error: "Invalid URL format" }, 400);
-	}
-
-	console.log(`🕷️ Starting URL crawl for: ${targetUrl.href}`);
-	console.log(
-		`📊 Configuration: maxLinks=${maxLinks}, batchSize=${batchSize}, useProxy=${useProxy}`
-	);
-
-	try {
-		// Step 1: Scrape the parent URL to get all links
-		console.log(`🔍 Step 1: Scraping parent URL to extract links...`);
-
-		const parentScrapeResponse = await fetch(
-			`http://localhost:3001/scrap-url`,
-			{
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({
-					url: targetUrl.href,
-					useProxy: useProxy,
-					includeSemanticContent: false,
-					includeImages: includeImages,
-					includeLinks: includeLinks,
-					extractMetadata: extractMetadata,
-					timeout: timeout,
-				}),
-			}
-		);
-
-		if (!parentScrapeResponse.ok) {
-			throw new Error(
-				`Failed to scrape parent URL: ${parentScrapeResponse.statusText}`
-			);
-		}
-
-		const parentScrapeData = await parentScrapeResponse.json();
-
-		if (!parentScrapeData.success) {
-			throw new Error(`Parent URL scraping failed: ${parentScrapeData.error}`);
-		}
-
-		// Extract links from the parent page
-		const allLinks = parentScrapeData.data?.links || [];
-		console.log(`🔗 Found ${allLinks.length} total links on parent page`);
-
-		const validLinks = [];
-		const invalidLinks = [];
-		const processedUrls = new Set([targetUrl.href]); // Track processed URLs to avoid duplicates
-
-		// Extract seed domain for filtering
-		const seedDomain = targetUrl.hostname.toLowerCase();
-		console.log(`🌐 Seed domain: ${seedDomain}`);
-		if (restrictToSeedDomain) {
-			console.log(
-				`🔒 Domain restriction: Only allowing links from ${seedDomain}`
-			);
-		} else {
-			console.log(`🌍 Domain restriction: Allowing links from any domain`);
-		}
-
-		for (const link of allLinks) {
-			try {
-				// Skip if we've already processed this URL
-				if (processedUrls.has(link.href)) {
-					continue;
-				}
-
-				// Basic link validation
-				if (!link.href || typeof link.href !== "string") {
-					invalidLinks.push({ ...link, reason: "Invalid href" });
-					continue;
-				}
-
-				// Parse the link URL
-				let linkUrl;
-				try {
-					linkUrl = new URL(link.href);
-				} catch (error) {
-					invalidLinks.push({ ...link, reason: "Invalid URL format" });
-					continue;
-				}
-
-				// Skip if we've already processed this URL
-				if (processedUrls.has(linkUrl.href)) {
-					continue;
-				}
-
-				// Domain filtering - only allow links from the same domain as seed URL
-				if (restrictToSeedDomain) {
-					const linkDomain = linkUrl.hostname.toLowerCase();
-
-					// Simple domain check: hostname must match seed domain exactly
-					if (linkDomain !== seedDomain) {
-						invalidLinks.push({
-							...link,
-							reason: `External domain: ${linkDomain}`,
-						});
-						continue;
-					}
-				}
-
-				// Enhanced link filtering for authentic content links only
-				if (validateLinks) {
-					// Skip non-HTTP/HTTPS protocols
-					if (
-						linkUrl.protocol === "mailto:" ||
-						linkUrl.protocol === "tel:" ||
-						linkUrl.protocol === "javascript:" ||
-						linkUrl.protocol === "data:" ||
-						linkUrl.protocol === "blob:" ||
-						linkUrl.protocol === "file:" ||
-						linkUrl.protocol === "ftp:" ||
-						linkUrl.protocol === "sftp:"
-					) {
-						invalidLinks.push({
-							...link,
-							reason: "Unsupported protocol",
-						});
-						continue;
-					}
-
-					// Skip anchor links and scroll-to links
-					if (linkUrl.href.includes("#") || linkUrl.hash) {
-						invalidLinks.push({
-							...link,
-							reason: "Anchor/scroll link",
-						});
-						continue;
-					}
-
-					// Skip image file extensions
-					const imageExtensions = [
-						".jpg",
-						".jpeg",
-						".png",
-						".gif",
-						".bmp",
-						".webp",
-						".svg",
-						".ico",
-						".tiff",
-						".tif",
-						".heic",
-						".heif",
-						".avif",
-						".jfif",
-						".pjpeg",
-						".pjp",
-					];
-					const hasImageExtension = imageExtensions.some((ext) =>
-						linkUrl.href.toLowerCase().includes(ext)
-					);
-					if (hasImageExtension) {
-						invalidLinks.push({
-							...link,
-							reason: "Image file link",
-						});
-						continue;
-					}
-
-					// Skip video file extensions
-					const videoExtensions = [
-						".mp4",
-						".avi",
-						".mov",
-						".wmv",
-						".flv",
-						".webm",
-						".mkv",
-						".m4v",
-						".3gp",
-						".ogv",
-						".ts",
-						".mts",
-						".m2ts",
-						".divx",
-						".xvid",
-					];
-					const hasVideoExtension = videoExtensions.some((ext) =>
-						linkUrl.href.toLowerCase().includes(ext)
-					);
-					if (hasVideoExtension) {
-						invalidLinks.push({
-							...link,
-							reason: "Video file link",
-						});
-						continue;
-					}
-
-					// Skip audio file extensions
-					const audioExtensions = [
-						".mp3",
-						".wav",
-						".flac",
-						".aac",
-						".ogg",
-						".wma",
-						".m4a",
-						".opus",
-						".amr",
-						".3ga",
-						".ra",
-						".mid",
-						".midi",
-					];
-					const hasAudioExtension = audioExtensions.some((ext) =>
-						linkUrl.href.toLowerCase().includes(ext)
-					);
-					if (hasAudioExtension) {
-						invalidLinks.push({
-							...link,
-							reason: "Audio file link",
-						});
-						continue;
-					}
-
-					// Skip document and archive file extensions
-					const documentExtensions = [
-						".pdf",
-						".doc",
-						".docx",
-						".xls",
-						".xlsx",
-						".ppt",
-						".pptx",
-						".txt",
-						".rtf",
-						".odt",
-						".ods",
-						".odp",
-						".csv",
-					];
-					const archiveExtensions = [
-						".zip",
-						".rar",
-						".7z",
-						".tar",
-						".gz",
-						".bz2",
-						".xz",
-						".lzma",
-					];
-					const hasDocumentExtension = documentExtensions.some((ext) =>
-						linkUrl.href.toLowerCase().includes(ext)
-					);
-					const hasArchiveExtension = archiveExtensions.some((ext) =>
-						linkUrl.href.toLowerCase().includes(ext)
-					);
-					if (hasDocumentExtension || hasArchiveExtension) {
-						invalidLinks.push({
-							...link,
-							reason: "Document/archive file link",
-						});
-						continue;
-					}
-
-					// Skip social media sharing and tracking links
-					const socialMediaPatterns = [
-						"share",
-						"shareArticle",
-						"sharethis",
-						"addthis",
-						"facebook.com/sharer",
-						"twitter.com/intent",
-						"linkedin.com/sharing",
-						"pinterest.com/pin/create",
-						"whatsapp.com/send",
-						"telegram.me/share",
-						"reddit.com/submit",
-						"buffer.com/add",
-						"digg.com/submit",
-						"stumbleupon.com/submit",
-					];
-					const hasSocialMediaPattern = socialMediaPatterns.some((pattern) =>
-						linkUrl.href.toLowerCase().includes(pattern)
-					);
-					if (hasSocialMediaPattern) {
-						invalidLinks.push({
-							...link,
-							reason: "Social media sharing link",
-						});
-						continue;
-					}
-
-					// Skip analytics and tracking links
-					const trackingPatterns = [
-						"google-analytics",
-						"googletagmanager",
-						"facebook.com/tr",
-						"pixel",
-						"tracking",
-						"analytics",
-						"stats",
-						"metrics",
-						"clicktrack",
-						"affiliate",
-						"ref=",
-						"utm_",
-						"campaign",
-					];
-					const hasTrackingPattern = trackingPatterns.some((pattern) =>
-						linkUrl.href.toLowerCase().includes(pattern)
-					);
-					if (hasTrackingPattern) {
-						invalidLinks.push({
-							...link,
-							reason: "Analytics/tracking link",
-						});
-						continue;
-					}
-
-					// Skip login, signup, and account-related links
-					const accountPatterns = [
-						"login",
-						"signin",
-						"signup",
-						"register",
-						"signout",
-						"logout",
-						"account",
-						"profile",
-						"dashboard",
-						"admin",
-						"user",
-						"member",
-						"auth",
-						"oauth",
-						"sso",
-						"password",
-						"reset",
-						"verify",
-					];
-					const hasAccountPattern = accountPatterns.some((pattern) =>
-						linkUrl.href.toLowerCase().includes(pattern)
-					);
-					if (hasAccountPattern) {
-						invalidLinks.push({
-							...link,
-							reason: "Account/authentication link",
-						});
-						continue;
-					}
-
-					// Skip very long URLs (likely generated or spam)
-					if (linkUrl.href.length > 500) {
-						invalidLinks.push({ ...link, reason: "URL too long" });
-						continue;
-					}
-
-					// Skip URLs with too many query parameters (likely tracking)
-					if (linkUrl.searchParams.size > 10) {
-						invalidLinks.push({ ...link, reason: "Too many query parameters" });
-						continue;
-					}
-
-					// Skip URLs that are just the domain (no meaningful path)
-					if (linkUrl.pathname === "/" || linkUrl.pathname === "") {
-						invalidLinks.push({ ...link, reason: "Just domain root" });
-						continue;
-					}
-
-					// Skip URLs with suspicious patterns
-					const suspiciousPatterns = [
-						"click",
-						"redirect",
-						"go",
-						"jump",
-						"visit",
-						"goto",
-						"out",
-						"external",
-						"away",
-						"exit",
-						"leave",
-						"depart",
-					];
-					const hasSuspiciousPattern = suspiciousPatterns.some((pattern) =>
-						linkUrl.href.toLowerCase().includes(pattern)
-					);
-					if (hasSuspiciousPattern) {
-						invalidLinks.push({
-							...link,
-							reason: "Suspicious redirect pattern",
-						});
-						continue;
-					}
-				}
-
-				// Add to valid links
-				validLinks.push({
-					...link,
-					parsedUrl: linkUrl.href,
-					domain: linkUrl.hostname,
-				});
-
-				// Mark as processed
-				processedUrls.add(linkUrl.href);
-
-				// Stop if we have enough valid links
-				if (validLinks.length >= maxLinks) {
-					break;
-				}
-			} catch (error) {
-				invalidLinks.push({
-					...link,
-					reason: `Validation error: ${error.message}`,
-				});
-			}
-		}
-
-		console.log(
-			`✅ Validated ${validLinks.length} links (${invalidLinks.length} invalid)`
-		);
-
-		// Log detailed filtering statistics
-		if (invalidLinks.length > 0) {
-			console.log(`📊 Invalid links breakdown:`);
-			const reasonCounts = {};
-			invalidLinks.forEach((link) => {
-				const reason = link.reason || "Unknown reason";
-				reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
-			});
-
-			Object.entries(reasonCounts)
-				.sort(([, a], [, b]) => b - a) // Sort by count descending
-				.forEach(([reason, count]) => {
-					console.log(`   ❌ ${reason}: ${count} links`);
-				});
-		}
-
-		// Log domain filtering summary
-		if (restrictToSeedDomain) {
-			const externalDomainCount = invalidLinks.filter(
-				(link) => link.reason && link.reason.includes("External domain")
-			).length;
-
-			console.log(
-				`🌐 Domain filtering: ${externalDomainCount} external domain links blocked`
-			);
-			console.log(`✅ Links passing domain filter: ${validLinks.length}`);
-		}
-
-		// Step 3: Process links in batches
-		console.log(
-			`🔄 Step 3: Processing ${validLinks.length} links in batches of ${batchSize}...`
-		);
-
-		const crawlResults = [];
-		const batches = [];
-
-		// Create batches
-		for (let i = 0; i < validLinks.length; i += batchSize) {
-			batches.push(validLinks.slice(i, i + batchSize));
-		}
-
-		console.log(`📦 Created ${batches.length} batches`);
-
-		// Process each batch
-		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-			const batch = batches[batchIndex];
-			console.log(
-				`🔄 Processing batch ${batchIndex + 1}/${batches.length} with ${
-					batch.length
-				} links...`
-			);
-
-			// Process current batch concurrently
-			const batchPromises = batch.map(async (link, linkIndex) => {
-				try {
-					console.log(
-						`🔍 Crawling link ${batchIndex * batchSize + linkIndex + 1}/${
-							validLinks.length
-						}: ${link.parsedUrl}`
-					);
-
-					// Call scrap-url for this link
-					const linkResponse = await fetch(`http://localhost:3001/scrap-url`, {
-						method: "POST",
-						headers: {
-							"Content-Type": "application/json",
-						},
-						body: JSON.stringify({
-							url: link.parsedUrl,
-							useProxy: useProxy,
-							includeSemanticContent: includeSemanticContent,
-							includeImages: includeImages,
-							includeLinks: includeLinks,
-							extractMetadata: extractMetadata,
-							timeout: timeout,
-						}),
-					});
-
-					if (!linkResponse.ok) {
-						throw new Error(
-							`HTTP error: ${linkResponse.status} ${linkResponse.statusText}`
-						);
-					}
-
-					const linkData = await linkResponse.json();
-
-					if (!linkData.success) {
-						throw new Error(`Scraping failed: ${linkData.error}`);
-					}
-
-					// Extract key information from the scraped data
-					const extractedData = {
-						originalLink: link,
-						url: link.parsedUrl,
-						title: linkData.data?.title || link.text || "No title",
-						description:
-							linkData.data?.metadata?.description ||
-							linkData.data?.metadata?.["og:description"] ||
-							"No description",
-						scrapedAt: linkData.timestamp,
-						success: true,
-						content: {
-							headings: linkData.data?.content || {},
-							paragraphs:
-								linkData.data?.content?.semanticContent?.paragraphs || [],
-							images: linkData.data?.images || [],
-							links: linkData.data?.links || [],
-						},
-						metadata: linkData.data?.metadata || {},
-						pageInfo: linkData.data?.pageInfo || {},
-					};
-
-					console.log(`✅ Successfully crawled: ${link.parsedUrl}`);
-					return extractedData;
-				} catch (error) {
-					console.error(`❌ Failed to crawl ${link.parsedUrl}:`, error.message);
-
-					return {
-						originalLink: link,
-						url: link.parsedUrl,
-						success: false,
-						error: error.message,
-						scrapedAt: new Date().toISOString(),
-					};
-				}
-			});
-
-			// Wait for current batch to complete
-			const batchResults = await Promise.allSettled(batchPromises);
-
-			// Process batch results
-			const successfulResults = [];
-			const failedResults = [];
-
-			batchResults.forEach((result, index) => {
-				if (result.status === "fulfilled") {
-					const data = result.value;
-					if (data.success) {
-						successfulResults.push(data);
-					} else {
-						failedResults.push(data);
-					}
-				} else {
-					// Handle rejected promises
-					const link = batch[index];
-					failedResults.push({
-						originalLink: link,
-						url: link.parsedUrl,
-						success: false,
-						error: `Promise rejected: ${result.reason}`,
-						scrapedAt: new Date().toISOString(),
-					});
-				}
-			});
-
-			// Add batch results to overall results
-			crawlResults.push(...successfulResults, ...failedResults);
-
-			console.log(
-				`📊 Batch ${batchIndex + 1} completed: ${
-					successfulResults.length
-				} successful, ${failedResults.length} failed`
-			);
-
-			// Add delay between batches (except for the last batch)
-			if (batchIndex < batches.length - 1 && delayBetweenBatches > 0) {
-				console.log(`⏳ Waiting ${delayBetweenBatches}ms before next batch...`);
-				await new Promise((resolve) =>
-					setTimeout(resolve, delayBetweenBatches)
-				);
-			}
-		}
-
-		// Step 4: Prepare final response
-		console.log(`🎉 Crawling completed! Processing final results...`);
-
-		const successfulCrawls = crawlResults.filter((r) => r.success);
-		const failedCrawls = crawlResults.filter((r) => !r.success);
-		const successRate = (
-			(successfulCrawls.length / crawlResults.length) *
-			100
-		).toFixed(2);
-
-		// Calculate statistics
-		const totalImages = successfulCrawls.reduce(
-			(sum, crawl) => sum + (crawl.content?.images?.length || 0),
-			0
-		);
-		const totalLinks = successfulCrawls.reduce(
-			(sum, crawl) => sum + (crawl.content?.links?.length || 0),
-			0
-		);
-		const totalParagraphs = successfulCrawls.reduce(
-			(sum, crawl) => sum + (crawl.content?.paragraphs?.length || 0),
-			0
-		);
-
-		// Collect all unique links from all nested scrap responses using Map to avoid duplicates
-		console.log(`🔗 Collecting all unique links from nested responses...`);
-		const uniqueLinksMap = new Map();
-
-		// Add links from parent URL
-		if (parentScrapeData.data?.links) {
-			parentScrapeData.data.links.forEach((link, index) => {
-				if (link.href && typeof link.href === "string") {
-					const key = link.href.toLowerCase().trim();
-					if (!uniqueLinksMap.has(key)) {
-						uniqueLinksMap.set(key, {
-							...link,
-							source: "parent",
-							sourceIndex: index,
-							discoveredAt: "parent_page",
-						});
-					}
-				}
-			});
-		}
-
-		// Add links from all crawled pages
-		successfulCrawls.forEach((crawl, crawlIndex) => {
-			if (crawl.content?.links && Array.isArray(crawl.content.links)) {
-				crawl.content.links.forEach((link, linkIndex) => {
-					if (link.href && typeof link.href === "string") {
-						const key = link.href.toLowerCase().trim();
-						if (!uniqueLinksMap.has(key)) {
-							uniqueLinksMap.set(key, {
-								...link,
-								source: "crawled_page",
-								sourceUrl: crawl.url,
-								sourceTitle: crawl.title,
-								crawlIndex: crawlIndex,
-								linkIndex: linkIndex,
-								discoveredAt: "nested_crawl",
-							});
-						}
-					}
-				});
-			}
-		});
-
-		// Convert Map to array and sort by source for better organization
-		const allUniqueLinks = Array.from(uniqueLinksMap.values()).sort((a, b) => {
-			// Sort by source priority: parent first, then crawled pages
-			if (a.source === "parent" && b.source !== "parent") return -1;
-			if (a.source !== "parent" && b.source === "parent") return 1;
-
-			// Then sort by crawl index and link index
-			if (a.source === "crawled_page" && b.source === "crawled_page") {
-				if (a.crawlIndex !== b.crawlIndex) return a.crawlIndex - b.crawlIndex;
-				return a.linkIndex - b.linkIndex;
-			}
-
-			// For parent links, sort by original index
-			if (a.source === "parent" && b.source === "parent") {
-				return a.sourceIndex - b.sourceIndex;
-			}
-
-			return 0;
-		});
-
-		console.log(
-			`🔗 Collected ${allUniqueLinks.length} unique links from all sources`
-		);
-
-		// Apply domain filtering to allUniqueLinks if restrictToSeedDomain is enabled
-		let filteredUniqueLinks = allUniqueLinks;
-		if (restrictToSeedDomain) {
-			const beforeFiltering = allUniqueLinks.length;
-			filteredUniqueLinks = allUniqueLinks.filter((link) => {
-				try {
-					const linkUrl = new URL(link.href);
-					const linkDomain = linkUrl.hostname.toLowerCase();
-					return linkDomain === seedDomain;
-				} catch (error) {
-					// If URL parsing fails, filter it out
-					return false;
-				}
-			});
-
-			const afterFiltering = filteredUniqueLinks.length;
-			const filteredOut = beforeFiltering - afterFiltering;
-			console.log(`🔒 Domain filtering applied to allUniqueLinks:`);
-			console.log(`   📊 Before filtering: ${beforeFiltering} links`);
-			console.log(`   ✅ After filtering: ${afterFiltering} links`);
-			console.log(`   ❌ Filtered out: ${filteredOut} external domain links`);
-		}
-
-		const finalResponse = {
-			success: true,
-			message: `Successfully crawled ${targetUrl.href} and processed ${validLinks.length} links`,
-			parentUrl: {
-				url: targetUrl.href,
-				title: parentScrapeData.data?.title || "No title",
-				description:
-					parentScrapeData.data?.metadata?.description || "No description",
-				totalLinksFound: allLinks.length,
-				validLinksFound: validLinks.length,
-				invalidLinksFound: invalidLinks.length,
-			},
-			crawlResults: {
-				total: crawlResults.length,
-				successful: successfulCrawls.length,
-				failed: failedCrawls.length,
-				successRate: `${successRate}%`,
-			},
-			contentSummary: {
-				totalImages: totalImages,
-				totalLinks: totalLinks,
-				totalParagraphs: totalParagraphs,
-				averageImagesPerPage:
-					successfulCrawls.length > 0
-						? (totalImages / successfulCrawls.length).toFixed(2)
-						: 0,
-				averageLinksPerPage:
-					successfulCrawls.length > 0
-						? (totalLinks / successfulCrawls.length).toFixed(2)
-						: 0,
-				averageParagraphsPerPage:
-					successfulCrawls.length > 0
-						? (totalParagraphs / successfulCrawls.length).toFixed(2)
-						: 0,
-			},
-			configuration: {
-				maxLinks: maxLinks,
-				batchSize: batchSize,
-				delayBetweenBatches: delayBetweenBatches,
-				useProxy: useProxy,
-				includeImages: includeImages,
-				includeLinks: includeLinks,
-				extractMetadata: extractMetadata,
-				timeout: timeout,
-				validateLinks: validateLinks,
-				restrictToSeedDomain: restrictToSeedDomain,
-				seedDomain: seedDomain,
-			},
-			allUniqueLinks: {
-				total: filteredUniqueLinks.length,
-				links: filteredUniqueLinks,
-				summary: {
-					fromParent: filteredUniqueLinks.filter(
-						(link) => link.source === "parent"
-					).length,
-					fromCrawledPages: filteredUniqueLinks.filter(
-						(link) => link.source === "crawled_page"
-					).length,
-					uniqueDomains: new Set(
-						filteredUniqueLinks.map((link) => {
-							try {
-								return new URL(link.href).hostname;
-							} catch {
-								return "invalid-url";
-							}
-						})
-					).size,
-				},
-			},
-			results: crawlResults,
-			timestamp: new Date().toISOString(),
-			processingTime: Date.now() - Date.now(), // Will be calculated properly in actual implementation
-		};
-
-		console.log(`📊 Final Statistics:`);
-		console.log(`✅ Successful crawls: ${successfulCrawls.length}`);
-		console.log(`❌ Failed crawls: ${failedCrawls.length}`);
-		console.log(`📈 Success rate: ${successRate}%`);
-		console.log(`🖼️ Total images found: ${totalImages}`);
-		console.log(`🔗 Total links found: ${totalLinks}`);
-		console.log(`📝 Total paragraphs found: ${totalParagraphs}`);
-		console.log(`🔗 Unique Links Summary:`);
-		console.log(
-			`   📍 From parent page: ${
-				filteredUniqueLinks.filter((link) => link.source === "parent").length
-			}`
-		);
-		console.log(
-			`   🕷️ From crawled pages: ${
-				filteredUniqueLinks.filter((link) => link.source === "crawled_page")
-					.length
-			}`
-		);
-		console.log(
-			`   🌐 Unique domains: ${
-				new Set(
-					filteredUniqueLinks.map((link) => {
-						try {
-							return new URL(link.href).hostname;
-						} catch {
-							return "invalid-url";
-						}
-					})
-				).size
-			}`
-		);
-
-		return c.json(finalResponse);
-	} catch (error) {
-		console.error("❌ URL crawling error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to crawl URL",
-				details: error.message,
-				url: targetUrl?.href || url,
-				timestamp: new Date().toISOString(),
-			},
-			500
-		);
-	}
-});
-
 const isDevelopment = process.env.NODE_ENV === "development";
 const origin = isDevelopment
 	? "http://localhost:3001"
@@ -4965,12 +3707,10 @@ Please provide a helpful answer based on the data from the link/url provided by 
 Website: ${link}
 
 Question: ${prompt}
-The data for the website is as follows in JSON format:${JSON.stringify(
-			scrapedData,
-			null,
-			2
-		)}
-Read the data and answer the user question as given above.
+The data for the website is in markdown format:
+${results.mardown}
+
+Read the data markdown and answer the user question as given above.
 `;
 
 		// Use Google GenAI to answer the question
@@ -5002,6 +3742,7 @@ Read the data and answer the user question as given above.
 			answer: response.candidates[0].content.parts[0].text,
 			scrapedData: scrapedData,
 			url: link,
+			markdown: results.markdown,
 			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
@@ -5050,6 +3791,16 @@ const uploadImageToFirebaseStorage = async () => {
 		};
 	}
 };
+
+function isValidURL(urlString) {
+	try {
+		new URL(urlString);
+		return true;
+	} catch (error) {
+		return false;
+	}
+}
+
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
 	const {
@@ -5064,29 +3815,44 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		includeCache = false,
 	} = await c.req.json();
 
-	if (!url) {
-		return c.json({ error: "URL is required" }, 400);
+	const isValidUrl = isValidURL(url);
+
+	if (!url || !isValidUrl) {
+		return c.json({ error: "URL is required or invalid" }, 400);
+	}
+	let existingData;
+	if (includeCache) {
+		// Check if URL already exists in Supabase using an 'eq' filter for exact match
+		const { data, error: fetchError } = await supabase
+			.from("universo")
+			.select("scraped_data, scraped_at, url, markdown, screenshot")
+			.eq("url", url);
+
+		existingData = data[0];
+		if (fetchError || !existingData) {
+			return c.json(
+				{
+					success: false,
+					error: "Internal server error",
+				},
+				500
+			);
+		}
 	}
 
-	// Check if URL already exists in Supabase using an 'eq' filter for exact match
-	const { data, error: fetchError } = await supabase
-		.from("universo")
-		.select("scraped_data, scraped_at, url, markdown, screenshot")
-		.eq("url", url);
-
-	const existingData = data[0];
-
-	if (existingData && existingData.scraped_data && includeCache) {
+	if (existingData && existingData.scraped_data) {
 		// Check if cached data matches current request parameters
 		const scrapedData = existingData.scraped_data;
 
 		return c.json({
 			success: true,
 			data: JSON.parse(scrapedData),
-			markdown: existingData.markdown,
-			screenshot: existingData.screenshot,
+			contentHtml: existingData?.contentHtml,
+			textContent: existingData?.textContent,
+			markdown: existingData?.markdown,
+			screenshot: existingData?.screenshot,
 			url: url,
-			timestamp: existingData.scraped_at,
+			timestamp: existingData?.scraped_at,
 		});
 	}
 
@@ -5098,7 +3864,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		const puppeteer = await import("puppeteer-core");
 		const chromium = (await import("@sparticuz/chromium")).default;
 
-		// Try to launch browser with @sparticuz/chromium first
 		try {
 			const executablePath = await chromium.executablePath();
 
@@ -5249,6 +4014,112 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			}
 		}
 
+		const html = await page.content();
+
+		const dom = new JSDOM(html, { url: url });
+		const isReadable = isProbablyReaderable(dom.window.document);
+
+		// ... cheerio loading content ...
+		// const $ = load(html);
+
+		// const cheerioScrapedContent = {
+		// 	headings: {
+		// 		h1: $("h1")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 		h2: $("h2")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 		h3: $("h3")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 		h4: $("h4")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 		h5: $("h5")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 		h6: $("h6")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 	},
+		// 	paragraphs: $("p")
+		// 		.map((i, el) => $(el).text().trim())
+		// 		.get(),
+		// 	divs: $("div")
+		// 		.map((i, el) => $(el).text().trim())
+		// 		.get(),
+		// 	lists: {
+		// 		ordered: $("ol li")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 		unordered: $("ul li")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 	},
+		// 	code: {
+		// 		codeBlocks: $("code")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 		preBlocks: $("pre")
+		// 			.map((i, el) => $(el).text().trim())
+		// 			.get(),
+		// 	},
+		// 	tables: $("table")
+		// 		.map((i, table) => {
+		// 			const $table = $(table);
+		// 			const rows = $table
+		// 				.find("tr")
+		// 				.map((j, row) => {
+		// 					const $row = $(row);
+		// 					return {
+		// 						headers: $row
+		// 							.find("th")
+		// 							.map((k, th) => $(th).text().trim())
+		// 							.get(),
+		// 						cells: $row
+		// 							.find("td")
+		// 							.map((k, td) => $(td).text().trim())
+		// 							.get(),
+		// 					};
+		// 				})
+		// 				.get();
+		// 			return {
+		// 				caption: $table.find("caption").text().trim(),
+		// 				rows: rows,
+		// 			};
+		// 		})
+		// 		.get(),
+		// 	// Additional useful elements
+		// 	links: $("a")
+		// 		.map((i, el) => ({
+		// 			text: $(el).text().trim(),
+		// 			href: $(el).attr("href"),
+		// 			title: $(el).attr("title"),
+		// 		}))
+		// 		.get(),
+		// 	images: $("img")
+		// 		.map((i, el) => ({
+		// 			src: $(el).attr("src"),
+		// 			alt: $(el).attr("alt"),
+		// 			title: $(el).attr("title"),
+		// 		}))
+		// 		.get(),
+		// 	// Get all text content for fallback
+		// 	allText: $("body").text().trim(),
+		// };
+
+		let textContent, contentHtml;
+
+		if (isReadable) {
+			const reader = new Readability(dom.window.document);
+
+			const article = reader.parse();
+
+			textContent = article.textContent;
+			contentHtml = article.content;
+		}
+
 		// Extract page content
 		scrapedData = await page.evaluate(
 			async (options) => {
@@ -5357,32 +4228,17 @@ app.post("/scrap-url-puppeteer", async (c) => {
 							: [];
 					};
 
-					const extractTableContent = (table) => {
-						const rows = Array.from(table.querySelectorAll("tr"));
-						return rows
-							.map((row) => {
-								const cells = Array.from(row.querySelectorAll("td, th")).map(
-									(cell) => cell.textContent.trim()
-								);
-								return cells.filter((cell) => cell.length > 0);
-							})
-							.filter((row) => row.length > 0);
-					};
-
-					const extractListContent = (list) => {
-						return Array.from(list.querySelectorAll("li"))
-							.map((li) => li.textContent.trim())
-							.filter((item) => item.length > 0);
-					};
-
 					// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
 					const rawSemanticContent = {
 						// High priority: Main content elements
 						mainContent: extractSemanticContent("main"),
 						articleContent: extractSemanticContent("article"),
 
+						divs: extractSemanticContent("div"),
+
 						// High priority: Core text content
 						paragraphs: extractSemanticContent("p"),
+						span: extractSemanticContent("span"),
 						blockquotes: extractSemanticContent("blockquote"),
 						codeBlocks: extractSemanticContent("code"),
 						preformatted: extractSemanticContent("pre"),
@@ -5463,19 +4319,31 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		await page.close();
 
 		console.log(
-			`   🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
+			`🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
 		);
 
 		// Store new data in Supabase
 		try {
 			if (!includeCache) {
-				const { error: insertError } = await supabase.from("universo").insert({
-					title: scrapedData.title || "No Title",
-					url: url,
-					markdown: toMarkdown(scrapedData),
-					scraped_at: new Date().toISOString(),
-					scraped_data: JSON.stringify(scrapedData),
-				});
+				// Check if the URL already exists in the "universo" table
+				const { data: existingRows, error: fetchError } = await supabase
+					.from("universo")
+					.select("id")
+					.eq("url", url);
+
+				let insertError = null;
+				if (!fetchError && (!existingRows || existingRows.length === 0)) {
+					const { error } = await supabase.from("universo").insert({
+						title: scrapedData.title || "No Title",
+						url: url,
+						contentHtml: contentHtml,
+						textContent: textContent,
+						markdown: toMarkdown(scrapedData),
+						scraped_at: new Date().toISOString(),
+						scraped_data: JSON.stringify(scrapedData),
+					});
+					insertError = error;
+				}
 
 				if (insertError) {
 					console.error("❌ Error storing data in Supabase:", insertError);
@@ -5489,8 +4357,10 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		return c.json({
 			success: true,
 			data: scrapedData,
-			markdown: toMarkdown(scrapedData),
 			url: url,
+			markdown: toMarkdown(scrapedData),
+			textContent: textContent,
+			contentHtml: contentHtml,
 			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
@@ -5741,6 +4611,223 @@ app.post("/take-screenshot", async (c) => {
 		);
 	}
 });
+
+const filterValidImages = async (locations) => {
+	let results = [];
+	try {
+		locations.forEach(async (location) => {
+			const imgs = new Set();
+			if (location) {
+				try {
+					const { body: imageStream } = await fetch(location);
+					if (imageStream) {
+						const { height, width } = await imageDimensionsFromStream(
+							imageStream
+						);
+						if (
+							height &&
+							width &&
+							height > 600 &&
+							width > 600 &&
+							!imgs.has(location)
+						) {
+							imgs.add(location);
+						}
+					} else {
+						console.log("No image stream", location);
+					}
+				} catch (err) {
+					console.log("Error in batch", err);
+				}
+			}
+			return imgs;
+		});
+	} catch (err) {
+		console.log("Error in batch", err);
+	}
+	return results;
+};
+
+app.get("/filter-images/:batch", async (c) => {
+	const batch = await c.req.param("batch");
+	const locations = await supabase
+		.from("locations")
+		.select("unsplash_images, images")
+		.range((batch - 1) * 50, batch * 50 - 1);
+
+	for (const location of locations.data) {
+		let new_unsplash_images = [];
+		let new_images = [];
+		if (location?.unsplash_images?.length > 0) {
+			new_unsplash_images = await filterValidImages(location.unsplash_images);
+		}
+		if (location?.images?.length > 0) {
+			new_images = await filterValidImages(location.images);
+		}
+
+		if (new_unsplash_images.length > 0 || new_images.length > 0) {
+			console.log(`Supabase table updated for ${location.id}`);
+			await supabase
+				.from("locations")
+				.update({ unsplash_images: new_unsplash_images, images: new_images })
+				.eq("id", location.id);
+		}
+	}
+
+	return c.json({ success: true, batch: batch });
+});
+
+app.post("/filter-images-batch", async (c) => {
+	let batch = 1;
+	while (batch < 25) {
+		console.log(`Starting batch: ${batch}`);
+		try {
+			await fetch("http://localhost:3001/filter-images/" + batch, {
+				method: "GET",
+			});
+			console.log(`Finished batch: ${batch}`);
+		} catch (error) {
+			console.error(`Error in batch: ${batch}`, error);
+		}
+		batch++;
+	}
+	return c.json({ success: true, batch: batch });
+});
+
+// ... existing code ...
+
+const filterAndUpdateImages = async () => {
+	try {
+		// Get all locations with their image arrays
+		const { data: locations, error } = await supabase
+			.from("locations")
+			.select("id, unsplash_images, images");
+
+		if (error) {
+			console.error("Error fetching locations:", error);
+			return { success: false, error: error.message };
+		}
+
+		// Flatten all images into a single array with their location IDs
+		const allImages = [];
+		locations.forEach((location) => {
+			if (location.unsplash_images?.length > 0) {
+				location.unsplash_images.forEach((imageUrl) => {
+					allImages.push({
+						locationId: location.id,
+						imageUrl: imageUrl,
+						type: "unsplash_images",
+					});
+				});
+			}
+			if (location.images?.length > 0) {
+				location.images.forEach((imageUrl) => {
+					allImages.push({
+						locationId: location.id,
+						imageUrl: imageUrl,
+						type: "images",
+					});
+				});
+			}
+		});
+
+		console.log(`Processing ${allImages.length} total images...`);
+
+		// Process images in batches to avoid overwhelming the system
+		const batchSize = 10;
+		const validImages = new Map(); // locationId -> { unsplash_images: [], images: [] }
+
+		for (let i = 0; i < allImages.length; i += batchSize) {
+			const batch = allImages.slice(i, i + batchSize);
+
+			// Process batch concurrently
+			const batchPromises = batch.map(async (imageData) => {
+				try {
+					const { body: imageStream } = await fetch(imageData.imageUrl);
+					if (imageStream) {
+						const { height, width } = await imageDimensionsFromStream(
+							imageStream
+						);
+						if (height && width && height > 600 && width > 600) {
+							// Initialize location data if not exists
+							if (!validImages.has(imageData.locationId)) {
+								validImages.set(imageData.locationId, {
+									unsplash_images: [],
+									images: [],
+								});
+							}
+
+							// Add valid image to appropriate array
+							const locationData = validImages.get(imageData.locationId);
+							if (imageData.type === "unsplash_images") {
+								locationData.unsplash_images.push(imageData.imageUrl);
+							} else {
+								locationData.images.push(imageData.imageUrl);
+							}
+						}
+					}
+				} catch (err) {
+					console.log(
+						`Error processing image ${imageData.imageUrl}:`,
+						err.message
+					);
+				}
+			});
+
+			await Promise.all(batchPromises);
+
+			// Small delay between batches to be respectful to external services
+			if (i + batchSize < allImages.length) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+		}
+
+		// Update database with filtered images
+		let updatedCount = 0;
+		for (const [locationId, imageData] of validImages) {
+			try {
+				const { error: updateError } = await supabase
+					.from("locations")
+					.update({
+						unsplash_images: imageData.unsplash_images,
+						images: imageData.images,
+					})
+					.eq("id", locationId);
+
+				if (updateError) {
+					console.error(`Error updating location ${locationId}:`, updateError);
+				} else {
+					updatedCount++;
+					console.log(
+						`Updated location ${locationId} - unsplash: ${imageData.unsplash_images.length}, images: ${imageData.images.length}`
+					);
+				}
+			} catch (err) {
+				console.error(`Error updating location ${locationId}:`, err);
+			}
+		}
+
+		console.log(
+			`Successfully processed ${allImages.length} images, updated ${updatedCount} locations`
+		);
+		return {
+			success: true,
+			totalImages: allImages.length,
+			updatedLocations: updatedCount,
+		};
+	} catch (err) {
+		console.error("Error in filterAndUpdateImages:", err);
+		return { success: false, error: err.message };
+	}
+};
+
+// Add this endpoint to use the method
+app.post("/filter-all-images", async (c) => {
+	const result = await filterAndUpdateImages();
+	return c.json(result);
+});
+
+// ... existing code ...
 
 app.post("/repo", async (c) => {
 	const { name } = await c.req.json();
@@ -6286,3 +5373,5 @@ app.get("/ai-chat-form", async (c) => {
 		},
 	});
 });
+
+// we want to make ihatereading frontend few API as well
