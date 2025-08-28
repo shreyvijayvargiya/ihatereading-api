@@ -5,7 +5,10 @@
 	"main": "index.js",
 	"scripts": {
 		"start": "node index.js",
-		"dev": "nodemon index.js"
+		"dev": "nodemon index.js",
+		"test:load": "node test-load.js",
+		"monitor": "node monitor-resources.js",
+		"test:with-monitor": "concurrently \"npm run monitor\" \"npm run test:load\""
 	},
 	"dependencies": {
 		"@google/genai": "^1.10.0",
@@ -35,6 +38,7 @@
 		"puppeteer": "^24.17.0",
 		"puppeteer-core": "^24.17.0",
 		"supabase": "^2.34.3",
+		"turndown": "^7.2.1",
 		"undici": "^7.13.0",
 		"url": "^0.11.4",
 		"user-agents": "^1.1.642",
@@ -42,5 +46,9 @@
 		"vite": "^7.1.1",
 		"xml2js": "^0.6.2",
 		"zod": "^3.25.76"
+	},
+	"devDependencies": {
+		"autocannon": "^8.0.0",
+		"concurrently": "^9.2.1"
 	}
 }

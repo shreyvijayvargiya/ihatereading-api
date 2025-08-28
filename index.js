@@ -18,6 +18,7 @@ import { Readability, isProbablyReaderable } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import { load } from "cheerio";
 import extractImagesFromContent from "./lib/extractImages.js";
+import TurndownService from "turndown";
 
 const userAgents = new UserAgent();
 
@@ -3801,6 +3802,18 @@ function isValidURL(urlString) {
 	}
 }
 
+function removeEmptyKeys(obj) {
+	for (const key of Object.keys(obj)) {
+		const value = obj[key];
+		if (
+			value === null ||
+			(Array.isArray(value) && value.length === 0) ||
+			(typeof value === "string" && value.trim() === "")
+		) {
+			delete obj[key];
+		}
+	}
+}
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
 	const {
@@ -3847,12 +3860,10 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		return c.json({
 			success: true,
 			data: JSON.parse(scrapedData),
-			contentHtml: existingData?.contentHtml,
-			textContent: existingData?.textContent,
 			markdown: existingData?.markdown,
-			screenshot: existingData?.screenshot,
+			markdownContent: existingData?.markdownContent,
 			url: url,
-			timestamp: existingData?.scraped_at,
+			scraped_at: existingData?.scraped_at,
 		});
 	}
 
@@ -4019,105 +4030,11 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		const dom = new JSDOM(html, { url: url });
 		const isReadable = isProbablyReaderable(dom.window.document);
 
-		// ... cheerio loading content ...
-		// const $ = load(html);
-
-		// const cheerioScrapedContent = {
-		// 	headings: {
-		// 		h1: $("h1")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 		h2: $("h2")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 		h3: $("h3")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 		h4: $("h4")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 		h5: $("h5")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 		h6: $("h6")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 	},
-		// 	paragraphs: $("p")
-		// 		.map((i, el) => $(el).text().trim())
-		// 		.get(),
-		// 	divs: $("div")
-		// 		.map((i, el) => $(el).text().trim())
-		// 		.get(),
-		// 	lists: {
-		// 		ordered: $("ol li")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 		unordered: $("ul li")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 	},
-		// 	code: {
-		// 		codeBlocks: $("code")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 		preBlocks: $("pre")
-		// 			.map((i, el) => $(el).text().trim())
-		// 			.get(),
-		// 	},
-		// 	tables: $("table")
-		// 		.map((i, table) => {
-		// 			const $table = $(table);
-		// 			const rows = $table
-		// 				.find("tr")
-		// 				.map((j, row) => {
-		// 					const $row = $(row);
-		// 					return {
-		// 						headers: $row
-		// 							.find("th")
-		// 							.map((k, th) => $(th).text().trim())
-		// 							.get(),
-		// 						cells: $row
-		// 							.find("td")
-		// 							.map((k, td) => $(td).text().trim())
-		// 							.get(),
-		// 					};
-		// 				})
-		// 				.get();
-		// 			return {
-		// 				caption: $table.find("caption").text().trim(),
-		// 				rows: rows,
-		// 			};
-		// 		})
-		// 		.get(),
-		// 	// Additional useful elements
-		// 	links: $("a")
-		// 		.map((i, el) => ({
-		// 			text: $(el).text().trim(),
-		// 			href: $(el).attr("href"),
-		// 			title: $(el).attr("title"),
-		// 		}))
-		// 		.get(),
-		// 	images: $("img")
-		// 		.map((i, el) => ({
-		// 			src: $(el).attr("src"),
-		// 			alt: $(el).attr("alt"),
-		// 			title: $(el).attr("title"),
-		// 		}))
-		// 		.get(),
-		// 	// Get all text content for fallback
-		// 	allText: $("body").text().trim(),
-		// };
-
-		let textContent, contentHtml;
+		let markdownContent;
 
 		if (isReadable) {
-			const reader = new Readability(dom.window.document);
-
-			const article = reader.parse();
-
-			textContent = article.textContent;
-			contentHtml = article.content;
+			const turndown = new TurndownService();
+			markdownContent = turndown.turndown(dom.window.document.body.innerHTML);
 		}
 
 		// Extract page content
@@ -4126,7 +4043,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				const data = {
 					url: window.location.href,
 					title: document.title,
-					timestamp: new Date().toISOString(),
 					content: {},
 					metadata: {},
 					links: [],
@@ -4318,10 +4234,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 		await page.close();
 
-		console.log(
-			`🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
-		);
-
 		// Store new data in Supabase
 		try {
 			if (!includeCache) {
@@ -4336,9 +4248,8 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					const { error } = await supabase.from("universo").insert({
 						title: scrapedData.title || "No Title",
 						url: url,
-						contentHtml: contentHtml,
-						textContent: textContent,
 						markdown: toMarkdown(scrapedData),
+						markdownContent: markdownContent,
 						scraped_at: new Date().toISOString(),
 						scraped_data: JSON.stringify(scrapedData),
 					});
@@ -4354,13 +4265,14 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			console.error("❌ Supabase storage error:", supabaseError);
 		}
 
+		removeEmptyKeys(scrapedData.content.semanticContent);
+		removeEmptyKeys(scrapedData.content);
+
 		return c.json({
 			success: true,
 			data: scrapedData,
 			url: url,
 			markdown: toMarkdown(scrapedData),
-			textContent: textContent,
-			contentHtml: contentHtml,
 			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
@@ -4370,7 +4282,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			{
 				success: false,
 				error: "Failed to scrape URL using Puppeteer",
-				details: error.message,
+				details: "Unable to scrap, check URL",
 				url: url,
 			},
 			500
@@ -4503,9 +4415,7 @@ app.post("/take-screenshot", async (c) => {
 			scrapedData = await page.evaluate(async () => {
 				const data = {
 					url: window.location.href,
-					timestamp: new Date().toISOString(),
 					metadata: {},
-					screenshot: null,
 				};
 
 				// Meta tags
