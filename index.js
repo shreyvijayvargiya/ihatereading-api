@@ -10,14 +10,45 @@ import { performance } from "perf_hooks";
 import { cpus } from "os";
 import { ChatOllama } from "@langchain/ollama";
 import UserAgent from "user-agents";
-import { pipeline } from "@xenova/transformers";
+import { pipeline, env } from "@xenova/transformers";
 import { v4 as uuidv4 } from "uuid";
 import { imageDimensionsFromStream } from "image-dimensions";
 import toMarkdown from "./lib/toMarkdown.js";
 import { JSDOM } from "jsdom";
 import axios from "axios";
 import TurndownService from "turndown";
+import { remark } from "remark";
+import remarkGfm from "remark-gfm";
+import remarkRehype from "remark-rehype";
+import rehypeStringify from "rehype-stringify";
 import https from "https";
+import { unified } from "unified";
+
+// Function to process markdown content using remark for LLM optimization
+async function processMarkdownForLLM(markdownContent) {
+	try {
+		if (!markdownContent || typeof markdownContent !== "string") {
+			return markdownContent;
+		}
+
+		// Process markdown with remark plugins
+		const processedContent = await unified()
+			.use(remark)
+			.use(remarkGfm)
+			.use(remarkRehype)
+			.use(rehypeStringify)
+			.process(markdownContent);
+
+		return processedContent;
+	} catch (error) {
+		console.warn(
+			"Warning: Failed to process markdown with remark:",
+			error.message
+		);
+		// Return original content if processing fails
+		return markdownContent;
+	}
+}
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -41,7 +72,7 @@ function get_useragent() {
 
 const ollama = new ChatOllama({
 	// model: "gemma:2b",
-	model: "nemotron-mini:latest",
+	model: "deepseek-r1:1.5b ",
 	baseURL: "http://localhost:11434",
 });
 
@@ -643,61 +674,6 @@ const supabase = createClient(
 	process.env.SUPABASE_URL,
 	process.env.SUPABASE_KEY
 );
-
-// Initialize the embedding model
-let embedder = null;
-
-// Initialize embedding model asynchronously
-async function initializeEmbedder() {
-	try {
-		console.log("🔄 Initializing embedding model...");
-		embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-		console.log("✅ Embedding model initialized successfully");
-	} catch (error) {
-		console.error("❌ Failed to initialize embedding model:", error);
-	}
-}
-
-// Initialize the embedder when the server starts
-initializeEmbedder();
-
-// Function to create embeddings for text
-async function createEmbedding(text) {
-	if (!embedder) {
-		throw new Error(
-			"Embedding model not initialized. Please wait for initialization to complete."
-		);
-	}
-
-	try {
-		const embedding = await embedder(text);
-		return embedding;
-	} catch (error) {
-		console.error("Error creating embedding:", error);
-		throw new Error(`Failed to create embedding: ${error.message}`);
-	}
-}
-
-// Function to create embeddings for multiple text chunks
-async function embedChunks(chunks) {
-	if (!embedder) {
-		throw new Error(
-			"Embedding model not initialized. Please wait for initialization to complete."
-		);
-	}
-
-	try {
-		return Promise.all(
-			chunks.map(async (chunk) => {
-				const embedding = await embedder(chunk);
-				return { chunk, embedding };
-			})
-		);
-	} catch (error) {
-		console.error("Error creating embeddings for chunks:", error);
-		throw new Error(`Failed to create embeddings for chunks: ${error.message}`);
-	}
-}
 
 const app = new Hono();
 
@@ -1867,146 +1843,119 @@ app.post("/find-latest-jobs", async (c) => {
 	});
 });
 
-// Dedicated Bing Search endpoint using Playwright (like multi-search)
+// Enhanced Bing Search endpoint using Axios (same method as google-search)
 app.post("/bing-search", async (c) => {
 	const {
 		query,
-		limit = 5,
-		config = {
-			timeout: 30000,
-		},
+		num = 10,
+		language = "en",
+		country = "us",
+		timeout = 10000,
 	} = await c.req.json();
 
 	if (!query) {
-		return c.json({ error: "Query is required" }, 400);
+		return c.json({ error: "Query parameter is required" }, 400);
 	}
 
-	let searchResults;
-	let browser;
-
+	const results = [];
 	try {
-		// Use Playwright like bing-search for JavaScript rendering
-		browser = await chromium.launch({
-			headless: true,
-			args: [
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-dev-shm-usage",
-				"--disable-gpu",
-			],
-		});
+		console.log(`🔍 Starting Bing search for: "${query}"`);
 
-		const context = await browser.newContext({
-			userAgent:
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.61 Safari/537.36",
-			viewport: { width: 1920, height: 1080 },
-			extraHTTPHeaders: {
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-				"sec-fetch-site": "same-origin",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				referer: "https://www.bing.com/",
-				"accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+		const response = await axios.get(`https://www.bing.com/search`, {
+			headers: {
+				"User-Agent": get_useragent(),
+				Accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+				"Accept-Language": `${language}-${country},${language};q=0.9`,
+				"Accept-Encoding": "gzip, deflate",
+				Referer: "https://www.bing.com/",
+				DNT: "1",
+				"Upgrade-Insecure-Requests": "1",
 			},
+			params: {
+				q: query,
+				first: 1, // Start position (Bing uses 'first' instead of 'start')
+				count: Math.min(num, 10), // Bing's count parameter, max 10 per page
+				setlang: language,
+				cc: country.toUpperCase(),
+				safesearch: "moderate",
+				format: "rss", // Request RSS format for better parsing
+				ensearch: 0, // English search
+			},
+			timeout: timeout,
+			httpsAgent: new https.Agent({
+				rejectUnauthorized: true,
+			}),
 		});
 
-		const page = await context.newPage();
+		// Use response.data directly - axios already handles UTF-8
+		const dom = new JSDOM(response.data);
+		const document = dom.window.document;
 
-		// Navigate to Bing search
-		await page.goto(
-			`https://www.bing.com/search?q=${encodeURIComponent(
-				query
-			)}&count=${limit}`,
-			{
-				waitUntil: "networkidle",
-				timeout: config.timeout,
-			}
-		);
+		// Get Bing search results using correct selectors
+		const result_block = document.querySelectorAll(".b_algo, .b_results li");
 
-		// Wait for search results to load (like multi-search does)
-		await page.waitForTimeout(1000);
+		for (const result of result_block) {
+			// Try multiple title selectors for Bing
+			const title_tag = result.querySelector("h2 a, .b_title a, a[href]");
+			const description_tag = result.querySelector(
+				".b_caption p, .b_snippet, .b_caption"
+			);
 
-		// Extract search results using the same method as multi-search
-		const bingResults = await page.evaluate((maxResults) => {
-			const results = [];
-			const searchItems = document.querySelectorAll(".b_algo");
+			if (title_tag && description_tag) {
+				const link = title_tag.href;
+				const title = (title_tag.textContent || "").trim();
+				const description = (description_tag.textContent || "").trim();
 
-			searchItems.forEach((item, index) => {
-				if (index >= maxResults) return;
-
-				const titleElement = item.querySelector("h2 a");
-				const snippetElement = item.querySelector(".b_caption p");
-
-				if (titleElement) {
-					results.push({
-						title: titleElement.textContent.trim(),
-						url: titleElement.href,
-						snippet: snippetElement ? snippetElement.textContent.trim() : "",
-						position: index + 1,
-					});
+				// Clean Bing redirect URLs
+				let cleanLink = link;
+				try {
+					if (link.includes("bing.com/ck/")) {
+						const urlMatch = link.match(/u=([^&]+)/);
+						if (urlMatch) {
+							cleanLink = decodeURIComponent(urlMatch[1]);
+						}
+					}
+				} catch (urlError) {
+					console.log("URL cleaning error:", urlError.message);
 				}
-			});
 
-			return results;
-		}, limit);
-
-		// Process results and add domain extraction
-		const results = bingResults.map((result, index) => {
-			let domain = "";
-			try {
-				domain = new URL(result.url).hostname.replace("www.", "");
-			} catch (e) {
-				domain = "";
+				results.push({
+					title,
+					description,
+					link: cleanLink,
+				});
 			}
+		}
 
-			return {
-				...result,
-				domain,
-				position: index + 1,
-			};
+		console.log(`🎯 Total Bing results collected: ${results.length}`);
+
+		return c.json({
+			success: true,
+			query,
+			results: results.slice(0, num),
+			totalFound: results.length,
+			engine: "bing",
+			parameters: {
+				language,
+				country,
+				num,
+				timeout,
+			},
+			timestamp: new Date().toISOString(),
 		});
-
-		if (results.length === 0) {
-			console.warn(
-				"⚠️ No Bing search results found - possible detection or no results"
-			);
-			searchResults = {
-				error: "No search results found. Bing may have blocked the request.",
-				noResults: true,
-				suggestion: "Try a different query or wait before retrying",
-			};
-		} else {
-			console.log(
-				`✅ Found ${results.length} Bing search results using Playwright`
-			);
-			searchResults = results;
-		}
-
-		await page.close();
-		await context.close();
 	} catch (error) {
-		console.error("Bing search error with Playwright:", error);
-		searchResults = { error: error.message };
-	} finally {
-		if (browser) {
-			await browser.close();
-		}
+		console.error("❌ Bing search error:", error);
+		return c.json(
+			{
+				success: false,
+				error: error.message,
+				query,
+				engine: "bing",
+			},
+			500
+		);
 	}
-
-	return c.json({
-		success: true,
-		query,
-		results: searchResults,
-		total: Array.isArray(searchResults) ? searchResults.length : 0,
-		engine: "bing",
-		config: {
-			timeout: config.timeout,
-		},
-	});
 });
 
 app.post("/google-search", async (c) => {
@@ -2041,9 +1990,6 @@ app.post("/google-search", async (c) => {
 				rejectUnauthorized: true,
 			}),
 		});
-
-		console.log("Response data type:", typeof response.data);
-		console.log("Response data length:", response.data.length);
 
 		// Use response.data directly - axios already handles UTF-8
 		const dom = new JSDOM(response.data, {
@@ -4127,7 +4073,10 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 		if (dom.window.document.body.innerHTML) {
 			const turndown = new TurndownService();
-			markdownContent = turndown.turndown(dom.window.document.body.innerHTML);
+			// markdownContent = turndown.turndown(dom.window.document.body.innerHTML);
+			markdownContent = await processMarkdownForLLM(
+				turndown.turndown(dom.window.document.body.innerHTML)
+			);
 		}
 
 		// Extract page content
@@ -4187,7 +4136,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 				// Extract links
 				if (options.includeLinks) {
-					const links = document.querySelectorAll("a");
+					const links = document.querySelectorAll("a[href]");
 
 					const currentUrl = new URL(window.location.href);
 					const seedDomain = currentUrl.hostname;
@@ -4237,6 +4186,24 @@ app.post("/scrap-url-puppeteer", async (c) => {
 							: [];
 					};
 
+					const extractTableContent = (table) => {
+						const rows = Array.from(table.querySelectorAll("tr"));
+						return rows
+							.map((row) => {
+								const cells = Array.from(row.querySelectorAll("td, th")).map(
+									(cell) => cell.textContent.trim()
+								);
+								return cells.filter((cell) => cell.length > 0);
+							})
+							.filter((row) => row.length > 0);
+					};
+
+					const extractListContent = (list) => {
+						return Array.from(list.querySelectorAll("li"))
+							.map((li) => li.textContent.trim())
+							.filter((item) => item.length > 0);
+					};
+
 					// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
 					const rawSemanticContent = {
 						// High priority: Main content elements
@@ -4251,6 +4218,9 @@ app.post("/scrap-url-puppeteer", async (c) => {
 						blockquotes: extractSemanticContent("blockquote"),
 						codeBlocks: extractSemanticContent("code"),
 						preformatted: extractSemanticContent("pre"),
+						tables: extractSemanticContent("table", extractTableContent),
+						unorderedLists: extractSemanticContent("ul", extractListContent),
+						orderedLists: extractSemanticContent("ol", extractListContent),
 					};
 
 					// Remove duplicates from semantic content
@@ -4390,7 +4360,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			success: true,
 			data: scrapedData,
 			url: url,
-			markdown: toMarkdown(scrapedData),
+			markdown: await processMarkdownForLLM(toMarkdown(scrapedData)),
 			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
@@ -5401,5 +5371,10 @@ app.get("/ai-chat-form", async (c) => {
 		},
 	});
 });
-
-// we want to make ihatereading frontend few API as well
+env.useBrowserCache = false;
+env.allowLocalModels = false;
+env.backends.onnx.wasm.proxy = false;
+env.backends.onnx.wasm.numThreads = 1; // keep single-threaded
+env.localModelPath = "./models"; // optional: if you cache locally
+env.useWebWorkers = false;
+env.useBrowserCache = false;
