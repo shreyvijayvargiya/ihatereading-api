@@ -3786,7 +3786,6 @@ const origin = isDevelopment
 
 app.post("/ai-url-chat", async (c) => {
 	const { link, prompt } = await c.req.json();
-	console.log(`${origin}/scrap-url-puppeteer`);
 
 	if (!link || !prompt) {
 		return c.json({ error: "Both link and prompt are required" }, 400);
@@ -3798,6 +3797,7 @@ app.post("/ai-url-chat", async (c) => {
 			method: "POST",
 			body: JSON.stringify({
 				url: link,
+				includeCache: true
 			}),
 		});
 
@@ -3810,11 +3810,10 @@ Website: ${link}
 
 Question: ${prompt}
 The data for the website is in markdown format:
-${results.mardown}
-
-Read the data markdown and answer the user question as given above.
+${results.markdown}
 `;
 
+		console.log(results.markdown, "results");
 		// Use Google GenAI to answer the question
 		const response = await genai.models.generateContent({
 			model: "gemini-2.5-flash-lite",
@@ -3831,24 +3830,21 @@ Read the data markdown and answer the user question as given above.
 					role: "user",
 					parts: [
 						{
-							text: `You are a helpful AI assistant. A user is asking a question about a website. Please provide a helpful answer based on the context.
-							
-							Question: ${prompt}`,
+							text: `${prompt}`,
 						},
 					],
 				},
 			],
 		});
 
+		console.log(response.usageMetadata, "response.usageMetadata");
 		return c.json({
 			answer: response.candidates[0].content.parts[0].text,
 			scrapedData: scrapedData,
 			url: link,
 			markdown: results.markdown,
 			timestamp: new Date().toISOString(),
-			inputTokens: response.usageMetadata.inputTokens,
-			outputTokens: response.usageMetadata.outputTokens,
-			totalTokens: response.usageMetadata.totalTokens,
+			usageMetadata: response.usageMetadata,
 		});
 	} catch (error) {
 		console.error("❌ AI URL Chat error:", error);
@@ -4392,32 +4388,8 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		}
 
 		// Remove empty keys from content
-		if (scrapedData.content && scrapedData.content.semanticContent) {
-			Object.keys(scrapedData.content.semanticContent).forEach((key) => {
-				const value = scrapedData.content.semanticContent[key];
-				if (
-					value === null ||
-					(Array.isArray(value) && value.length === 0) ||
-					(typeof value === "string" && value.trim() === "")
-				) {
-					delete scrapedData.content.semanticContent[key];
-				}
-			});
-		}
-
-		// Remove empty keys from main content
-		if (scrapedData.content) {
-			Object.keys(scrapedData.content).forEach((key) => {
-				const value = scrapedData.content[key];
-				if (
-					value === null ||
-					(Array.isArray(value) && value.length === 0) ||
-					(typeof value === "string" && value.trim() === "")
-				) {
-					delete scrapedData.content[key];
-				}
-			});
-		}
+		removeEmptyKeys(scrapedData.content.semanticContent);
+		removeEmptyKeys(scrapedData.content);
 
 		return c.json({
 			success: true,
@@ -4672,90 +4644,6 @@ app.post("/take-screenshot", async (c) => {
 		);
 	}
 });
-
-const filterValidImages = async (locations) => {
-	let results = [];
-	try {
-		locations.forEach(async (location) => {
-			const imgs = new Set();
-			if (location) {
-				try {
-					const { body: imageStream } = await fetch(location);
-					if (imageStream) {
-						const { height, width } = await imageDimensionsFromStream(
-							imageStream
-						);
-						if (
-							height &&
-							width &&
-							height > 600 &&
-							width > 600 &&
-							!imgs.has(location)
-						) {
-							imgs.add(location);
-						}
-					} else {
-						console.log("No image stream", location);
-					}
-				} catch (err) {
-					console.log("Error in batch", err);
-				}
-			}
-			return imgs;
-		});
-	} catch (err) {
-		console.log("Error in batch", err);
-	}
-	return results;
-};
-
-app.get("/filter-images/:batch", async (c) => {
-	const batch = await c.req.param("batch");
-	const locations = await supabase
-		.from("locations")
-		.select("unsplash_images, images")
-		.range((batch - 1) * 50, batch * 50 - 1);
-
-	for (const location of locations.data) {
-		let new_unsplash_images = [];
-		let new_images = [];
-		if (location?.unsplash_images?.length > 0) {
-			new_unsplash_images = await filterValidImages(location.unsplash_images);
-		}
-		if (location?.images?.length > 0) {
-			new_images = await filterValidImages(location.images);
-		}
-
-		if (new_unsplash_images.length > 0 || new_images.length > 0) {
-			console.log(`Supabase table updated for ${location.id}`);
-			await supabase
-				.from("locations")
-				.update({ unsplash_images: new_unsplash_images, images: new_images })
-				.eq("id", location.id);
-		}
-	}
-
-	return c.json({ success: true, batch: batch });
-});
-
-app.post("/filter-images-batch", async (c) => {
-	let batch = 1;
-	while (batch < 25) {
-		console.log(`Starting batch: ${batch}`);
-		try {
-			await fetch("http://localhost:3001/filter-images/" + batch, {
-				method: "GET",
-			});
-			console.log(`Finished batch: ${batch}`);
-		} catch (error) {
-			console.error(`Error in batch: ${batch}`, error);
-		}
-		batch++;
-	}
-	return c.json({ success: true, batch: batch });
-});
-
-// ... existing code ...
 
 const filterAndUpdateImages = async () => {
 	try {
@@ -5435,11 +5323,10 @@ app.get("/ai-chat-form", async (c) => {
 	});
 });
 
-
 app.post("/ai-answer", async (c) => {
 	// Initialize the pipeline with proper error handling and ONNX optimization
 	let generator;
-	
+
 	generator = await pipeline("text2text-generation", "Xenova/flan-t5-base", {
 		quantized: false,
 		cache_dir: "./models",
