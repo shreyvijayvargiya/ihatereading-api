@@ -23,6 +23,8 @@ import remarkRehype from "remark-rehype";
 import rehypeStringify from "rehype-stringify";
 import https from "https";
 import { unified } from "unified";
+import { existsSync, mkdir } from "fs";
+import path from "path";
 
 // Function to process markdown content using remark for LLM optimization
 async function processMarkdownForLLM(markdownContent) {
@@ -39,7 +41,16 @@ async function processMarkdownForLLM(markdownContent) {
 			.use(rehypeStringify)
 			.process(markdownContent);
 
-		return processedContent;
+		// Convert VFile to string and clean up for LLM consumption
+		const processedString = String(processedContent);
+
+		// Additional cleaning for LLM consumption
+		const cleanedContent = processedString
+			.replace(/\n{3,}/g, "\n\n") // Remove excessive newlines
+			.replace(/\s{2,}/g, " ") // Remove excessive whitespace
+			.trim();
+
+		return cleanedContent;
 	} catch (error) {
 		console.warn(
 			"Warning: Failed to process markdown with remark:",
@@ -47,6 +58,55 @@ async function processMarkdownForLLM(markdownContent) {
 		);
 		// Return original content if processing fails
 		return markdownContent;
+	}
+}
+
+// Function to check model cache status
+async function checkModelCache(modelsDirectory) {
+	try {
+		const fs = await import("fs/promises");
+
+		const modelFiles = await fs.readdir(modelsDirectory);
+		console.log("📁 Models in cache:", modelFiles);
+
+		if (modelFiles.length === 0) {
+			console.log(
+				"⚠️ No models found in cache. Models will be downloaded on first use."
+			);
+		} else {
+			console.log("✅ Models found in cache");
+		}
+	} catch (error) {
+		console.warn("⚠️ Could not check model cache:", error.message);
+	}
+}
+
+// Function to get AI answers using transformers pipeline
+async function getAIAnswer(question, context = "") {
+	try {
+		if (!generator) {
+			throw new Error("Transformers pipeline not initialized");
+		}
+
+		// Format the input for flan-t5 model (better for question-answering)
+		let input;
+		if (context) {
+			input = `Answer the following question based on the context:\n\nContext: ${context}\n\nQuestion: ${question}`;
+		} else {
+			input = `Answer the following question: ${question}`;
+		}
+
+		const output = await generator(input, {
+			max_new_tokens: 1000,
+			temperature: 0.7,
+			do_sample: true,
+			top_p: 0.9,
+		});
+
+		return output[0]?.generated_text || "No answer generated";
+	} catch (error) {
+		console.error("Error getting AI answer:", error.message);
+		return `Error: ${error.message}`;
 	}
 }
 
@@ -1784,7 +1844,7 @@ ${prompt}
 Please provide a comprehensive itinerary following the structure specified in the system prompt.`;
 
 		const initialItineraryResult = await genai.models.generateContent({
-			model: "gemini-2.0-flash",
+			model: "gemini-2.5-flash-lite",
 			contents: [
 				{ role: "model", parts: [{ text: generateItineraryPrompt(prompt) }] },
 				{ role: "user", parts: [{ text: userPrompt }] },
@@ -3757,7 +3817,7 @@ Read the data markdown and answer the user question as given above.
 
 		// Use Google GenAI to answer the question
 		const response = await genai.models.generateContent({
-			model: "gemini-2.0-flash",
+			model: "gemini-2.5-flash-lite",
 			contents: [
 				{
 					role: "model",
@@ -3786,6 +3846,9 @@ Read the data markdown and answer the user question as given above.
 			url: link,
 			markdown: results.markdown,
 			timestamp: new Date().toISOString(),
+			inputTokens: response.usageMetadata.inputTokens,
+			outputTokens: response.usageMetadata.outputTokens,
+			totalTokens: response.usageMetadata.totalTokens,
 		});
 	} catch (error) {
 		console.error("❌ AI URL Chat error:", error);
@@ -5371,10 +5434,51 @@ app.get("/ai-chat-form", async (c) => {
 		},
 	});
 });
-env.useBrowserCache = false;
-env.allowLocalModels = false;
-env.backends.onnx.wasm.proxy = false;
-env.backends.onnx.wasm.numThreads = 1; // keep single-threaded
-env.localModelPath = "./models"; // optional: if you cache locally
-env.useWebWorkers = false;
-env.useBrowserCache = false;
+
+
+app.post("/ai-answer", async (c) => {
+	// Initialize the pipeline with proper error handling and ONNX optimization
+	let generator;
+	
+	generator = await pipeline("text2text-generation", "Xenova/flan-t5-base", {
+		quantized: false,
+		cache_dir: "./models",
+		progress_callback: (progress) => {
+			if (progress.status === "progress") {
+				console.log(
+					`📥 Downloading alternative model: ${Math.round(progress.progress)}%`
+				);
+			}
+		},
+	});
+	try {
+		const data = await supabase
+			.from("universo")
+			.select("markdown")
+			.order("id", { ascending: false })
+			.limit(1);
+		const markdown = data.data[0].markdown;
+		const output = await generator(
+			`Improve the following markdown content and give me production read LLM
+			based markdown content: ${markdown}`,
+			{
+				max_new_tokens: 1000,
+				temperature: 0.7,
+				do_sample: true,
+			}
+		);
+		console.log("✅ Pipeline test successful:", output);
+		return c.json({
+			success: true,
+			answer: output[0].generated_text,
+		});
+	} catch (error) {
+		console.error("❌ Alternative model also failed:", error.message);
+		console.error("Full alternative error:", error);
+		generator = null;
+		return c.json({
+			success: false,
+			error: error.message,
+		});
+	}
+});
