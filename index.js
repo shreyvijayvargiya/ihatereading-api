@@ -24,7 +24,9 @@ import rehypeStringify from "rehype-stringify";
 import https from "https";
 import { unified } from "unified";
 import { existsSync, mkdir } from "fs";
+import { Markdown } from "markdown-to-html";
 import path from "path";
+import toHtml from "./lib/toHtml.js";
 
 // Function to process markdown content using remark for LLM optimization
 async function processMarkdownForLLM(markdownContent) {
@@ -3797,7 +3799,7 @@ app.post("/ai-url-chat", async (c) => {
 			method: "POST",
 			body: JSON.stringify({
 				url: link,
-				includeCache: true
+				includeCache: true,
 			}),
 		});
 
@@ -3926,6 +3928,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		includeLinks = true,
 		extractMetadata = true,
 		includeCache = false,
+		useProxy = true,
 	} = await c.req.json();
 
 	const isValidUrl = isValidURL(url);
@@ -4004,9 +4007,19 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 		// Set viewport and user agent
 		await page.setViewport({ width: 1920, height: 1080 });
-		await page.setUserAgent(get_useragent());
+		// await page.setUserAgent(
+		// 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		// );
 
 		// Set extra headers
+		if (useProxy) {
+			// If using proxy, set up proxy credentials and server
+			const proxy = proxyManager.getNextProxy();
+			await page.authenticate({
+				username: proxy.username,
+				password: proxy.password,
+			});
+		}
 		await page.setExtraHTTPHeaders({
 			dnt: "1",
 			"upgrade-insecure-requests": "1",
@@ -4391,6 +4404,8 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		removeEmptyKeys(scrapedData.content.semanticContent);
 		removeEmptyKeys(scrapedData.content);
 
+		// const htmlFromMarkdown = await toHtml(scrapedData);
+		// return c.html(htmlFromMarkdown);
 		return c.json({
 			success: true,
 			data: scrapedData,
