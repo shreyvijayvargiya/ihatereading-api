@@ -23,10 +23,19 @@ import remarkRehype from "remark-rehype";
 import rehypeStringify from "rehype-stringify";
 import https from "https";
 import { unified } from "unified";
-import { existsSync, mkdir } from "fs";
+import { load } from "cheerio";
 import { Markdown } from "markdown-to-html";
-import path from "path";
 import toHtml from "./lib/toHtml.js";
+import deepPruneMarkdown from "./lib/deepPruneMarkdown.js";
+import extractSemanticOrder, {
+	extractSemanticContentWithFormattedMarkdown,
+	extractSemanticContentWithMarkdown,
+} from "./lib/extractSemanticContent.js";
+import {
+	convertHtmlToMarkdown,
+	htmlToMarkdownAST,
+	markdownASTToString,
+} from "dom-to-semantic-markdown";
 
 // Function to process markdown content using remark for LLM optimization
 async function processMarkdownForLLM(markdownContent) {
@@ -36,8 +45,7 @@ async function processMarkdownForLLM(markdownContent) {
 		}
 
 		// Process markdown with remark plugins
-		const processedContent = await unified()
-			.use(remark)
+		const processedContent = await remark()
 			.use(remarkGfm)
 			.use(remarkRehype)
 			.use(rehypeStringify)
@@ -52,7 +60,10 @@ async function processMarkdownForLLM(markdownContent) {
 			.replace(/\s{2,}/g, " ") // Remove excessive whitespace
 			.trim();
 
-		return cleanedContent;
+		// In-depth pruning for better LLM consumption
+		const prunedContent = await deepPruneMarkdown(cleanedContent);
+
+		return prunedContent;
 	} catch (error) {
 		console.warn(
 			"Warning: Failed to process markdown with remark:",
@@ -3916,9 +3927,291 @@ function removeEmptyKeys(obj) {
 		}
 	}
 }
+function rewriteUrl(url) {
+	if (
+		url.startsWith("https://docs.google.com/document/d/") ||
+		url.startsWith("http://docs.google.com/document/d/")
+	) {
+		const id = url.match(/\/document\/d\/([-\w]+)/)?.[1];
+		if (id) {
+			return `https://docs.google.com/document/d/${id}/export?format=html`;
+		}
+	} else if (
+		url.startsWith("https://docs.google.com/presentation/d/") ||
+		url.startsWith("http://docs.google.com/presentation/d/")
+	) {
+		const id = url.match(/\/presentation\/d\/([-\w]+)/)?.[1];
+		if (id) {
+			return `https://docs.google.com/presentation/d/${id}/export?format=pdf`;
+		}
+	} else if (
+		url.startsWith("https://drive.google.com/file/d/") ||
+		url.startsWith("http://drive.google.com/file/d/")
+	) {
+		const id = url.match(/\/file\/d\/([-\w]+)/)?.[1];
+		if (id) {
+			return `https://drive.google.com/uc?export=download&id=${id}`;
+		}
+	} else if (
+		url.startsWith("https://docs.google.com/spreadsheets/d/") ||
+		url.startsWith("http://docs.google.com/spreadsheets/d/")
+	) {
+		const id = url.match(/\/spreadsheets\/d\/([-\w]+)/)?.[1];
+		if (id) {
+			return `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:html`;
+		}
+	}
+
+	return url;
+}
+
+const scrapJson = async (url) => {
+	const response = await fetch(url);
+	const data = await response.json();
+	return data;
+};
+
+const scrapHtml = async (url) => {
+	const response = await fetch(url);
+	const html = await response.text();
+	return html;
+};
+
+const dataExtractionFromHtml = (html, options) => {
+	const $ = load(html);
+
+	// Remove unwanted elements using Cheerio
+	const selectorsToRemove = [
+		"nav",
+		"header",
+		"footer",
+		"aside",
+		".navbar",
+		".sidebar",
+		".comments",
+		"[role='navigation']",
+		"[role='banner']",
+		"[role='contentinfo']",
+		"[aria-label*='comment']",
+		"[id*='comment']",
+	];
+	selectorsToRemove.forEach((sel) => {
+		$(sel).remove();
+	});
+
+	// Initialize data structure
+	const data = {
+		url: options.url || "",
+		title: $("title").text().trim() || $("h1").first().text().trim(),
+		content: {},
+		metadata: {},
+		links: [],
+		images: [],
+		screenshot: null,
+	};
+
+	// Extract headings using Cheerio
+	["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
+		data.content[tag] = $(tag)
+			.map((i, el) => $(el).text().trim())
+			.get();
+	});
+
+	// Extract metadata using Cheerio
+	if (options.extractMetadata) {
+		// Meta tags
+		$("meta").each((i, meta) => {
+			const name = $(meta).attr("name") || $(meta).attr("property");
+			const content = $(meta).attr("content");
+			if (name && content) {
+				data.metadata[name] = content;
+			}
+		});
+
+		// Open Graph tags
+		$('meta[property^="og:"]').each((i, meta) => {
+			const property = $(meta).attr("property");
+			const content = $(meta).attr("content");
+			if (property && content) {
+				data.metadata[property] = content;
+			}
+		});
+
+		// Twitter Card tags
+		$('meta[name^="twitter:"]').each((i, meta) => {
+			const name = $(meta).attr("name");
+			const content = $(meta).attr("content");
+			if (name && content) {
+				data.metadata[name] = content;
+			}
+		});
+	}
+
+	// Extract links using Cheerio
+	if (options.includeLinks) {
+		const currentUrl = options.url || "";
+		const seedDomain = currentUrl ? new URL(currentUrl).hostname : "";
+
+		const rawLinks = [];
+		$("a[href]").each((i, link) => {
+			const $link = $(link);
+			rawLinks.push({
+				text: $link.text().trim(),
+				href: $link.attr("href"),
+				title: $link.attr("title") || "",
+			});
+		});
+
+		// Filter links by domain and remove duplicates
+		const seenLinks = new Set();
+		data.links = rawLinks.filter((link) => {
+			// Skip if no meaningful text or title
+			if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
+				return false;
+			}
+
+			try {
+				// Check if link URL is valid and matches seed domain
+				if (seedDomain && link.href) {
+					const linkUrl = new URL(link.href, currentUrl);
+					if (linkUrl.hostname !== seedDomain) {
+						return false; // Skip external links
+					}
+				}
+			} catch (error) {
+				// Skip invalid URLs
+				return false;
+			}
+
+			// Remove duplicates based on text, href, or title
+			const key = `${link.text}|${link.href}|${link.title}`;
+			if (seenLinks.has(key)) return false;
+			seenLinks.add(key);
+			return true;
+		});
+	}
+
+	if (options.includeSemanticContent) {
+		// Extract semantic content with optimized methods using Cheerio
+		const extractSemanticContent = (
+			selector,
+			processor = (el) => $(el).text().trim()
+		) => {
+			const elements = $(selector);
+			return elements.length > 0
+				? elements.map((i, el) => processor(el)).get()
+				: [];
+		};
+
+		const extractTableContent = (table) => {
+			const rows = $(table).find("tr");
+			return rows
+				.map((i, row) => {
+					const cells = $(row)
+						.find("td, th")
+						.map((j, cell) => $(cell).text().trim())
+						.get();
+					return cells.filter((cell) => cell.length > 0);
+				})
+				.get()
+				.filter((row) => row.length > 0);
+		};
+
+		const extractListContent = (list) => {
+			return $(list)
+				.find("li")
+				.map((i, li) => $(li).text().trim())
+				.get()
+				.filter((item) => item.length > 0);
+		};
+
+		// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
+		const rawSemanticContent = {
+			// High priority: Main content elements
+			mainContent: extractSemanticContent("main"),
+			articleContent: extractSemanticContent("article"),
+
+			divs: extractSemanticContent("div"),
+
+			// High priority: Core text content
+			paragraphs: extractSemanticContent("p"),
+			span: extractSemanticContent("span"),
+			blockquotes: extractSemanticContent("blockquote"),
+			codeBlocks: extractSemanticContent("code"),
+			preformatted: extractSemanticContent("pre"),
+			tables: extractSemanticContent("table", extractTableContent),
+			unorderedLists: extractSemanticContent("ul", extractListContent),
+			orderedLists: extractSemanticContent("ol", extractListContent),
+		};
+
+		// Remove duplicates from semantic content
+		const removeDuplicates = (array) => {
+			if (!Array.isArray(array)) return array;
+			const seen = new Set();
+			return array.filter((item) => {
+				if (typeof item === "string") {
+					const normalized = item.toLowerCase().trim();
+					if (seen.has(normalized)) return false;
+					seen.add(normalized);
+					return true;
+				} else if (typeof item === "object" && item !== null) {
+					// Handle complex objects like tables
+					const key = JSON.stringify(item);
+					if (seen.has(key)) return false;
+					seen.add(key);
+					return true;
+				}
+				return true;
+			});
+		};
+
+		// Apply duplicate removal to prioritized semantic content
+		data.content.semanticContent = Object.fromEntries(
+			Object.entries(rawSemanticContent).map(([key, value]) => [
+				key,
+				removeDuplicates(value),
+			])
+		);
+	}
+
+	// Extract images using Cheerio
+	if (options.includeImages) {
+		data.images = $("img[src]")
+			.map((i, img) => ({
+				src: $(img).attr("src"),
+				alt: $(img).attr("alt") || "",
+				title: $(img).attr("title") || "",
+				width: $(img).attr("width") || "",
+				height: $(img).attr("height") || "",
+			}))
+			.get();
+	}
+
+	// Extract custom selectors if provided using Cheerio
+	if (options.selectors && Object.keys(options.selectors).length > 0) {
+		data.customSelectors = {};
+		for (const [key, selector] of Object.entries(options.selectors)) {
+			try {
+				const elements = $(selector);
+				if (elements.length === 1) {
+					data.customSelectors[key] = elements.first().text().trim();
+				} else if (elements.length > 1) {
+					data.customSelectors[key] = elements
+						.map((i, el) => $(el).text().trim())
+						.get();
+				}
+			} catch (error) {
+				data.customSelectors[key] = null;
+			}
+		}
+	}
+
+	return data;
+};
+
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
-	const {
+	let {
 		url,
 		selectors = {}, // Custom selectors for specific elements
 		waitForSelector = null, // Wait for specific element to load
@@ -3936,6 +4229,33 @@ app.post("/scrap-url-puppeteer", async (c) => {
 	if (!url || !isValidUrl) {
 		return c.json({ error: "URL is required or invalid" }, 400);
 	}
+
+	let newUrl = rewriteUrl(url);
+	if (newUrl) {
+		url = newUrl;
+	}
+
+	if (newUrl.includes("format=json")) {
+		const data = await scrapJson(newUrl);
+		return c.json({
+			success: true,
+			data: data,
+		});
+	}
+	if (newUrl.includes("format=html")) {
+		const html = await scrapHtml(newUrl);
+		const data = dataExtractionFromHtml(html, {
+			includeSemanticContent,
+			includeImages,
+			includeLinks,
+			extractMetadata,
+		});
+		return c.json({
+			success: true,
+			data: data,
+		});
+	}
+
 	let existingData;
 	if (includeCache) {
 		// Check if URL already exists in Supabase using an 'eq' filter for exact match
@@ -4007,9 +4327,9 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 		// Set viewport and user agent
 		await page.setViewport({ width: 1920, height: 1080 });
-		// await page.setUserAgent(
-		// 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-		// );
+		await page.setUserAgent(
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		);
 
 		// Set extra headers
 		if (useProxy) {
@@ -4138,234 +4458,335 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			}
 		}
 
-		const html = await page.content();
+		// Get page content and process with JSDOM
+		const pageHtml = await page.content();
+		const dom = new JSDOM(pageHtml);
+		const document = dom.window.document;
 
-		const dom = new JSDOM(html, { url: url });
-		let markdownContent;
+		// Remove unwanted elements from JSDOM document
+		const selectorsToRemove = [
+			"header",
+			"footer",
+			"nav",
+			"aside",
+			".header",
+			".top",
+			".navbar",
+			"#header",
+			".footer",
+			".bottom",
+			"#footer",
+			".sidebar",
+			".side",
+			".aside",
+			"#sidebar",
+			".modal",
+			".popup",
+			"#modal",
+			".overlay",
+			".ad",
+			".ads",
+			".advert",
+			"#ad",
+			".lang-selector",
+			".language",
+			"#language-selector",
+			".social",
+			".social-media",
+			".social-links",
+			"#social",
+			".menu",
+			".navigation",
+			"#nav",
+			".breadcrumbs",
+			"#breadcrumbs",
+			".share",
+			"#share",
+			".widget",
+			"#widget",
+			".cookie",
+			"#cookie",
+			"script",
+			"style",
+			"noscript",
+		];
 
-		if (dom.window.document.body.innerHTML) {
-			const turndown = new TurndownService();
-			// markdownContent = turndown.turndown(dom.window.document.body.innerHTML);
-			markdownContent = await processMarkdownForLLM(
-				turndown.turndown(dom.window.document.body.innerHTML)
-			);
-		}
+		selectorsToRemove.forEach((sel) => {
+			document.querySelectorAll(sel).forEach((el) => el.remove());
+		});
+
+		const { markdown } = extractSemanticContentWithFormattedMarkdown(
+			document.body
+		);
 
 		// Extract page content
-		scrapedData = await page.evaluate(
-			async (options) => {
-				const data = {
-					url: window.location.href,
-					title: document.title,
-					content: {},
-					metadata: {},
-					links: [],
-					images: [],
-					screenshot: null,
-				};
+		if (includeSemanticContent) {
+			scrapedData = await page.evaluate(
+				async (options, preProcessedContent) => {
+					const data = {
+						url: window.location.href,
+						title: document.title,
+						content: {},
+						metadata: {},
+						links: [],
+						images: [],
+						screenshot: null,
+						orderedContent: preProcessedContent, // Use the pre-processed content
+					};
 
-				["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
-					data.content[tag] = Array.from(document.querySelectorAll(tag)).map(
-						(h) => h.textContent.trim()
-					);
-				});
+					const selectorsToRemove = [
+						"header",
+						"footer",
+						"nav",
+						"aside",
+						".header",
+						".top",
+						".navbar",
+						"#header",
+						".footer",
+						".bottom",
+						"#footer",
+						".sidebar",
+						".side",
+						".aside",
+						"#sidebar",
+						".modal",
+						".popup",
+						"#modal",
+						".overlay",
+						".ad",
+						".ads",
+						".advert",
+						"#ad",
+						".lang-selector",
+						".language",
+						"#language-selector",
+						".social",
+						".social-media",
+						".social-links",
+						"#social",
+						".menu",
+						".navigation",
+						"#nav",
+						".breadcrumbs",
+						"#breadcrumbs",
+						".share",
+						"#share",
+						".widget",
+						"#widget",
+						".cookie",
+						"#cookie",
+						"script",
+						"style",
+						"noscript",
+					];
 
-				// Extract metadata
-				if (options.extractMetadata) {
-					// Meta tags
-					const metaTags = document.querySelectorAll("meta");
-					metaTags.forEach((meta) => {
-						const name =
-							meta.getAttribute("name") || meta.getAttribute("property");
-						const content = meta.getAttribute("content");
-						if (name && content) {
-							data.metadata[name] = content;
-						}
+					selectorsToRemove.forEach((sel) => {
+						document.querySelectorAll(sel).forEach((el) => el.remove());
 					});
 
-					// Open Graph tags
-					const ogTags = document.querySelectorAll('meta[property^="og:"]');
-					ogTags.forEach((meta) => {
-						const property = meta.getAttribute("property");
-						const content = meta.getAttribute("content");
-						if (property && content) {
-							data.metadata[property] = content;
-						}
+					[("h1", "h2", "h3", "h4", "h5", "h6")].forEach((tag) => {
+						data.content[tag] = Array.from(document.querySelectorAll(tag)).map(
+							(h) => h.textContent.trim()
+						);
 					});
 
-					// Twitter Card tags
-					const twitterTags = document.querySelectorAll(
-						'meta[name^="twitter:"]'
-					);
-					twitterTags.forEach((meta) => {
-						const name = meta.getAttribute("name");
-						const content = meta.getAttribute("content");
-						if (name && content) {
-							data.metadata[name] = content;
-						}
-					});
-				}
-
-				// Extract links
-				if (options.includeLinks) {
-					const links = document.querySelectorAll("a[href]");
-
-					const currentUrl = new URL(window.location.href);
-					const seedDomain = currentUrl.hostname;
-
-					const rawLinks = Array.from(links).map((link) => ({
-						text: link.textContent.trim(),
-						href: link.href,
-						title: link.getAttribute("title") || "",
-					}));
-
-					// Filter links by domain and remove duplicates
-					const seenLinks = new Set();
-					data.links = rawLinks.filter((link) => {
-						// Skip if no meaningful text or title
-						if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
-							return false;
-						}
-
-						try {
-							// Check if link URL is valid and matches seed domain
-							const linkUrl = new URL(link.href);
-							if (linkUrl.hostname !== seedDomain) {
-								return false; // Skip external links
+					// Extract metadata
+					if (options.extractMetadata) {
+						// Meta tags
+						const metaTags = document.querySelectorAll("meta");
+						metaTags.forEach((meta) => {
+							const name =
+								meta.getAttribute("name") || meta.getAttribute("property");
+							const content = meta.getAttribute("content");
+							if (name && content) {
+								data.metadata[name] = content;
 							}
-						} catch (error) {
-							// Skip invalid URLs
-							return false;
-						}
+						});
 
-						// Remove duplicates based on text, href, or title
-						const key = `${link.text}|${link.href}|${link.title}`;
-						if (seenLinks.has(key)) return false;
-						seenLinks.add(key);
-						return true;
-					});
-				}
-
-				if (options.includeSemanticContent) {
-					// Extract semantic content with optimized methods - prioritizing important content
-					const extractSemanticContent = (
-						selector,
-						processor = (el) => el.textContent.trim()
-					) => {
-						const elements = document.querySelectorAll(selector);
-						return elements.length > 0
-							? Array.from(elements).map(processor)
-							: [];
-					};
-
-					const extractTableContent = (table) => {
-						const rows = Array.from(table.querySelectorAll("tr"));
-						return rows
-							.map((row) => {
-								const cells = Array.from(row.querySelectorAll("td, th")).map(
-									(cell) => cell.textContent.trim()
-								);
-								return cells.filter((cell) => cell.length > 0);
-							})
-							.filter((row) => row.length > 0);
-					};
-
-					const extractListContent = (list) => {
-						return Array.from(list.querySelectorAll("li"))
-							.map((li) => li.textContent.trim())
-							.filter((item) => item.length > 0);
-					};
-
-					// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
-					const rawSemanticContent = {
-						// High priority: Main content elements
-						mainContent: extractSemanticContent("main"),
-						articleContent: extractSemanticContent("article"),
-
-						divs: extractSemanticContent("div"),
-
-						// High priority: Core text content
-						paragraphs: extractSemanticContent("p"),
-						span: extractSemanticContent("span"),
-						blockquotes: extractSemanticContent("blockquote"),
-						codeBlocks: extractSemanticContent("code"),
-						preformatted: extractSemanticContent("pre"),
-						tables: extractSemanticContent("table", extractTableContent),
-						unorderedLists: extractSemanticContent("ul", extractListContent),
-						orderedLists: extractSemanticContent("ol", extractListContent),
-					};
-
-					// Remove duplicates from semantic content
-					const removeDuplicates = (array) => {
-						if (!Array.isArray(array)) return array;
-						const seen = new Set();
-						return array.filter((item) => {
-							if (typeof item === "string") {
-								const normalized = item.toLowerCase().trim();
-								if (seen.has(normalized)) return false;
-								seen.add(normalized);
-								return true;
-							} else if (typeof item === "object" && item !== null) {
-								// Handle complex objects like tables
-								const key = JSON.stringify(item);
-								if (seen.has(key)) return false;
-								seen.add(key);
-								return true;
+						// Open Graph tags
+						const ogTags = document.querySelectorAll('meta[property^="og:"]');
+						ogTags.forEach((meta) => {
+							const property = meta.getAttribute("property");
+							const content = meta.getAttribute("content");
+							if (property && content) {
+								data.metadata[property] = content;
 							}
+						});
+
+						// Twitter Card tags
+						const twitterTags = document.querySelectorAll(
+							'meta[name^="twitter:"]'
+						);
+						twitterTags.forEach((meta) => {
+							const name = meta.getAttribute("name");
+							const content = meta.getAttribute("content");
+							if (name && content) {
+								data.metadata[name] = content;
+							}
+						});
+					}
+
+					// Extract links
+					if (options.includeLinks) {
+						const links = document.querySelectorAll("a[href]");
+
+						const currentUrl = new URL(window.location.href);
+						const seedDomain = currentUrl.hostname;
+
+						const rawLinks = Array.from(links).map((link) => ({
+							text: link.textContent.trim(),
+							href: link.href,
+							title: link.getAttribute("title") || "",
+						}));
+
+						// Filter links by domain and remove duplicates
+						const seenLinks = new Set();
+						data.links = rawLinks.filter((link) => {
+							// Skip if no meaningful text or title
+							if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
+								return false;
+							}
+
+							try {
+								// Check if link URL is valid and matches seed domain
+								const linkUrl = new URL(link.href);
+								if (linkUrl.hostname !== seedDomain) {
+									return false; // Skip external links
+								}
+							} catch (error) {
+								// Skip invalid URLs
+								return false;
+							}
+
+							// Remove duplicates based on text, href, or title
+							const key = `${link.text}|${link.href}|${link.title}`;
+							if (seenLinks.has(key)) return false;
+							seenLinks.add(key);
 							return true;
 						});
-					};
+					}
 
-					// Apply duplicate removal to prioritized semantic content
-					data.content.semanticContent = Object.fromEntries(
-						Object.entries(rawSemanticContent).map(([key, value]) => [
-							key,
-							removeDuplicates(value),
-						])
-					);
-				}
-
-				// Extract images
-				if (options.includeImages) {
-					const images = document.querySelectorAll("img[src]");
-					data.images = Array.from(images).map((img) => ({
-						src: img.src,
-						alt: img.alt || "",
-						title: img.title || "",
-						width: img.naturalWidth || img.width,
-						height: img.naturalHeight || img.height,
-					}));
-				}
-
-				// Extract custom selectors if provided
-				if (options.selectors && Object.keys(options.selectors).length > 0) {
-					data.customSelectors = {};
-					for (const [key, selector] of Object.entries(options.selectors)) {
-						try {
+					if (options.includeSemanticContent) {
+						// Extract semantic content with optimized methods - prioritizing important content
+						const extractSemanticContent = (
+							selector,
+							processor = (el) => el.textContent.trim()
+						) => {
 							const elements = document.querySelectorAll(selector);
-							if (elements.length === 1) {
-								data.customSelectors[key] = elements[0].textContent.trim();
-							} else if (elements.length > 1) {
-								data.customSelectors[key] = Array.from(elements).map((el) =>
-									el.textContent.trim()
-								);
+							return elements.length > 0
+								? Array.from(elements).map(processor)
+								: [];
+						};
+
+						const extractTableContent = (table) => {
+							const rows = Array.from(table.querySelectorAll("tr"));
+							return rows
+								.map((row) => {
+									const cells = Array.from(row.querySelectorAll("td, th")).map(
+										(cell) => cell.textContent.trim()
+									);
+									return cells.filter((cell) => cell.length > 0);
+								})
+								.filter((row) => row.length > 0);
+						};
+
+						const extractListContent = (list) => {
+							return Array.from(list.querySelectorAll("li"))
+								.map((li) => li.textContent.trim())
+								.filter((item) => item.length > 0);
+						};
+
+						// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
+						const rawSemanticContent = {
+							// High priority: Main content elements
+							articleContent: extractSemanticContent("article"),
+
+							divs: extractSemanticContent("div"),
+
+							// High priority: Core text content
+							paragraphs: extractSemanticContent("p"),
+							span: extractSemanticContent("span"),
+							blockquotes: extractSemanticContent("blockquote"),
+							codeBlocks: extractSemanticContent("code"),
+							preformatted: extractSemanticContent("pre"),
+							tables: extractSemanticContent("table", extractTableContent),
+							unorderedLists: extractSemanticContent("ul", extractListContent),
+							orderedLists: extractSemanticContent("ol", extractListContent),
+						};
+
+						// Remove duplicates from semantic content
+						const removeDuplicates = (array) => {
+							if (!Array.isArray(array)) return array;
+							const seen = new Set();
+							return array.filter((item) => {
+								if (typeof item === "string") {
+									const normalized = item.toLowerCase().trim();
+									if (seen.has(normalized)) return false;
+									seen.add(normalized);
+									return true;
+								} else if (typeof item === "object" && item !== null) {
+									// Handle complex objects like tables
+									const key = JSON.stringify(item);
+									if (seen.has(key)) return false;
+									seen.add(key);
+									return true;
+								}
+								return true;
+							});
+						};
+
+						// Apply duplicate removal to prioritized semantic content
+						data.content.semanticContent = Object.fromEntries(
+							Object.entries(rawSemanticContent).map(([key, value]) => [
+								key,
+								removeDuplicates(value),
+							])
+						);
+					}
+
+					// Extract images
+					if (options.includeImages) {
+						const images = document.querySelectorAll("img[src]");
+						data.images = Array.from(images).map((img) => ({
+							src: img.src,
+							alt: img.alt || "",
+							title: img.title || "",
+							width: img.naturalWidth || img.width,
+							height: img.naturalHeight || img.height,
+						}));
+					}
+
+					// Extract custom selectors if provided
+					if (options.selectors && Object.keys(options.selectors).length > 0) {
+						data.customSelectors = {};
+						for (const [key, selector] of Object.entries(options.selectors)) {
+							try {
+								const elements = document.querySelectorAll(selector);
+								if (elements.length === 1) {
+									data.customSelectors[key] = elements[0].textContent.trim();
+								} else if (elements.length > 1) {
+									data.customSelectors[key] = Array.from(elements).map((el) =>
+										el.textContent.trim()
+									);
+								}
+							} catch (error) {
+								data.customSelectors[key] = null;
 							}
-						} catch (error) {
-							data.customSelectors[key] = null;
 						}
 					}
-				}
 
-				return data;
-			},
-			{
-				extractMetadata,
-				includeImages,
-				includeLinks,
-				includeSemanticContent,
-				selectors,
-			}
-		);
+					return data;
+				},
+				{
+					extractMetadata,
+					includeImages,
+					includeLinks,
+					includeSemanticContent,
+					selectors,
+				}
+			);
+		}
 
 		await page.close();
 
@@ -4383,8 +4804,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					const { error } = await supabase.from("universo").insert({
 						title: scrapedData.title || "No Title",
 						url: url,
-						markdown: toMarkdown(scrapedData),
-						markdownContent: markdownContent,
+						markdown: markdown,
 						scraped_at: new Date().toISOString(),
 						scraped_data: JSON.stringify(scrapedData),
 					});
@@ -4401,16 +4821,15 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		}
 
 		// Remove empty keys from content
-		removeEmptyKeys(scrapedData.content.semanticContent);
-		removeEmptyKeys(scrapedData.content);
+		if (includeSemanticContent && scrapedData?.content) {
+			removeEmptyKeys(scrapedData?.content);
+		}
 
-		// const htmlFromMarkdown = await toHtml(scrapedData);
-		// return c.html(htmlFromMarkdown);
 		return c.json({
 			success: true,
 			data: scrapedData,
 			url: url,
-			markdown: await processMarkdownForLLM(toMarkdown(scrapedData)),
+			markdown: markdown,
 			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
