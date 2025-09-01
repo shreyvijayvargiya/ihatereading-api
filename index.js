@@ -3924,6 +3924,8 @@ function removeEmptyKeys(obj) {
 			(typeof value === "string" && value.trim() === "")
 		) {
 			delete obj[key];
+		} else if (typeof value === "object" && value !== null) {
+			removeEmptyKeys(value);
 		}
 	}
 }
@@ -4854,13 +4856,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 // Take Screenshot API Endpoint
 app.post("/take-screenshot", async (c) => {
 	try {
-		const {
-			url,
-			title = "Website Screenshot",
-			waitForSelector,
-			timeout = 30000,
-			includeImages = false,
-		} = await c.req.json();
+		const { url, waitForSelector, timeout = 30000 } = await c.req.json();
 
 		if (!url) {
 			return c.json(
@@ -5079,282 +5075,305 @@ app.post("/take-screenshot", async (c) => {
 	}
 });
 
-const filterAndUpdateImages = async () => {
+app.post("/take-metadata", async (c) => {
 	try {
-		// Get all locations with their image arrays
-		const { data: locations, error } = await supabase
-			.from("locations")
-			.select("id, unsplash_images, images");
+		const { url } = await c.req.json();
 
-		if (error) {
-			console.error("Error fetching locations:", error);
-			return { success: false, error: error.message };
+		if (!url) {
+			return c.json(
+				{
+					success: false,
+					error: "URL is required",
+				},
+				400
+			);
 		}
 
-		// Flatten all images into a single array with their location IDs
-		const allImages = [];
-		locations.forEach((location) => {
-			if (location.unsplash_images?.length > 0) {
-				location.unsplash_images.forEach((imageUrl) => {
-					allImages.push({
-						locationId: location.id,
-						imageUrl: imageUrl,
-						type: "unsplash_images",
-					});
-				});
+		// Validate URL format
+		try {
+			new URL(url);
+		} catch (error) {
+			return c.json(
+				{
+					success: false,
+					error: "Invalid URL format",
+				},
+				400
+			);
+		}
+
+		try {
+			// Fetch the webpage content
+			const response = await axios.get(url, {
+				headers: {
+					"User-Agent": userAgents.random().toString(),
+					Accept:
+						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+					"Accept-Language": "en-US,en;q=0.9",
+					"Accept-Encoding": "gzip, deflate, br",
+					DNT: "1",
+					Connection: "keep-alive",
+					"Upgrade-Insecure-Requests": "1",
+				},
+				timeout: 30000,
+				maxRedirects: 5,
+			});
+
+			// Load HTML content with Cheerio
+			const $ = load(response.data);
+
+			// Extract basic metadata
+			const metadata = {
+				url: url,
+				title: $("title").text().trim() || $("h1").first().text().trim(),
+				description: "",
+				author: "",
+				pubDate: "",
+				image: "",
+				robots: "",
+				keywords: "",
+				language: "",
+				viewport: "",
+				favicon: "",
+				openGraph: {},
+				twitterCard: {},
+				allMetaTags: {},
+			};
+
+			// Extract description from various meta tags
+			metadata.description =
+				$('meta[name="description"]').attr("content") ||
+				$('meta[property="og:description"]').attr("content") ||
+				$('meta[name="twitter:description"]').attr("content") ||
+				$('meta[name="summary"]').attr("content") ||
+				"";
+
+			// Extract author
+			metadata.author =
+				$('meta[name="author"]').attr("content") ||
+				$('meta[property="article:author"]').attr("content") ||
+				$('meta[name="twitter:creator"]').attr("content") ||
+				$('link[rel="author"]').attr("href") ||
+				"";
+
+			// Extract publication date
+			metadata.pubDate =
+				$('meta[property="article:published_time"]').attr("content") ||
+				$('meta[name="date"]').attr("content") ||
+				$('meta[name="pubdate"]').attr("content") ||
+				$('meta[name="DC.date.issued"]').attr("content") ||
+				$("time[datetime]").first().attr("datetime") ||
+				"";
+
+			// Extract main image
+			metadata.image =
+				$('meta[property="og:image"]').attr("content") ||
+				$('meta[name="twitter:image"]').attr("content") ||
+				$('meta[name="image"]').attr("content") ||
+				$("img").first().attr("src") ||
+				"";
+
+			if (
+				metadata.image.startsWith("http") ||
+				metadata.image.startsWith("//") ||
+				metadata.image.startsWith("data:image/") ||
+				metadata.image.startsWith("blob:") ||
+				metadata.image.startsWith("file:") ||
+				metadata.image.startsWith("mailto:")
+			) {
+				metadata.image = "";
 			}
-			if (location.images?.length > 0) {
-				location.images.forEach((imageUrl) => {
-					allImages.push({
-						locationId: location.id,
-						imageUrl: imageUrl,
-						type: "images",
-					});
-				});
-			}
-		});
+			// Extract robots meta
+			metadata.robots = $('meta[name="robots"]').attr("content") || "";
 
-		console.log(`Processing ${allImages.length} total images...`);
+			// Extract keywords
+			metadata.keywords = $('meta[name="keywords"]').attr("content") || "";
 
-		// Process images in batches to avoid overwhelming the system
-		const batchSize = 10;
-		const validImages = new Map(); // locationId -> { unsplash_images: [], images: [] }
+			// Extract language
+			metadata.language =
+				$("html").attr("lang") ||
+				$('meta[http-equiv="content-language"]').attr("content") ||
+				$('meta[name="language"]').attr("content") ||
+				"";
 
-		for (let i = 0; i < allImages.length; i += batchSize) {
-			const batch = allImages.slice(i, i + batchSize);
+			// Extract viewport
+			metadata.viewport = $('meta[name="viewport"]').attr("content") || "";
 
-			// Process batch concurrently
-			const batchPromises = batch.map(async (imageData) => {
-				try {
-					const { body: imageStream } = await fetch(imageData.imageUrl);
-					if (imageStream) {
-						const { height, width } = await imageDimensionsFromStream(
-							imageStream
-						);
-						if (height && width && height > 600 && width > 600) {
-							// Initialize location data if not exists
-							if (!validImages.has(imageData.locationId)) {
-								validImages.set(imageData.locationId, {
-									unsplash_images: [],
-									images: [],
-								});
-							}
+			// Extract charset
+			metadata.charset =
+				$("meta[charset]").attr("charset") ||
+				$('meta[http-equiv="content-type"]').attr("content") ||
+				"";
 
-							// Add valid image to appropriate array
-							const locationData = validImages.get(imageData.locationId);
-							if (imageData.type === "unsplash_images") {
-								locationData.unsplash_images.push(imageData.imageUrl);
-							} else {
-								locationData.images.push(imageData.imageUrl);
-							}
-						}
-					}
-				} catch (err) {
-					console.log(
-						`Error processing image ${imageData.imageUrl}:`,
-						err.message
-					);
+			// Extract theme color
+			metadata.themeColor = $('meta[name="theme-color"]').attr("content") || "";
+
+			// Extract all meta tags
+			$("meta").each((i, element) => {
+				const $meta = $(element);
+				const name =
+					$meta.attr("name") ||
+					$meta.attr("property") ||
+					$meta.attr("http-equiv");
+				const content = $meta.attr("content");
+				if (name && content) {
+					metadata.allMetaTags[name] = content;
 				}
 			});
 
-			await Promise.all(batchPromises);
+			// Extract Open Graph tags
+			$('meta[property^="og:"]').each((i, element) => {
+				const $meta = $(element);
+				const property = $meta.attr("property");
+				const content = $meta.attr("content");
+				if (property && content) {
+					// If the content starts with "http", "blob:", "image:", or "data:", set the value to an empty string
+					if (
+						content.startsWith("http") ||
+						content.startsWith("blob:") ||
+						content.startsWith("image:") ||
+						content.startsWith("data:")
+					) {
+						return;
+					} else {
+						metadata.openGraph[property] = content;
+					}
+				}
+			});
 
-			// Small delay between batches to be respectful to external services
-			if (i + batchSize < allImages.length) {
-				await new Promise((resolve) => setTimeout(resolve, 100));
-			}
-		}
+			// Extract Twitter Card tags
+			$('meta[name^="twitter:"]').each((i, element) => {
+				const $meta = $(element);
+				const name = $meta.attr("name");
+				const content = $meta.attr("content");
+				if (name && content) {
+					if (
+						content.startsWith("http") ||
+						content.startsWith("blob:") ||
+						content.startsWith("image:") ||
+						content.startsWith("data:")
+					) {
+						return;
+					} else {
+						metadata.twitterCard[name] = content;
+					}
+				}
+			});
 
-		// Update database with filtered images
-		let updatedCount = 0;
-		for (const [locationId, imageData] of validImages) {
-			try {
-				const { error: updateError } = await supabase
-					.from("locations")
-					.update({
-						unsplash_images: imageData.unsplash_images,
-						images: imageData.images,
-					})
-					.eq("id", locationId);
+			// Extract favicon
+			metadata.favicon =
+				$('link[rel="icon"]').attr("href") ||
+				$('link[rel="shortcut icon"]').attr("href") ||
+				$('link[rel="favicon"]').attr("href") ||
+				"";
 
-				if (updateError) {
-					console.error(`Error updating location ${locationId}:`, updateError);
-				} else {
-					updatedCount++;
-					console.log(
-						`Updated location ${locationId} - unsplash: ${imageData.unsplash_images.length}, images: ${imageData.images.length}`
+			removeEmptyKeys(metadata);
+			return c.json({
+				success: true,
+				metadata: metadata,
+				timestamp: new Date().toISOString(),
+			});
+		} catch (fetchError) {
+			console.error("❌ Error fetching URL:", fetchError);
+
+			// Handle specific HTTP status codes
+			if (fetchError.response) {
+				const status = fetchError.response.status;
+
+				// Handle page not found (404) and other client errors
+				if (status === 404) {
+					return c.json(
+						{
+							success: true,
+							metadata: null,
+							message: "Page not found - the requested URL does not exist",
+							status: 404,
+							timestamp: new Date().toISOString(),
+						},
+						200
 					);
 				}
-			} catch (err) {
-				console.error(`Error updating location ${locationId}:`, err);
-			}
-		}
 
-		console.log(
-			`Successfully processed ${allImages.length} images, updated ${updatedCount} locations`
-		);
-		return {
-			success: true,
-			totalImages: allImages.length,
-			updatedLocations: updatedCount,
-		};
-	} catch (err) {
-		console.error("Error in filterAndUpdateImages:", err);
-		return { success: false, error: err.message };
-	}
-};
-
-// Add this endpoint to use the method
-app.post("/filter-all-images", async (c) => {
-	const result = await filterAndUpdateImages();
-	return c.json(result);
-});
-
-// ... existing code ...
-
-app.post("/repo", async (c) => {
-	const { name } = await c.req.json();
-
-	const owner = "rumca-js";
-
-	//https://github.com/rumca-js/RSS-Link-Database-2025/tree/main
-	try {
-		const url = `https://api.github.com/repos/${owner}/${name}`;
-		const response = await fetch(
-			`https://api.github.com/repos/${owner}/${name}/contents`,
-			{
-				headers: {
-					Authorization: `token ${process.env.GITHUB_TOKEN}`,
-					"User-Agent": "node-fetch", // GitHub requires User-Agent
-					Accept: "application/vnd.github+json",
-				},
-			}
-		);
-
-		if (!response.ok) {
-			return c.json({ error: "Failed to fetch repo" }, response.status);
-		}
-
-		const data = await response.json();
-		return c.json(data);
-	} catch (error) {
-		console.error(error);
-		return c.json({ error: "Internal Server Error" }, 500);
-	}
-});
-
-app.post("/push-repo", async (c) => {
-	const { projectName, content, fileName = "README.md" } = await c.req.json();
-
-	if (!projectName || !content) {
-		return c.json({ error: "projectName and content are required" }, 400);
-	}
-
-	const owner = "shreyvijayvargiya";
-	const repo = "ihatereading-api"; // Your main repository name
-
-	try {
-		// First, check if the repository exists
-		const repoResponse = await fetch(
-			`https://api.github.com/repos/${owner}/${repo}`,
-			{
-				headers: {
-					Authorization: `token ${process.env.GITHUB_TOKEN}`,
-					"User-Agent": "node-fetch",
-					Accept: "application/vnd.github+json",
-				},
-			}
-		);
-
-		if (!repoResponse.ok) {
-			return c.json(
-				{ error: "Repository not found or access denied" },
-				repoResponse.status
-			);
-		}
-
-		// Create the folder structure by creating a file in the project-name folder
-		// GitHub automatically creates folders when you create files with paths
-		const filePath = `${projectName}/${fileName}`;
-
-		// Get the current branch (usually main or master)
-		const branchResponse = await fetch(
-			`https://api.github.com/repos/${owner}/${repo}/branches/main`,
-			{
-				headers: {
-					Authorization: `token ${process.env.GITHUB_TOKEN}`,
-					"User-Agent": "node-fetch",
-					Accept: "application/vnd.github+json",
-				},
-			}
-		);
-
-		if (!branchResponse.ok) {
-			// Try master branch if main doesn't exist
-			const masterBranchResponse = await fetch(
-				`https://api.github.com/repos/${owner}/${repo}/branches/master`,
-				{
-					headers: {
-						Authorization: `token ${process.env.GITHUB_TOKEN}`,
-						"User-Agent": "node-fetch",
-						Accept: "application/vnd.github+json",
-					},
+				// Handle other client errors (4xx)
+				if (status >= 400 && status < 500) {
+					return c.json(
+						{
+							success: true,
+							metadata: null,
+							message: `Client error - the server returned status ${status}`,
+							status: status,
+							timestamp: new Date().toISOString(),
+						},
+						200
+					);
 				}
-			);
 
-			if (!masterBranchResponse.ok) {
-				return c.json({ error: "Could not determine default branch" }, 400);
+				// Handle server errors (5xx)
+				if (status >= 500) {
+					return c.json(
+						{
+							success: true,
+							metadata: null,
+							message: `Server error - the target server returned status ${status}`,
+							status: status,
+							timestamp: new Date().toISOString(),
+						},
+						200
+					);
+				}
 			}
 
-			const masterBranchData = await masterBranchResponse.json();
-			var defaultBranch = "master";
-			var sha = masterBranchData.commit.sha;
-		} else {
-			const branchData = await branchResponse.json();
-			var defaultBranch = "main";
-			var sha = branchData.commit.sha;
-		}
-
-		// Create the file in the project folder
-		const createFileResponse = await fetch(
-			`https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`,
-			{
-				method: "PUT",
-				headers: {
-					Authorization: `token ${process.env.GITHUB_TOKEN}`,
-					"User-Agent": "node-fetch",
-					Accept: "application/vnd.github+json",
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({
-					message: `Add ${projectName} project folder`,
-					content: Buffer.from(content).toString("base64"),
-					branch: defaultBranch,
-				}),
+			// Handle network errors (DNS, connection issues, etc.)
+			if (
+				fetchError.code === "ENOTFOUND" ||
+				fetchError.code === "ECONNREFUSED" ||
+				fetchError.code === "ETIMEDOUT"
+			) {
+				return c.json(
+					{
+						success: true,
+						metadata: null,
+						message: "Network error - unable to reach the requested URL",
+						error: fetchError.code,
+						timestamp: new Date().toISOString(),
+					},
+					200
+				);
 			}
-		);
 
-		if (!createFileResponse.ok) {
-			const errorData = await createFileResponse.json();
-			console.error("GitHub API Error:", errorData);
+			// Handle timeout errors
+			if (fetchError.code === "ECONNABORTED") {
+				return c.json(
+					{
+						success: true,
+						metadata: null,
+						message: "Request timeout - the server took too long to respond",
+						timestamp: new Date().toISOString(),
+					},
+					200
+				);
+			}
+
+			// Handle other errors
 			return c.json(
-				{ error: "Failed to create project folder", details: errorData },
-				createFileResponse.status
+				{
+					success: true,
+					metadata: null,
+					message: "Unable to fetch metadata from the requested URL",
+					error: fetchError.message,
+					timestamp: new Date().toISOString(),
+				},
+				200
 			);
 		}
-
-		const result = await createFileResponse.json();
-
-		return c.json({
-			success: true,
-			message: `Successfully created ${projectName} folder with ${fileName}`,
-			file: result.content,
-			projectUrl: `https://github.com/${owner}/${repo}/tree/${defaultBranch}/${projectName}`,
-		});
 	} catch (error) {
-		console.error("Error creating project folder:", error);
+		console.error("❌ Metadata API error:", error);
 		return c.json(
-			{ error: "Internal Server Error", details: error.message },
+			{
+				success: false,
+				error: "Internal server error",
+				details: error.message,
+			},
 			500
 		);
 	}
@@ -5803,3 +5822,34 @@ app.post("/ai-answer", async (c) => {
 		});
 	}
 });
+
+const filterDuplicatesLink = (links) => {
+	const seenLinks = new Set();
+	return links.filter((link) => {
+		if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
+			return false;
+		}
+
+		try {
+			// Check if link URL is valid and matches seed domain
+			const linkUrl = new URL(link.href);
+			if (linkUrl.hostname !== seedDomain) {
+				return false; // Skip external links
+			}
+		} catch (error) {
+			// Skip invalid URLs
+			return false;
+		}
+
+		// Remove duplicates based on text, href, or title
+		const key = `${link.text}|${link.href}|${link.title}`;
+		if (seenLinks.has(key)) return false;
+		seenLinks.add(key);
+		return true;
+	});
+	return true;
+};
+// now write a new endpoint that takes LLM markdown data and create embeddings from it
+// them store them as pgvector inside supabase
+// then pass these vectors as summarise version to LLM model in frontend to reduce the input tokens size
+// in this way our LLM ready data and question is cheap and perfect
