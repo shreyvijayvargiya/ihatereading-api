@@ -10,32 +10,18 @@ import { performance } from "perf_hooks";
 import { cpus } from "os";
 import { ChatOllama } from "@langchain/ollama";
 import UserAgent from "user-agents";
-import { pipeline, env } from "@xenova/transformers";
 import { v4 as uuidv4 } from "uuid";
-import { imageDimensionsFromStream } from "image-dimensions";
-import toMarkdown from "./lib/toMarkdown.js";
 import { JSDOM } from "jsdom";
 import axios from "axios";
-import TurndownService from "turndown";
 import { remark } from "remark";
 import remarkGfm from "remark-gfm";
 import remarkRehype from "remark-rehype";
 import rehypeStringify from "rehype-stringify";
 import https from "https";
-import { unified } from "unified";
 import { load } from "cheerio";
-import { Markdown } from "markdown-to-html";
-import toHtml from "./lib/toHtml.js";
 import deepPruneMarkdown from "./lib/deepPruneMarkdown.js";
-import extractSemanticOrder, {
-	extractSemanticContentWithFormattedMarkdown,
-	extractSemanticContentWithMarkdown,
-} from "./lib/extractSemanticContent.js";
-import {
-	convertHtmlToMarkdown,
-	htmlToMarkdownAST,
-	markdownASTToString,
-} from "dom-to-semantic-markdown";
+import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
+import puppeteer from "puppeteer";
 
 // Function to process markdown content using remark for LLM optimization
 async function processMarkdownForLLM(markdownContent) {
@@ -951,439 +937,6 @@ app.post("/post-to-devto", async (c) => {
 	}
 });
 
-// Core Google Maps scraping function (extracted from the endpoint)
-const scrapeGoogleMapsLocation = async (
-	query,
-	browserInstance = null,
-	contextInstance = null
-) => {
-	try {
-		let browser = browserInstance;
-		let context = contextInstance;
-		let shouldCloseBrowser = false;
-		let shouldCloseContext = false;
-
-		try {
-			// Use provided browser instance or create new one
-			if (!browser) {
-				browser = await chromium.launch({
-					headless: true,
-					userAgent:
-						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-					args: [
-						"--no-sandbox",
-						"--disable-setuid-sandbox",
-						"--disable-dev-shm-usage",
-						"--disable-accelerated-2d-canvas",
-						"--no-first-run",
-						"--no-zygote",
-						"--single-process",
-						"--disable-gpu",
-						"--disable-web-security",
-						"--disable-features=VizDisplayCompositor",
-						"--disable-background-timer-throttling",
-						"--disable-backgrounding-occluded-windows",
-						"--disable-renderer-backgrounding",
-					],
-				});
-				shouldCloseBrowser = true;
-			}
-
-			// Use provided context or create new one
-			if (!context) {
-				context = await browser.newContext();
-
-				// Block unnecessary resources to improve performance
-				await context.route("**/*", (route) => {
-					const type = route.request().resourceType();
-					return ["image", "font", "stylesheet", "media"].includes(type)
-						? route.abort()
-						: route.continue();
-				});
-				shouldCloseContext = true;
-			}
-
-			const page = await context.newPage();
-
-			// Navigate to Google Maps with optimized settings
-			await page.goto(
-				`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
-				{
-					waitUntil: "domcontentloaded", // Faster than networkidle
-					timeout: 20000, // Reduced timeout
-				}
-			);
-
-			// Wait for the map to load with better strategy
-			await page.waitForSelector('div[role="main"]', { timeout: 15000 });
-
-			// Wait for map to fully load and coordinates to appear
-			// Give more time for city searches to resolve to specific coordinates
-			await page.waitForTimeout(3000);
-
-			// Try to wait for any loading indicators to disappear
-			try {
-				await page.waitForSelector("[data-js-log]", { timeout: 5000 });
-			} catch (e) {
-				// Ignore if not found, continue anyway
-			}
-
-			// Try to click on the map to get more specific coordinates
-			try {
-				// Look for the main map area and click on it
-				const mapArea = await page.$('div[role="main"]');
-				if (mapArea) {
-					// Click in the center of the map area
-					await mapArea.click();
-					await page.waitForTimeout(1000); // Wait for any map interactions
-				}
-			} catch (e) {
-				// Ignore click errors
-			}
-
-			// Extract location data with improved coordinate detection
-			const locationData = await page.evaluate(() => {
-				console.log("🔍 Starting coordinate extraction...");
-				const url = window.location.href;
-
-				// Try multiple ways to get coordinates
-				let coordinates = null;
-
-				// Method 1: Check URL for coordinates
-				const urlCoordsMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-				if (urlCoordsMatch) {
-					coordinates = {
-						lat: parseFloat(urlCoordsMatch[1]),
-						lng: parseFloat(urlCoordsMatch[2]),
-					};
-					console.log("✅ Found coordinates in URL:", coordinates);
-				} else {
-					console.log("❌ No coordinates in URL");
-				}
-
-				// Method 2: Look for coordinates in the page content
-				if (!coordinates) {
-					// Try to find coordinates in various page elements
-					const coordElements = document.querySelectorAll(
-						"[data-lat], [data-lng], [data-coordinates]"
-					);
-					for (const element of coordElements) {
-						const lat =
-							element.getAttribute("data-lat") ||
-							element.getAttribute("data-coordinates");
-						const lng = element.getAttribute("data-lng");
-						if (lat && lng) {
-							const latNum = parseFloat(lat);
-							const lngNum = parseFloat(lng);
-							if (!isNaN(latNum) && !isNaN(lngNum)) {
-								coordinates = { lat: latNum, lng: lngNum };
-								break;
-							}
-						}
-					}
-				}
-
-				// Method 3: Look for coordinates in text content
-				if (!coordinates) {
-					const pageText = document.body.textContent;
-					const coordPattern = /(-?\d+\.\d+),\s*(-?\d+\.\d+)/g;
-					const matches = pageText.match(coordPattern);
-					if (matches && matches.length > 0) {
-						// Take the first coordinate pair found
-						const coords = matches[0]
-							.split(",")
-							.map((c) => parseFloat(c.trim()));
-						if (coords.length === 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
-							coordinates = { lat: coords[0], lng: coords[1] };
-						}
-					}
-				}
-
-				// Method 4: Try to get coordinates from map center (if available)
-				if (!coordinates && window.google && window.google.maps) {
-					try {
-						const map =
-							document.querySelector("#scene-container") ||
-							document.querySelector("[data-js-log]");
-						if (map && map._googleMap) {
-							const center = map._googleMap.getCenter();
-							if (center) {
-								coordinates = { lat: center.lat(), lng: center.lng() };
-							}
-						}
-					} catch (e) {
-						// Ignore errors accessing map object
-					}
-				}
-
-				const locationName = document.querySelector("h1")?.textContent || "";
-				const address =
-					document.querySelector('button[data-item-id="address"]')
-						?.textContent || "";
-
-				return {
-					name: locationName,
-					address: address,
-					coordinates: coordinates,
-					url: url,
-				};
-			});
-
-			// Close only the page, keep context for reuse
-			await page.close();
-
-			// If no coordinates found, try a fallback strategy for city names
-			if (!locationData.coordinates) {
-				console.log(
-					`⚠️ No coordinates found for "${query}", trying fallback strategy...`
-				);
-
-				// For city names, try to get approximate coordinates by searching with "city center" or similar
-				if (
-					query &&
-					!query.includes("restaurant") &&
-					!query.includes("hotel") &&
-					!query.includes("market")
-				) {
-					// This might be a city name, try to get approximate coordinates
-					console.log(
-						`📍 Query "${query}" appears to be a city name, coordinates may be approximate`
-					);
-
-					// Return success with a note about approximate coordinates
-					return {
-						success: true,
-						data: {
-							...locationData,
-							note: "City name - coordinates may be approximate or city center",
-							queryType: "city",
-						},
-						warning: "City coordinates are approximate",
-					};
-				}
-
-				return {
-					success: false,
-					error: "Location not found or coordinates not available",
-					data: locationData,
-				};
-			}
-
-			return {
-				success: true,
-				data: locationData,
-			};
-		} catch (error) {
-			console.error(`Error processing query "${query}":`, error);
-			return {
-				success: false,
-				error: error.message,
-				data: {
-					query,
-					name: "",
-					address: "",
-					coordinates: null,
-					url: "",
-				},
-			};
-		} finally {
-			// Only close context if we created it (not for shared instances)
-			if (context && shouldCloseContext) {
-				await context.close();
-			}
-			// Only close browser if we created it (not for shared instances)
-			if (browser && shouldCloseBrowser) {
-				await browser.close();
-			}
-		}
-	} catch (error) {
-		console.error("Google Maps Scraping Error:", error);
-		return {
-			success: false,
-			error: "Failed to fetch location data",
-			details: error.message,
-		};
-	}
-};
-
-// Bulk scraping with multiple browser instances for parallel processing
-const scrapeGoogleMapsBulk = async (queries, maxConcurrentBrowsers = 3) => {
-	const results = [];
-	const browsers = [];
-	const contexts = [];
-
-	try {
-		for (let i = 0; i < maxConcurrentBrowsers; i++) {
-			const browser = await chromium.launch({
-				headless: true,
-				userAgent:
-					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-				args: [
-					"--no-sandbox",
-					"--disable-setuid-sandbox",
-					"--disable-dev-shm-usage",
-					"--disable-accelerated-2d-canvas",
-					"--no-first-run",
-					"--no-zygote",
-					"--single-process",
-					"--disable-gpu",
-					"--disable-web-security",
-					"--disable-features=VizDisplayCompositor",
-					"--disable-background-timer-throttling",
-					"--disable-backgrounding-occluded-windows",
-					"--disable-renderer-backgrounding",
-				],
-			});
-
-			// Create context for this browser
-			const context = await browser.newContext();
-
-			// Block unnecessary resources to improve performance
-			await context.route("**/*", (route) => {
-				const type = route.request().resourceType();
-				return ["image", "font", "stylesheet", "media"].includes(type)
-					? route.abort()
-					: route.continue();
-			});
-
-			browsers.push(browser);
-			contexts.push(context);
-		}
-
-		// Process queries in batches to avoid overwhelming Google Maps
-		const batchSize = Math.max(
-			1,
-			Math.ceil(queries.length / maxConcurrentBrowsers)
-		);
-		const batches = [];
-		for (let i = 0; i < queries.length; i += batchSize) {
-			batches.push(queries.slice(i, i + batchSize));
-		}
-
-		// Process batches sequentially to avoid rate limiting
-		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-			const batch = batches[batchIndex];
-			console.log(
-				`🔄 Processing batch ${batchIndex + 1}/${batches.length} with ${
-					batch.length
-				} queries`
-			);
-
-			// Process current batch in parallel
-			const batchPromises = batch.map(async (query, index) => {
-				const browserIndex = index % maxConcurrentBrowsers;
-				const browser = browsers[browserIndex];
-				const context = contexts[browserIndex];
-
-				// Retry mechanism for failed queries
-				const maxRetries = 2;
-				let lastError = null;
-
-				for (let retry = 0; retry <= maxRetries; retry++) {
-					try {
-						if (retry > 0) {
-							console.log(
-								`🔄 Retry ${retry} for query "${query}" with browser ${
-									browserIndex + 1
-								}`
-							);
-							// Small delay before retry
-							await new Promise((resolve) => setTimeout(resolve, 1000));
-						} else {
-							console.log(
-								`🔍 Processing query "${query}" with browser ${
-									browserIndex + 1
-								}`
-							);
-						}
-
-						const result = await scrapeGoogleMapsLocation(
-							query,
-							browser,
-							context
-						);
-
-						// If successful, return result
-						if (result.success) {
-							return { query, result };
-						}
-
-						// If no coordinates found, don't retry
-						if (
-							result.error === "Location not found or coordinates not available"
-						) {
-							return { query, result };
-						}
-
-						// For other errors, continue to retry
-						lastError = result.error;
-					} catch (error) {
-						lastError = error.message;
-						console.error(
-							`Error processing query "${query}" (attempt ${retry + 1}):`,
-							error
-						);
-
-						// If it's the last retry, return error
-						if (retry === maxRetries) {
-							return {
-								query,
-								result: { success: false, error: error.message },
-							};
-						}
-					}
-				}
-
-				// If all retries failed, return last error
-				return {
-					query,
-					result: {
-						success: false,
-						error: lastError || "Max retries exceeded",
-					},
-				};
-			});
-
-			// Wait for current batch to complete
-			const batchResults = await Promise.all(batchPromises);
-			results.push(...batchResults);
-
-			// Add delay between batches to avoid overwhelming Google Maps
-			if (batchIndex < batches.length - 1) {
-				const delay = Math.min(2000, batch.length * 500); // Adaptive delay based on batch size
-				console.log(`⏳ Waiting ${delay}ms before next batch...`);
-				await new Promise((resolve) => setTimeout(resolve, delay));
-			}
-		}
-
-		// Calculate final statistics
-		const successfulQueries = results.filter((r) => r.result.success).length;
-		const failedQueries = results.filter((r) => !r.result.success).length;
-		const successRate = ((successfulQueries / results.length) * 100).toFixed(2);
-
-		console.log(
-			`🎉 All batches completed! Total queries processed: ${results.length}`
-		);
-		console.log(`📊 Final Statistics:`);
-		console.log(`✅ Successful: ${successfulQueries}`);
-		console.log(`❌ Failed: ${failedQueries}`);
-		console.log(`📈 Success Rate: ${successRate}%`);
-
-		return results;
-	} catch (error) {
-		console.error("Bulk scraping error:", error);
-		return results; // Return partial results if available
-	} finally {
-		// Close all contexts first
-		console.log(`🧹 Closing ${contexts.length} browser contexts`);
-		await Promise.all(contexts.map((context) => context.close()));
-
-		// Then close all browser instances
-		console.log(`🧹 Closing ${browsers.length} browser instances`);
-		await Promise.all(browsers.map((browser) => browser.close()));
-	}
-};
-
 // Google Maps scraping endpoint using headless Chrome
 app.post("/scrap-google-maps", async (c) => {
 	try {
@@ -1584,145 +1137,8 @@ app.post("/scrap-google-maps", async (c) => {
 	}
 });
 
-app.post("/scrap-google-images", async (c) => {
-	const { queries, options = {}, limit = 5 } = await c.req.json();
-
-	// Handle both single query and array of queries
-	const queryArray = Array.isArray(queries) ? queries : [queries];
-
-	if (!queryArray.length || queryArray.some((q) => !q)) {
-		return c.json({ error: "Invalid queries" }, 400);
-	}
-
-	let browser;
-	try {
-		const tbsParts = Object.entries(options)
-			.map(([k, v]) => codeMap[k]?.[v])
-			.filter(Boolean);
-		const tbsQuery = tbsParts.length ? `&tbs=${tbsParts.join(",")}` : "";
-
-		// Launch browser with proper configuration
-		browser = await chromium.launch({
-			headless: true,
-			userAgent:
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-			args: [
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-dev-shm-usage",
-				"--disable-accelerated-2d-canvas",
-				"--no-first-run",
-				"--no-zygote",
-				"--single-process",
-				"--disable-gpu",
-			],
-		});
-
-		// Create a shared context for all queries
-		const context = await browser.newContext({
-			userAgent:
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.61 Safari/537.36",
-			viewport: { width: 1920, height: 1080 },
-			extraHTTPHeaders: {
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-				"sec-fetch-site": "same-origin",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				referer: "https://www.google.com/",
-				"accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
-			},
-		});
-
-		// Block unnecessary resources
-		await context.route("**/*", (route) => {
-			const type = route.request().resourceType();
-			return ["font", "stylesheet"].includes(type)
-				? route.abort()
-				: route.continue();
-		});
-
-		// Process all queries in parallel using Promise.all
-		const results = await Promise.all(
-			queryArray.map(async (query) => {
-				const page = await context.newPage();
-				try {
-					await page.goto(
-						`https://www.google.com/search?q=${encodeURIComponent(
-							query
-						)}&tbm=isch${tbsQuery}`,
-						{
-							waitUntil: "networkidle",
-						}
-					);
-					await page.waitForSelector('img[src^="https"]');
-					await page.evaluate(() =>
-						window.scrollTo(0, document.body.scrollHeight)
-					);
-					await page.waitForTimeout(2000);
-
-					const images = await page.evaluate(
-						(max) =>
-							Array.from(document.querySelectorAll('img[src^="https"]'))
-								.map((img) => ({
-									url: img.src,
-									w: img.naturalWidth,
-									h: img.naturalHeight,
-									...img,
-								}))
-								.filter((i) => i.w > 100 && i.h > 100)
-								.slice(0, max)
-								.map((i) => i.url),
-						limit
-					);
-
-					return { query, images };
-				} catch (error) {
-					console.error(`Error processing query "${query}":`, error);
-					return {
-						query,
-						images: [],
-						error: error.message,
-					};
-				} finally {
-					await page.close();
-				}
-			})
-		);
-
-		// Close the shared context after all queries are complete
-		await context.close();
-
-		// If single query was provided, return just the images array
-		if (!Array.isArray(queries)) {
-			const result = results[0];
-			if (!result.images.length) {
-				return c.json({
-					error: "No images found",
-					data: result,
-				});
-			}
-			return c.json(result.images);
-		}
-
-		// For multiple queries, return array of results
-		return c.json(results);
-	} catch (error) {
-		console.error("Error scraping Google Images:", error);
-		return c.json({
-			error: "Failed to fetch images",
-			details: error.message,
-		});
-	} finally {
-		if (browser) {
-			await browser.close();
-		}
-	}
-});
-
+// get top places and maps and locations from LLM by enhancing the system prompt
+// if didn't get location from LLM then try using locations supabase database for detailed
 app.post("/ai-travel-agent", async (c) => {
 	try {
 		const { prompt } = await c.req.json();
@@ -1885,10 +1301,13 @@ Please provide a comprehensive itinerary following the structure specified in th
 	}
 });
 
+// find-latest-jobs run this using mutliple APIS from RAPID API
+// make system like if nothing working then try next API
+// another API is to take 50+ jobs websites and scrap each everyday once, use set to get unique jobs
 app.post("/find-latest-jobs", async (c) => {
 	const { query } = await c.req.json();
 	const urlEncodedQuery = encodeURIComponent(query);
-	// i can queue multiple API URL
+
 	const apiUrl = `https://jsearch.p.rapidapi.com/search?query=${urlEncodedQuery}&page=1&num_pages=1&date_posted=all`;
 
 	const response = await fetch(apiUrl, {
@@ -1916,7 +1335,7 @@ app.post("/find-latest-jobs", async (c) => {
 	});
 });
 
-// Enhanced Bing Search endpoint using Axios (same method as google-search)
+// Enhanced Bing Search endpoint using Axios
 app.post("/bing-search", async (c) => {
 	const {
 		query,
@@ -2649,18 +2068,19 @@ app.post("/scrap-url", async (c) => {
 
 // Scrap images for the internet
 app.post("/scrap-images", async (c) => {
-	const { query, platform } = await c.req.json();
+	const { query, platform, allowAllPlatforms = false } = await c.req.json();
 
 	if (!query) {
 		return c.json({ success: false, error: "query is required" }, 400);
 	}
 
-	if (!platform) {
+	// Original single platform logic
+	if (!platform && !allowAllPlatforms) {
 		return c.json(
 			{
 				success: false,
-				error:
-					"Platform is required. Choose from: 'google', 'unsplash', 'getty', 'istock', 'shutterstock', 'adobe', 'pexels', 'pixabay', 'freepik', 'pinterest', 'flickr', 'fivehundredpx', 'deviantart', 'behance', 'artstation', 'reuters', 'apimages', 'custom'",
+				error: `Platform is required. Choose from: 'google', 'unsplash', 'getty', 'istock', 'shutterstock', 'adobe', 'pexels', 'pixabay', 'freepik', 'pinterest', 'flickr', 'fivehundredpx', 'deviantart', 'behance', 'artstation', 'reuters', 'apimages', 'custom'. 
+					Or use allowAllPlatforms as true boolean value`,
 			},
 			400
 		);
@@ -2750,6 +2170,113 @@ app.post("/scrap-images", async (c) => {
 		},
 	};
 
+	// If allowAllPlatforms is true, we'll scrape from all platforms
+	if (allowAllPlatforms) {
+		// Define all available platforms (excluding custom)
+		const allPlatforms = [
+			"google",
+			"unsplash",
+			"getty",
+			"istock",
+			"shutterstock",
+			"adobe",
+			"pexels",
+			"pixabay",
+			"freepik",
+			"pinterest",
+			"flickr",
+			"fivehundredpx",
+			"deviantart",
+			"behance",
+			"artstation",
+			"reuters",
+			"apimages",
+		];
+
+		try {
+			// Scrape from all platforms in parallel
+			const platformPromises = allPlatforms.map(async (platformName) => {
+				try {
+					const platformUrl = platforms[platformName].url;
+					const response = await fetch(`http://localhost:3001/scrap-url`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							url: platformUrl,
+							includeImages: true,
+							includeLinks: false,
+							extractMetadata: false,
+							includeSemanticContent: false,
+							timeout: 30000,
+						}),
+					});
+
+					if (!response.ok) {
+						throw new Error(`HTTP error! status: ${response.status}`);
+					}
+
+					const data = await response.json();
+
+					// Limit to 10 results per platform
+					const limitedImages = data.images ? data.images.slice(0, 10) : [];
+
+					return {
+						platform: platformName,
+						platformName: data.platformName,
+						success: data.success,
+						imageCount: limitedImages.length,
+						images: limitedImages,
+						url: data.url,
+					};
+				} catch (error) {
+					console.error(`Error scraping ${platformName} for ${query}:`, error);
+					return {
+						platform: platformName,
+						platformName: platformName,
+						success: false,
+						error: error.message,
+						imageCount: 0,
+						images: [],
+					};
+				}
+			});
+
+			// Wait for all platforms to complete
+			const results = await Promise.all(platformPromises);
+
+			// Calculate total statistics
+			const totalImages = results.reduce(
+				(sum, result) => sum + result.imageCount,
+				0
+			);
+			const successfulPlatforms = results.filter((r) => r.success).length;
+			const failedPlatforms = results.filter((r) => !r.success).length;
+
+			return c.json({
+				success: true,
+				message: `Scraped images from all platforms for "${query}"`,
+				query: query,
+				allowAllPlatforms: true,
+				totalImages: totalImages,
+				successfulPlatforms: successfulPlatforms,
+				failedPlatforms: failedPlatforms,
+				platforms: results,
+				timestamp: new Date().toISOString(),
+			});
+		} catch (error) {
+			console.error(`Error in allowAllPlatforms mode for ${query}:`, error);
+			return c.json(
+				{
+					success: false,
+					error: "Failed to scrape from all platforms",
+					details: error.message,
+					query: query,
+				},
+				500
+			);
+		}
+	}
+
 	// Check if platform is supported
 	if (!platforms[platform]) {
 		return c.json(
@@ -2793,11 +2320,10 @@ app.post("/scrap-images", async (c) => {
 			body: JSON.stringify({
 				url: targetUrl,
 				includeImages: true,
-				includeLinks: true,
-				extractMetadata: true,
-				// selectors: getPlatformSelectors(platform),
-				// Platform-specific wait selectors
-				// waitForSelector: getPlatformWaitSelector(platform),
+				includeLinks: false,
+				extractMetadata: false,
+				includeSemanticContent: false,
+				timeout: 30000,
 			}),
 		});
 
@@ -2834,7 +2360,7 @@ app.post("/scrap-images", async (c) => {
 });
 
 // Reddit Post JSON API - Automatically converts Reddit post URLs to JSON format
-app.post("/reddit-post", async (c) => {
+app.post("/reddit-post-to-json", async (c) => {
 	try {
 		const { url } = await c.req.json();
 
@@ -3301,82 +2827,6 @@ const wikipediaScrapingQueue = {
 	},
 };
 
-// Bulk Airbnb scraping with queue management
-const airbnbScrapingQueue = {
-	batches: new Map(),
-	currentBatch: 0,
-	isProcessing: false,
-
-	addBatch(batchNumber, locations) {
-		this.batches.set(batchNumber, {
-			locations,
-			status: "pending",
-			startedAt: null,
-			completedAt: null,
-			results: [],
-			successCount: 0,
-			failedCount: 0,
-			errors: [],
-		});
-	},
-
-	getNextBatch() {
-		for (const [batchNumber, batch] of this.batches) {
-			if (batch.status === "pending") {
-				return { batchNumber, batch };
-			}
-		}
-		return null;
-	},
-
-	markBatchStarted(batchNumber) {
-		const batch = this.batches.get(batchNumber);
-		if (batch) {
-			batch.status = "processing";
-			batch.startedAt = new Date();
-		}
-	},
-
-	markBatchCompleted(batchNumber, results) {
-		const batch = this.batches.get(batchNumber);
-		if (batch) {
-			batch.status = "completed";
-			batch.completedAt = new Date();
-			batch.results = results;
-			batch.successCount = results.filter((r) => r.success).length;
-			batch.failedCount = results.filter((r) => !r.success).length;
-		}
-	},
-
-	getStats() {
-		const total = this.batches.size;
-		const pending = Array.from(this.batches.values()).filter(
-			(b) => b.status === "pending"
-		).length;
-		const processing = Array.from(this.batches.values()).filter(
-			(b) => b.status === "processing"
-		).length;
-		const completed = Array.from(this.batches.values()).filter(
-			(b) => b.status === "completed"
-		).length;
-
-		return {
-			total,
-			pending,
-			processing,
-			completed,
-			batches: Array.from(this.batches.entries()).map(([number, batch]) => ({
-				batchNumber: number,
-				status: batch.status,
-				startedAt: batch.startedAt,
-				completedAt: batch.completedAt,
-				successCount: batch.successCount,
-				failedCount: batch.failedCount,
-			})),
-		};
-	},
-};
-
 app.post("/bulk-airbnb-scrap", async (c) => {
 	try {
 		const {
@@ -3652,137 +3102,6 @@ async function processAirbnbBatch(locations, maxConcurrentBrowsers, useProxy) {
 	return results;
 }
 
-const fetchScrapedData = async () => {
-	const data = await firestore.collection("ScrapedData").get();
-	return data.docs.map((item) => item.data());
-};
-
-async function processAllScrapedSources() {
-	try {
-		console.log("Starting to process all scraped sources...");
-
-		// Get all scraped sources
-		const data = await fetchScrapedData();
-		const sources = data.flatMap((item) => item.latestBlogs);
-
-		console.log(`Found ${sources.length} sources to process`);
-
-		// Process sources in batches to avoid overwhelming the system
-		const batchSize = 10;
-		const results = [];
-
-		for (let i = 0; i < sources.length; i += batchSize) {
-			const batch = sources.slice(i, i + batchSize);
-			console.log(
-				`Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(
-					sources.length / batchSize
-				)}`
-			);
-
-			// Process batch concurrently
-			const batchPromises = batch.map(async (source) => {
-				try {
-					// Get article data from scrap-url endpoint
-					const response = await fetch(`http://localhost:3001/scrap-url`, {
-						method: "POST",
-						headers: {
-							"Content-Type": "application/json",
-						},
-						body: JSON.stringify({
-							url: source.link,
-						}),
-					});
-
-					if (!response.ok) {
-						console.log(`Failed to scrape ${source.link}: ${response.status}`);
-						return null;
-					}
-
-					const articleData = await response.json();
-					const title = articleData.data?.title;
-					const description =
-						articleData.data.metadata?.description ||
-						articleData.data.metadata["og:description"];
-					const banner_image =
-						articleData.data.metadata?.image ||
-						articleData.data.metadata["og:image"] ||
-						articleData.data.metadata["twitter:image"];
-					const pubDate = articleData.data?.timestamp;
-					const semanticcontent = JSON.stringify(
-						articleData.data?.content?.semanticContent || ""
-					);
-
-					// Prepare data for Supabase insertion
-					const articleRecord = {
-						author:
-							articleData.data.metadata["og:author"] ||
-							articleData.data.metadata["author"] ||
-							"",
-						link: source.link,
-						title,
-						description,
-						pub_date: pubDate,
-						banner_image,
-						semanticcontent,
-					};
-
-					// Insert into Supabase
-					const { data, error } = await supabase
-						.from("rssfeedarticles")
-						.upsert(articleRecord, {
-							onConflict: "link",
-						});
-
-					if (error) {
-						console.log(`Supabase error for ${source.link}:`, error.message);
-						return { success: false, error: error.message, link: source.link };
-					}
-
-					console.log(`Successfully processed: ${source.link}`);
-					return { success: true, link: source.link, title: articleData.title };
-				} catch (error) {
-					console.log(`Error processing ${source.link}:`, error.message);
-					return { success: false, error: error.message, link: source.link };
-				}
-			});
-
-			// Wait for batch to complete
-			const batchResults = await Promise.allSettled(batchPromises);
-			results.push(
-				...batchResults.map((result) => result.value).filter(Boolean)
-			);
-
-			// Small delay between batches to be respectful to the system
-			if (i + batchSize < sources.length) {
-				await new Promise((resolve) => setTimeout(resolve, 1000));
-			}
-		}
-
-		// Summary
-		const successful = results.filter((r) => r.success).length;
-		const failed = results.filter((r) => !r.success).length;
-
-		console.log(
-			`Success rate: ${((successful / sources.length) * 100).toFixed(2)}%`
-		);
-
-		return {
-			total: sources.length,
-			successful,
-			failed,
-			results,
-		};
-	} catch (error) {
-		console.error("Error in processAllScrapedSources:", error);
-		throw error;
-	}
-}
-
-app.get("/process-all-scraped-sources", async (c) => {
-	const result = await processAllScrapedSources();
-	return c.json(result);
-});
-
 const port = 3001;
 console.log(`Server is running on port ${port}`);
 
@@ -3796,115 +3115,6 @@ const isDevelopment = process.env.NODE_ENV === "development";
 const origin = isDevelopment
 	? "http://localhost:3001"
 	: "https://ihatereading-ai.vercel.app";
-
-app.post("/ai-url-chat", async (c) => {
-	const { link, prompt } = await c.req.json();
-
-	if (!link || !prompt) {
-		return c.json({ error: "Both link and prompt are required" }, 400);
-	}
-
-	try {
-		// Fetch data from puppeteer endpoint
-		const data = await fetch(`${origin}/scrap-url-puppeteer`, {
-			method: "POST",
-			body: JSON.stringify({
-				url: link,
-				includeCache: true,
-			}),
-		});
-
-		const results = await data.json();
-		const scrapedData = results.data;
-
-		const modelPrompt = `You are a helpful AI assistant. A user is asking a question about a website. 
-Please provide a helpful answer based on the data from the link/url provided by the user.
-Website: ${link}
-
-Question: ${prompt}
-The data for the website is in markdown format:
-${results.markdown}
-`;
-
-		console.log(results.markdown, "results");
-		// Use Google GenAI to answer the question
-		const response = await genai.models.generateContent({
-			model: "gemini-2.5-flash-lite",
-			contents: [
-				{
-					role: "model",
-					parts: [
-						{
-							text: modelPrompt,
-						},
-					],
-				},
-				{
-					role: "user",
-					parts: [
-						{
-							text: `${prompt}`,
-						},
-					],
-				},
-			],
-		});
-
-		console.log(response.usageMetadata, "response.usageMetadata");
-		return c.json({
-			answer: response.candidates[0].content.parts[0].text,
-			scrapedData: scrapedData,
-			url: link,
-			markdown: results.markdown,
-			timestamp: new Date().toISOString(),
-			usageMetadata: response.usageMetadata,
-		});
-	} catch (error) {
-		console.error("❌ AI URL Chat error:", error);
-		return c.json(
-			{ error: "Failed to process request", details: error.message },
-			500
-		);
-	}
-});
-
-const uploadImageToFirebaseStorage = async () => {
-	// Upload to Firebase storage
-	const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-	const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
-
-	try {
-		await file.save(websiteScreenshot, {
-			metadata: {
-				contentType: "image/png",
-				cacheControl: "public, max-age=3600",
-			},
-		});
-
-		// Make the file publicly accessible
-		await file.makePublic();
-
-		// Get the public URL
-		const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
-
-		return {
-			success: true,
-			url: url,
-			title: title,
-			screenshot: screenshotUrl,
-			storagePath: `ihr-website-screenshot/${uniqueFileName}`,
-			timestamp: new Date().toISOString(),
-		};
-	} catch (firebaseError) {
-		console.error("❌ Error uploading to Firebase storage:", firebaseError);
-
-		return {
-			success: false,
-			error: "Failed to upload screenshot to Firebase storage",
-			details: firebaseError.message,
-		};
-	}
-};
 
 function isValidURL(urlString) {
 	try {
@@ -4223,7 +3433,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		includeLinks = true,
 		extractMetadata = true,
 		includeCache = false,
-		useProxy = true,
+		useProxy = false,
 	} = await c.req.json();
 
 	const isValidUrl = isValidURL(url);
@@ -4333,6 +3543,25 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 		);
 
+		// Set additional headers to avoid bot detection
+		await page.setExtraHTTPHeaders({
+			Accept:
+				"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Accept-Encoding": "gzip, deflate, br",
+			"Accept-Language": "en-US,en;q=0.9",
+			"Cache-Control": "no-cache",
+			Pragma: "no-cache",
+			"Sec-Ch-Ua":
+				'"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+			"Sec-Ch-Ua-Mobile": "?0",
+			"Sec-Ch-Ua-Platform": '"macOS"',
+			"Sec-Fetch-Dest": "document",
+			"Sec-Fetch-Mode": "navigate",
+			"Sec-Fetch-Site": "none",
+			"Sec-Fetch-User": "?1",
+			"Upgrade-Insecure-Requests": "1",
+		});
+
 		// Set extra headers
 		if (useProxy) {
 			// If using proxy, set up proxy credentials and server
@@ -4342,16 +3571,30 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				password: proxy.password,
 			});
 		}
-		await page.setExtraHTTPHeaders({
-			dnt: "1",
-			"upgrade-insecure-requests": "1",
-			accept:
-				"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-			"sec-fetch-site": "none",
-			"sec-fetch-mode": "navigate",
-			"sec-fetch-user": "?1",
-			"sec-fetch-dest": "document",
-			"accept-language": "en-US,en;q=0.9",
+
+		// Enable JavaScript and set additional properties to avoid detection
+		await page.evaluateOnNewDocument(() => {
+			// Override webdriver property
+			Object.defineProperty(navigator, "webdriver", {
+				get: () => undefined,
+			});
+
+			// Override plugins
+			Object.defineProperty(navigator, "plugins", {
+				get: () => [1, 2, 3, 4, 5],
+			});
+
+			// Override languages
+			Object.defineProperty(navigator, "languages", {
+				get: () => ["en-US", "en"],
+			});
+
+			// Override permissions
+			const originalQuery = window.navigator.permissions.query;
+			window.navigator.permissions.query = (parameters) =>
+				parameters.name === "notifications"
+					? Promise.resolve({ state: Notification.permission })
+					: originalQuery(parameters);
 		});
 
 		// Enhanced resource blocking for faster loading
@@ -4363,68 +3606,86 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			const resourceType = request.resourceType();
 			const url = request.url().toLowerCase();
 
+			// Block Vercel security checkpoints and bot detection
+			if (
+				url.includes("vercel") &&
+				(url.includes("security") || url.includes("checkpoint"))
+			) {
+				request.abort();
+				return;
+			}
+
+			// Block Cloudflare and other bot detection services
+			if (
+				url.includes("cloudflare") ||
+				url.includes("bot-detection") ||
+				url.includes("challenge")
+			) {
+				request.abort();
+				return;
+			}
+
 			// Enhanced resource blocking when includeImages is false
-			if (!includeImages) {
-				// Block all image-related resources
-				if (resourceType === "image") {
-					blockedResources.images++;
-					request.abort();
-					return;
-				}
 
-				// Block image URLs by file extension
-				const imageExtensions = [
-					".jpg",
-					".jpeg",
-					".png",
-					".gif",
-					".bmp",
-					".webp",
-					".svg",
-					".ico",
-					".tiff",
-					".tif",
-					".heic",
-					".heif",
-					".avif",
-				];
-				const hasImageExtension = imageExtensions.some((ext) =>
-					url.includes(ext)
-				);
-				if (hasImageExtension) {
-					blockedResources.images++;
-					request.abort();
-					return;
-				}
+			// Block all image-related resources
+			if (resourceType === "image") {
+				blockedResources.images++;
+				request.abort();
+				return;
+			}
 
-				// Block common image CDN and hosting services
-				const imageServices = [
-					"cdn",
-					"images",
-					"img",
-					"photo",
-					"pic",
-					"media",
-					"assets",
-				];
-				const hasImageService = imageServices.some((service) =>
-					url.includes(service)
-				);
-				if (
-					hasImageService &&
-					(url.includes(".jpg") || url.includes(".png") || url.includes(".gif"))
-				) {
-					blockedResources.images++;
-					request.abort();
-					return;
-				}
+			// Block image URLs by file extension
+			const imageExtensions = [
+				".jpg",
+				".jpeg",
+				".png",
+				".gif",
+				".bmp",
+				".webp",
+				".svg",
+				".ico",
+				".tiff",
+				".tif",
+				".heic",
+				".heif",
+				".avif",
+			];
+			const hasImageExtension = imageExtensions.some((ext) =>
+				url.includes(ext)
+			);
+			if (hasImageExtension) {
+				blockedResources.images++;
+				request.abort();
+				return;
+			}
 
-				// Block data URLs (base64 encoded images)
-				if (url.startsWith("data:image/")) {
-					blockedResources.images++;
-					request.abort();
-					return;
-				}
+			// Block common image CDN and hosting services
+			const imageServices = [
+				"cdn",
+				"images",
+				"img",
+				"photo",
+				"pic",
+				"media",
+				"assets",
+			];
+			const hasImageService = imageServices.some((service) =>
+				url.includes(service)
+			);
+			if (
+				hasImageService &&
+				(url.includes(".jpg") || url.includes(".png") || url.includes(".gif"))
+			) {
+				blockedResources.images++;
+				request.abort();
+				return;
+			}
+
+			// Block data URLs (base64 encoded images)
+			if (url.startsWith("data:image/")) {
+				blockedResources.images++;
+				request.abort();
+				return;
 			}
 
 			// Always block fonts and stylesheets for faster loading
@@ -4856,7 +4117,14 @@ app.post("/scrap-url-puppeteer", async (c) => {
 // Take Screenshot API Endpoint
 app.post("/take-screenshot", async (c) => {
 	try {
-		const { url, waitForSelector, timeout = 30000 } = await c.req.json();
+		const {
+			url,
+			fullPage,
+			coords,
+			waitForSelector,
+			timeout = 50000,
+			device = "desktop",
+		} = await c.req.json();
 
 		if (!url) {
 			return c.json(
@@ -4919,8 +4187,28 @@ app.post("/take-screenshot", async (c) => {
 
 			const page = await browser.newPage();
 
+			const viewportMapping = {
+				desktop: {
+					width: 1920,
+					height: 1080,
+					scale: 1,
+				},
+				tablet: {
+					width: 1024,
+					height: 768,
+					scale: 1,
+				},
+				mobile: {
+					width: 375,
+					height: 667,
+					scale: 1,
+				},
+			};
+
+			const viewport = viewportMapping[device];
+
 			// Set viewport and user agent
-			await page.setViewport({ width: 1920, height: 1080 });
+			await page.setViewport(viewport);
 			await page.setUserAgent(userAgents.random().toString());
 
 			// Set extra headers
@@ -4958,11 +4246,101 @@ app.post("/take-screenshot", async (c) => {
 				}
 			}
 
-			const screenshotBuffer = await page.screenshot({
-				fullPage: false,
+			// INSERT_YOUR_CODE
+			// Determine screenshot options based on input
+			let screenshotOptions = {
 				optimizeForSpeed: true,
 				encoding: "binary",
+			};
+
+			if (typeof fullPage !== "undefined" && fullPage) {
+				// If fullPage is present and true, set only fullPage, do not set clip
+				screenshotOptions.fullPage = true;
+			} else if (
+				typeof coords !== "undefined" &&
+				coords &&
+				typeof coords.x === "number" &&
+				typeof coords.y === "number" &&
+				typeof coords.width === "number" &&
+				typeof coords.height === "number"
+			) {
+				// If coords are present, set clip and do not set fullPage
+				screenshotOptions.clip = {
+					x: coords.x,
+					y: coords.y,
+					width: coords.width,
+					height: coords.height,
+				};
+			} else {
+				// Default to viewport screenshot
+				screenshotOptions.clip = {
+					x: 0,
+					y: 0,
+					width: viewport.width,
+					height: viewport.height,
+				};
+			}
+			const screenshotBuffer = await page.screenshot(screenshotOptions);
+
+			const pageHtml = await page.content();
+			const dom = new JSDOM(pageHtml);
+			const document = dom.window.document;
+
+			// Remove unwanted elements from JSDOM document
+			const selectorsToRemove = [
+				"header",
+				"footer",
+				"nav",
+				"aside",
+				".header",
+				".top",
+				".navbar",
+				"#header",
+				".footer",
+				".bottom",
+				"#footer",
+				".sidebar",
+				".side",
+				".aside",
+				"#sidebar",
+				".modal",
+				".popup",
+				"#modal",
+				".overlay",
+				".ad",
+				".ads",
+				".advert",
+				"#ad",
+				".lang-selector",
+				".language",
+				"#language-selector",
+				".social",
+				".social-media",
+				".social-links",
+				"#social",
+				".menu",
+				".navigation",
+				"#nav",
+				".breadcrumbs",
+				"#breadcrumbs",
+				".share",
+				"#share",
+				".widget",
+				"#widget",
+				".cookie",
+				"#cookie",
+				"script",
+				"style",
+				"noscript",
+			];
+
+			selectorsToRemove.forEach((sel) => {
+				document.querySelectorAll(sel).forEach((el) => el.remove());
 			});
+
+			const { markdown } = extractSemanticContentWithFormattedMarkdown(
+				document.body
+			);
 
 			// Extract page content
 			scrapedData = await page.evaluate(async () => {
@@ -5031,13 +4409,17 @@ app.post("/take-screenshot", async (c) => {
 				// Get the public URL
 				const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
 
-				return c.json({
-					success: true,
-					url: url,
-					metadata: scrapedData.metadata,
-					screenshot: screenshotUrl,
-					timestamp: new Date().toISOString(),
-				});
+				return c.json(
+					{
+						success: true,
+						url: url,
+						markdown: markdown,
+						metadata: scrapedData.metadata,
+						screenshot: screenshotUrl,
+						timestamp: new Date().toISOString(),
+					},
+					200
+				);
 			} catch (firebaseError) {
 				console.error("❌ Error uploading to Firebase storage:", firebaseError);
 
@@ -5379,477 +4761,944 @@ app.post("/take-metadata", async (c) => {
 	}
 });
 
-app.get("/ai-chat-form", async (c) => {
-	const htmlContent = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI URL Chat</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg,rgb(23, 23, 23) 0%,rgb(28, 28, 28) 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-        }
-
-        .header {
-            background: linear-gradient(135deg,rgb(16, 16, 16) 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-
-        .header h1 {
-            font-size: 2.5rem;
-            margin-bottom: 10px;
-            font-weight: 300;
-        }
-
-        .header p {
-            font-size: 1.1rem;
-            opacity: 0.9;
-        }
-
-        .form-container {
-            padding: 40px;
-        }
-
-        .form-group {
-            margin-bottom: 25px;
-        }
-
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #333;
-            font-size: 1.1rem;
-        }
-
-        .form-group input, .form-group textarea {
-            width: 100%;
-            padding: 15px;
-            border: 2px solid #e1e5e9;
-            border-radius: 10px;
-            font-size: 1rem;
-            transition: all 0.3s ease;
-            font-family: inherit;
-        }
-
-        .form-group input:focus, .form-group textarea:focus {
-            outline: none;
-            border-color:rgb(0, 0, 0);
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-
-        .form-group textarea {
-            resize: vertical;
-            min-height: 100px;
-        }
-
-        .submit-btn {
-            background: linear-gradient(135deg,rgb(37, 37, 37) 0%,rgb(36, 36, 36) 100%);
-            color: white;
-            border: none;
-            padding: 15px 30px;
-            border-radius: 10px;
-            font-size: 1.1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            width: 100%;
-            margin-top: 10px;
-        }
-
-        .submit-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
-        }
-
-        .submit-btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .loader {
-            display: none;
-            text-align: center;
-            padding: 20px;
-        }
-
-        .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solidrgb(33, 33, 33);
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 15px;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .answer-container {
-            margin-top: 30px;
-            padding: 25px;
-            background: #f8f9fa;
-            border-radius: 15px;
-            border-left: 5px solidrgb(59, 59, 59);
-            display: none;
-        }
-
-        .answer-container h3 {
-            color: #333;
-            margin-bottom: 15px;
-            font-size: 1.3rem;
-        }
-
-        .answer-content {
-            line-height: 1.6;
-            color: #555;
-            font-size: 1.1rem;
-        }
-
-        /* Markdown styling */
-        .answer-content h1, .answer-content h2, .answer-content h3, 
-        .answer-content h4, .answer-content h5, .answer-content h6 {
-            margin: 20px 0 10px 0;
-            color: #333;
-            font-weight: 600;
-        }
-
-        .answer-content h1 { font-size: 1.8rem; }
-        .answer-content h2 { font-size: 1.6rem; }
-        .answer-content h3 { font-size: 1.4rem; }
-        .answer-content h4 { font-size: 1.2rem; }
-        .answer-content h5 { font-size: 1.1rem; }
-        .answer-content h6 { font-size: 1rem; }
-
-        .answer-content p {
-            margin: 10px 0;
-        }
-
-        .answer-content ul, .answer-content ol {
-            margin: 10px 0;
-            padding-left: 30px;
-        }
-
-        .answer-content li {
-            margin: 5px 0;
-        }
-
-        .answer-content blockquote {
-            border-left: 4px solid #667eea;
-            margin: 15px 0;
-            padding: 10px 20px;
-            background: #f8f9fa;
-            font-style: italic;
-        }
-
-        .answer-content code {
-            background: #f1f3f4;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9rem;
-        }
-
-        .answer-content pre {
-            background: #f1f3f4;
-            padding: 15px;
-            border-radius: 8px;
-            overflow-x: auto;
-            margin: 15px 0;
-        }
-
-        .answer-content pre code {
-            background: none;
-            padding: 0;
-        }
-
-        .answer-content strong {
-            font-weight: 600;
-        }
-
-        .answer-content em {
-            font-style: italic;
-        }
-
-        .answer-content a {
-            color: #667eea;
-            text-decoration: none;
-        }
-
-        .answer-content a:hover {
-            text-decoration: underline;
-        }
-
-        .answer-content table {
-            border-collapse: collapse;
-            width: 100%;
-            margin: 15px 0;
-        }
-
-        .answer-content th, .answer-content td {
-            border: 1px solid #ddd;
-            padding: 8px 12px;
-            text-align: left;
-        }
-
-        .answer-content th {
-            background: #f8f9fa;
-            font-weight: 600;
-        }
-
-        .error-message {
-            background: #fee;
-            color: #c33;
-            padding: 15px;
-            border-radius: 10px;
-            margin-top: 20px;
-            border-left: 4px solid #c33;
-            display: none;
-        }
-
-        .url-info {
-            background: #e8f4fd;
-            padding: 15px;
-            border-radius: 10px;
-            margin-top: 15px;
-            border-left: 4px solidrgb(63, 63, 63);
-            display: none;
-        }
-
-        .url-info h4 {
-            color:rgb(77, 77, 77);
-            margin-bottom: 8px;
-        }
-
-        .url-info p {
-            color: #555;
-            margin: 5px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🤖 AI URL Chat</h1>
-            <p>Ask questions about any website content</p>
-        </div>
-        
-        <div class="form-container">
-            <form id="chatForm">
-                <div class="form-group">
-                    <label for="url">Website URL:</label>
-                    <input type="url" id="url" name="url" placeholder="https://example.com" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="question">Your Question:</label>
-                    <textarea id="question" name="question" placeholder="Ask anything about the website content..." required></textarea>
-                </div>
-                
-                <button type="submit" class="submit-btn" id="submitBtn">
-                    🚀 Get AI Answer
-                </button>
-            </form>
-
-            <div class="loader" id="loader">
-                <div class="spinner"></div>
-                <p>🤖 AI is analyzing the website and thinking...</p>
-            </div>
-
-            <div class="error-message" id="errorMessage"></div>
-
-            <div class="answer-container" id="answerContainer">
-
-                <div class="answer-content" id="answerContent"></div>
-                
-                <div class="url-info" id="urlInfo">
-                    <h4>📊 Website Information:</h4>
-                    <p id="urlTitle"></p>
-                    <p id="urlUrl"></p>
-                    <p id="urlTimestamp"></p>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        document.getElementById('chatForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            
-            const url = document.getElementById('url').value;
-            const question = document.getElementById('question').value;
-            const submitBtn = document.getElementById('submitBtn');
-            const loader = document.getElementById('loader');
-            const answerContainer = document.getElementById('answerContainer');
-            const errorMessage = document.getElementById('errorMessage');
-            
-            // Reset UI
-            errorMessage.style.display = 'none';
-            answerContainer.style.display = 'none';
-            
-            // Show loader and disable button
-            loader.style.display = 'block';
-            submitBtn.disabled = true;
-            submitBtn.textContent = '⏳ Processing...';
-            
-            try {
-                const response = await fetch('/ai-url-chat', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        link: url,
-                        prompt: question
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (!response.ok) {
-                    throw new Error(data.error || 'Failed to get answer');
-                }
-                
-                // Convert markdown response to HTML and display
-                try {
-                    const html = await convertMarkdownToHtml(data.answer);
-                    document.getElementById('answerContent').innerHTML = html;
-                } catch (error) {
-                    console.error('Markdown conversion error:', error);
-                    // Fallback to plain text if conversion fails
-                    document.getElementById('answerContent').textContent = data.answer;
-                }
-                
-                // Display URL info
-                document.getElementById('urlTitle').textContent = 'Title: ' + (data.scrapedData.title || 'N/A');
-                document.getElementById('urlUrl').textContent = 'URL: ' + data.url;
-                document.getElementById('urlTimestamp').textContent = 'Analyzed: ' + new Date(data.timestamp).toLocaleString();
-                
-                // Show containers
-                answerContainer.style.display = 'block';
-                document.getElementById('urlInfo').style.display = 'block';
-                
-            } catch (error) {
-                console.error('Error:', error);
-                errorMessage.textContent = 'Error: ' + error.message;
-                errorMessage.style.display = 'block';
-            } finally {
-                // Hide loader and re-enable button
-                loader.style.display = 'none';
-                submitBtn.disabled = false;
-                submitBtn.textContent = '🚀 Get AI Answer';
-            }
-        });
-    </script>
-</body>
-</html>`;
-
-	return new Response(htmlContent, {
-		headers: {
-			"Content-Type": "text/html",
-		},
-	});
-});
-
-app.post("/ai-answer", async (c) => {
-	// Initialize the pipeline with proper error handling and ONNX optimization
-	let generator;
-
-	generator = await pipeline("text2text-generation", "Xenova/flan-t5-base", {
-		quantized: false,
-		cache_dir: "./models",
-		progress_callback: (progress) => {
-			if (progress.status === "progress") {
-				console.log(
-					`📥 Downloading alternative model: ${Math.round(progress.progress)}%`
-				);
-			}
-		},
-	});
+app.post("/crawl-take-screenshots", async (c) => {
 	try {
-		const data = await supabase
-			.from("universo")
-			.select("markdown")
-			.order("id", { ascending: false })
-			.limit(1);
-		const markdown = data.data[0].markdown;
-		const output = await generator(
-			`Improve the following markdown content and give me production read LLM
-			based markdown content: ${markdown}`,
-			{
-				max_new_tokens: 1000,
-				temperature: 0.7,
-				do_sample: true,
+		const {
+			url,
+			maxUrls = 10,
+			waitForSelector,
+			timeout = 30000,
+		} = await c.req.json();
+
+		if (!url) {
+			return c.json(
+				{
+					success: false,
+					error: "URL is required",
+				},
+				400
+			);
+		}
+
+		// Validate URL format
+		let seedUrl;
+		try {
+			seedUrl = new URL(url);
+		} catch (error) {
+			return c.json(
+				{
+					success: false,
+					error: "Invalid URL format",
+				},
+				400
+			);
+		}
+
+		const domain = seedUrl.hostname;
+		const crawledUrls = new Set();
+
+		try {
+			// Import puppeteer-core and chromium
+			const puppeteer = await import("puppeteer-core");
+			const chromium = (await import("@sparticuz/chromium")).default;
+
+			let browser;
+			let page;
+
+			// Try to launch browser with @sparticuz/chromium first
+			try {
+				const executablePath = await chromium.executablePath();
+
+				browser = await puppeteer.launch({
+					headless: true,
+					args: chromium.args,
+					executablePath: executablePath,
+					ignoreDefaultArgs: ["--disable-extensions"],
+				});
+			} catch (chromiumError) {
+				// Fallback: try to use system Chrome or let puppeteer find a browser
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath:
+						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+					args: [
+						"--no-sandbox",
+						"--disable-setuid-sandbox",
+						"--disable-dev-shm-usage",
+						"--disable-gpu",
+						"--disable-web-security",
+					],
+				});
 			}
-		);
-		console.log("✅ Pipeline test successful:", output);
-		return c.json({
-			success: true,
-			answer: output[0].generated_text,
-		});
+
+			page = await browser.newPage();
+
+			// Set viewport and user agent
+			await page.setViewport({ width: 1920, height: 1080 });
+			await page.setUserAgent(userAgents.random().toString());
+
+			// Set extra headers
+			await page.setExtraHTTPHeaders({
+				dnt: "1",
+				"upgrade-insecure-requests": "1",
+				accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+				"sec-fetch-site": "none",
+				"sec-fetch-mode": "navigate",
+				"sec-fetch-user": "?1",
+				"sec-fetch-dest": "document",
+				"accept-language": "en-US,en;q=0.9",
+			});
+
+			// Set request interception
+			await page.setRequestInterception(true);
+			await page.setJavaScriptEnabled(true);
+			page.on("request", (request) => {
+				request.continue();
+			});
+
+			// Function to crawl and collect URLs
+			const crawlPage = async (currentUrl) => {
+				if (crawledUrls.size >= maxUrls) return;
+
+				try {
+					await page.goto(currentUrl, {
+						waitUntil: "domcontentloaded",
+						timeout: timeout,
+					});
+
+					// Wait for specific selector if provided
+					if (waitForSelector) {
+						try {
+							await page.waitForSelector(waitForSelector, { timeout: 10000 });
+						} catch (error) {
+							console.warn(
+								`Selector ${waitForSelector} not found within timeout`
+							);
+						}
+					}
+
+					// Extract all links from the page
+					const links = await page.evaluate((domain) => {
+						const anchors = Array.from(document.querySelectorAll("a[href]"));
+						const urls = new Set();
+
+						// Define extensions and patterns to exclude
+						const excludedExtensions = [
+							".pdf",
+							".doc",
+							".docx",
+							".xls",
+							".xlsx",
+							".ppt",
+							".pptx",
+							".zip",
+							".rar",
+							".7z",
+							".tar",
+							".gz",
+							".jpg",
+							".jpeg",
+							".png",
+							".gif",
+							".bmp",
+							".svg",
+							".webp",
+							".ico",
+							".mp4",
+							".avi",
+							".mov",
+							".wmv",
+							".flv",
+							".webm",
+							".mp3",
+							".wav",
+							".flac",
+							".aac",
+							".ogg",
+							".css",
+							".js",
+							".json",
+							".xml",
+							".txt",
+							".csv",
+							".exe",
+							".dmg",
+							".pkg",
+							".deb",
+							".rpm",
+							".apk",
+							".ipa",
+							".app",
+							".bin",
+						];
+
+						anchors.forEach((anchor) => {
+							try {
+								const href = anchor.getAttribute("href");
+								if (!href) return;
+
+								// Skip data URLs and javascript URLs
+								if (
+									href.startsWith("data:") ||
+									href.startsWith("javascript:") ||
+									href.startsWith("mailto:") ||
+									href.startsWith("tel:")
+								) {
+									return;
+								}
+
+								// Handle relative URLs
+								const url = new URL(href, window.location.href);
+
+								// Only include URLs from the same domain
+								if (url.hostname !== domain) return;
+
+								// Skip URLs with excluded extensions
+								const pathname = url.pathname.toLowerCase();
+								const hasExcludedExtension = excludedExtensions.some((ext) =>
+									pathname.endsWith(ext)
+								);
+								if (hasExcludedExtension) return;
+
+								// Skip URLs with fragments only (same page anchors)
+								if (url.pathname === "" && url.search === "" && url.hash !== "")
+									return;
+
+								urls.add(url.href);
+							} catch (e) {
+								// Skip invalid URLs
+							}
+						});
+
+						return Array.from(urls);
+					}, domain);
+
+					// Add current URL to crawled set
+					crawledUrls.add(currentUrl);
+
+					// Add new URLs to crawl queue (up to maxUrls)
+					for (const link of links) {
+						if (crawledUrls.size >= maxUrls) break;
+						if (!crawledUrls.has(link)) {
+							crawledUrls.add(link);
+						}
+					}
+
+					return links;
+				} catch (error) {
+					console.error(`Error crawling ${currentUrl}:`, error);
+					return [];
+				}
+			};
+
+			// Start crawling from the seed URL
+			await crawlPage(url);
+
+			// Take screenshots of all crawled URLs
+			const screenshotPromises = Array.from(crawledUrls).map(
+				async (crawlUrl) => {
+					try {
+						const response = await fetch(`${origin}/take-screenshot`, {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({
+								url: crawlUrl,
+								waitForSelector: waitForSelector,
+								timeout: timeout,
+							}),
+						});
+
+						const data = await response.json();
+
+						return {
+							url: crawlUrl,
+							screenshot: data.screenshot,
+							metadata: data.metadata,
+							markdown: data.markdown,
+							success: data.success,
+						};
+					} catch (error) {
+						console.error(`Error taking screenshot for ${crawlUrl}:`, error);
+						return {
+							url: crawlUrl,
+							screenshot: null,
+							metadata: null,
+							success: false,
+							error: error.message,
+						};
+					}
+				}
+			);
+
+			// Wait for all screenshots to complete
+			const screenshotResults = await Promise.all(screenshotPromises);
+
+			await page.close();
+			await browser.close();
+
+			return c.json({
+				success: true,
+				seedUrl: url,
+				domain: domain,
+				crawledUrls: Array.from(crawledUrls),
+				totalUrls: crawledUrls.size,
+				results: screenshotResults,
+				timestamp: new Date().toISOString(),
+			});
+		} catch (captureError) {
+			console.error("❌ Error in crawl-screenshots:", captureError);
+
+			return c.json(
+				{
+					success: false,
+					crawledUrls: crawledUrls,
+					error: "Failed to crawl and take screenshots",
+					details: captureError.message,
+				},
+				500
+			);
+		}
 	} catch (error) {
-		console.error("❌ Alternative model also failed:", error.message);
-		console.error("Full alternative error:", error);
-		generator = null;
-		return c.json({
-			success: false,
-			error: error.message,
-		});
+		console.error("❌ Crawl-screenshots API error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Internal server error",
+				details: error.message,
+			},
+			500
+		);
 	}
 });
 
-const filterDuplicatesLink = (links) => {
-	const seenLinks = new Set();
-	return links.filter((link) => {
-		if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
-			return false;
+app.post("/crawl-url", async (c) => {
+	try {
+		const {
+			url,
+			maxUrls = 10,
+			allowSeedDomains = false,
+			waitForSelector,
+			timeout = 60000,
+		} = await c.req.json();
+
+		if (!url) {
+			return c.json(
+				{
+					success: false,
+					error: "URL is required",
+				},
+				400
+			);
+		}
+
+		// Validate URL format
+		let seedUrl;
+		try {
+			seedUrl = new URL(url);
+		} catch (error) {
+			return c.json(
+				{
+					success: false,
+					error: "Invalid URL format",
+				},
+				400
+			);
+		}
+
+		const domain = seedUrl.hostname;
+		const crawledUrls = new Set();
+
+		try {
+			// Import puppeteer-core and chromium
+			const puppeteer = await import("puppeteer-core");
+			const chromium = (await import("@sparticuz/chromium")).default;
+
+			let browser;
+			let page;
+
+			// Try to launch browser with @sparticuz/chromium first
+			try {
+				const executablePath = await chromium.executablePath();
+
+				browser = await puppeteer.launch({
+					headless: true,
+					args: chromium.args,
+					executablePath: executablePath,
+					ignoreDefaultArgs: ["--disable-extensions"],
+				});
+			} catch (chromiumError) {
+				// Fallback: try to use system Chrome or let puppeteer find a browser
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath:
+						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+					args: [
+						"--no-sandbox",
+						"--disable-setuid-sandbox",
+						"--disable-dev-shm-usage",
+						"--disable-gpu",
+						"--disable-web-security",
+					],
+				});
+			}
+
+			page = await browser.newPage();
+
+			// Set viewport and user agent
+			await page.setViewport({ width: 1920, height: 1080 });
+			await page.setUserAgent(userAgents.random().toString());
+
+			// Set extra headers
+			await page.setExtraHTTPHeaders({
+				dnt: "1",
+				"upgrade-insecure-requests": "1",
+				accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+				"sec-fetch-site": "none",
+				"sec-fetch-mode": "navigate",
+				"sec-fetch-user": "?1",
+				"sec-fetch-dest": "document",
+				"accept-language": "en-US,en;q=0.9",
+			});
+
+			// Set request interception
+			await page.setRequestInterception(true);
+			await page.setJavaScriptEnabled(true);
+			page.on("request", (request) => {
+				request.continue();
+			});
+
+			// Function to crawl and collect URLs
+			const crawlPage = async (currentUrl) => {
+				if (crawledUrls.size >= maxUrls) return;
+
+				try {
+					await page.goto(currentUrl, {
+						waitUntil: "domcontentloaded",
+						timeout: timeout,
+					});
+
+					// Wait for specific selector if provided
+					if (waitForSelector) {
+						try {
+							await page.waitForSelector(waitForSelector, { timeout: 10000 });
+						} catch (error) {
+							console.warn(
+								`Selector ${waitForSelector} not found within timeout`
+							);
+						}
+					}
+
+					// Extract all links from the page
+					const links = await page.evaluate((domain) => {
+						const anchors = Array.from(document.querySelectorAll("a[href]"));
+						const urls = new Set();
+
+						// Define extensions and patterns to exclude
+						const excludedExtensions = [
+							".pdf",
+							".doc",
+							".docx",
+							".xls",
+							".xlsx",
+							".ppt",
+							".pptx",
+							".zip",
+							".rar",
+							".7z",
+							".tar",
+							".gz",
+							".jpg",
+							".jpeg",
+							".png",
+							".gif",
+							".bmp",
+							".svg",
+							".webp",
+							".ico",
+							".mp4",
+							".avi",
+							".mov",
+							".wmv",
+							".flv",
+							".webm",
+							".mp3",
+							".wav",
+							".flac",
+							".aac",
+							".ogg",
+							".css",
+							".js",
+							".json",
+							".xml",
+							".txt",
+							".csv",
+							".exe",
+							".dmg",
+							".pkg",
+							".deb",
+							".rpm",
+							".apk",
+							".ipa",
+							".app",
+							".bin",
+						];
+
+						anchors.forEach((anchor) => {
+							try {
+								const href = anchor.getAttribute("href");
+								if (!href) return;
+
+								// Skip data URLs and javascript URLs
+								if (
+									href.startsWith("data:") ||
+									href.startsWith("javascript:") ||
+									href.startsWith("mailto:") ||
+									href.startsWith("tel:")
+								) {
+									return;
+								}
+
+								// Handle relative URLs
+								const url = new URL(href, window.location.href);
+
+								// Only include URLs from the same domain
+								if (url.hostname !== domain && allowSeedDomains) return;
+
+								// Skip URLs with excluded extensions
+								const pathname = url.pathname.toLowerCase();
+								// const hasExcludedExtension = excludedExtensions.some((ext) =>
+								// 	pathname.endsWith(ext)
+								// );
+								// if (hasExcludedExtension) return;
+
+								// Skip URLs with fragments only (same page anchors)
+								if (url.pathname === "" && url.search === "" && url.hash !== "")
+									return;
+
+								urls.add(url.href);
+							} catch (e) {
+								// Skip invalid URLs
+							}
+						});
+
+						return Array.from(urls);
+					}, domain);
+
+					// Add current URL to crawled set
+					crawledUrls.add(currentUrl);
+
+					// Add new URLs to crawl queue (up to maxUrls)
+					for (const link of links) {
+						if (crawledUrls.size >= maxUrls) break;
+						if (!crawledUrls.has(link)) {
+							crawledUrls.add(link);
+						}
+					}
+
+					return links;
+				} catch (error) {
+					console.error(`Error crawling ${currentUrl}:`, error);
+					return [];
+				}
+			};
+
+			// Start crawling from the seed URL
+			await crawlPage(url);
+
+			await page.close();
+			await browser.close();
+
+			return c.json({
+				success: true,
+				seedUrl: url,
+				domain: domain,
+				crawledUrls: Array.from(crawledUrls),
+				totalUrls: crawledUrls.size,
+				timestamp: new Date().toISOString(),
+			});
+		} catch (captureError) {
+			console.error("❌ Error in crawl-screenshots:", captureError);
+
+			return c.json(
+				{
+					success: false,
+					crawledUrls: crawledUrls,
+					error: "Failed to crawl and take screenshots",
+					details: captureError.message,
+				},
+				500
+			);
+		}
+	} catch (error) {
+		console.error("❌ Crawl-screenshots API error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Internal server error",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
+
+app.post("/scrap-reddit", async (c) => {
+	try {
+		const { url } = await c.req.json();
+
+		if (!url) {
+			return c.json({ success: false, error: "Reddit URL is required" }, 400);
+		}
+
+		// Validate that it's a Reddit URL
+		if (!url.includes("reddit.com")) {
+			return c.json({ success: false, error: "URL must be a Reddit URL" }, 400);
+		}
+
+		// Convert Reddit URL to JSON API URL
+		let jsonUrl = url;
+		if (!url.endsWith(".json")) {
+			jsonUrl = url.endsWith("/") ? url + ".json" : url + "/.json";
 		}
 
 		try {
-			// Check if link URL is valid and matches seed domain
-			const linkUrl = new URL(link.href);
-			if (linkUrl.hostname !== seedDomain) {
-				return false; // Skip external links
-			}
-		} catch (error) {
-			// Skip invalid URLs
-			return false;
-		}
+			// Fetch Reddit JSON data
+			const response = await axios.get(jsonUrl, {
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+					Accept: "application/json",
+				},
+				timeout: 30000,
+			});
 
-		// Remove duplicates based on text, href, or title
-		const key = `${link.text}|${link.href}|${link.title}`;
-		if (seenLinks.has(key)) return false;
-		seenLinks.add(key);
-		return true;
-	});
-	return true;
-};
-// now write a new endpoint that takes LLM markdown data and create embeddings from it
-// them store them as pgvector inside supabase
-// then pass these vectors as summarise version to LLM model in frontend to reduce the input tokens size
-// in this way our LLM ready data and question is cheap and perfect
+			const redditData = response.data;
+
+			// Extract metadata from the original Reddit URL (without .json)
+			let redditMetadata = null;
+			// Fetch the webpage content
+			const newUrl = new URL(url.replace(".json", ""));
+			const hostname = newUrl.hostname;
+			const metadataResponse = await axios.get(`https://${hostname}`, {
+				headers: {
+					"User-Agent": userAgents.random().toString(),
+					Accept:
+						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+					"Accept-Language": "en-US,en;q=0.9",
+					"Accept-Encoding": "gzip, deflate, br",
+					DNT: "1",
+					Connection: "keep-alive",
+					"Upgrade-Insecure-Requests": "1",
+				},
+				timeout: 30000,
+				maxRedirects: 5,
+			});
+
+			// Load HTML content with Cheerio
+			const $ = load(metadataResponse.data);
+
+			// Extract basic metadata
+			const metadata = {
+				url: url,
+				title: $("title").text().trim() || $("h1").first().text().trim(),
+				description: "",
+				author: "",
+				pubDate: "",
+				image: "",
+				robots: "",
+				keywords: "",
+				language: "",
+				viewport: "",
+				favicon: "",
+				openGraph: {},
+				twitterCard: {},
+				allMetaTags: {},
+			};
+
+			// Extract description from various meta tags
+			metadata.description =
+				$('meta[name="description"]').attr("content") ||
+				$('meta[property="og:description"]').attr("content") ||
+				$('meta[name="twitter:description"]').attr("content") ||
+				$('meta[name="summary"]').attr("content") ||
+				"";
+
+			// Extract author
+			metadata.author =
+				$('meta[name="author"]').attr("content") ||
+				$('meta[property="article:author"]').attr("content") ||
+				$('meta[name="twitter:creator"]').attr("content") ||
+				$('link[rel="author"]').attr("href") ||
+				"";
+
+			// Extract publication date
+			metadata.pubDate =
+				$('meta[property="article:published_time"]').attr("content") ||
+				$('meta[name="date"]').attr("content") ||
+				$('meta[name="pubdate"]').attr("content") ||
+				$('meta[name="DC.date.issued"]').attr("content") ||
+				$("time[datetime]").first().attr("datetime") ||
+				"";
+
+			// Extract main image
+			metadata.image =
+				$('meta[property="og:image"]').attr("content") ||
+				$('meta[name="twitter:image"]').attr("content") ||
+				$('meta[name="image"]').attr("content") ||
+				$("img").first().attr("src") ||
+				"";
+
+			if (
+				metadata.image.startsWith("http") ||
+				metadata.image.startsWith("//") ||
+				metadata.image.startsWith("data:image/") ||
+				metadata.image.startsWith("blob:") ||
+				metadata.image.startsWith("file:") ||
+				metadata.image.startsWith("mailto:")
+			) {
+				metadata.image = "";
+			}
+			// Extract robots meta
+			metadata.robots = $('meta[name="robots"]').attr("content") || "";
+
+			// Extract keywords
+			metadata.keywords = $('meta[name="keywords"]').attr("content") || "";
+
+			// Extract language
+			metadata.language =
+				$("html").attr("lang") ||
+				$('meta[http-equiv="content-language"]').attr("content") ||
+				$('meta[name="language"]').attr("content") ||
+				"";
+
+			// Extract viewport
+			metadata.viewport = $('meta[name="viewport"]').attr("content") || "";
+
+			// Extract charset
+			metadata.charset =
+				$("meta[charset]").attr("charset") ||
+				$('meta[http-equiv="content-type"]').attr("content") ||
+				"";
+
+			// Extract theme color
+			metadata.themeColor = $('meta[name="theme-color"]').attr("content") || "";
+
+			// Extract all meta tags
+			$("meta").each((i, element) => {
+				const $meta = $(element);
+				const name =
+					$meta.attr("name") ||
+					$meta.attr("property") ||
+					$meta.attr("http-equiv");
+				const content = $meta.attr("content");
+				if (name && content) {
+					metadata.allMetaTags[name] = content;
+				}
+			});
+
+			// Extract Open Graph tags
+			$('meta[property^="og:"]').each((i, element) => {
+				const $meta = $(element);
+				const property = $meta.attr("property");
+				const content = $meta.attr("content");
+				if (property && content) {
+					// If the content starts with "http", "blob:", "image:", or "data:", set the value to an empty string
+					if (
+						content.startsWith("http") ||
+						content.startsWith("blob:") ||
+						content.startsWith("image:") ||
+						content.startsWith("data:")
+					) {
+						return;
+					} else {
+						metadata.openGraph[property] = content;
+					}
+				}
+			});
+
+			// Extract Twitter Card tags
+			$('meta[name^="twitter:"]').each((i, element) => {
+				const $meta = $(element);
+				const name = $meta.attr("name");
+				const content = $meta.attr("content");
+				if (name && content) {
+					if (
+						content.startsWith("http") ||
+						content.startsWith("blob:") ||
+						content.startsWith("image:") ||
+						content.startsWith("data:")
+					) {
+						return;
+					} else {
+						metadata.twitterCard[name] = content;
+					}
+				}
+			});
+
+			// Extract favicon
+			metadata.favicon =
+				$('link[rel="icon"]').attr("href") ||
+				$('link[rel="shortcut icon"]').attr("href") ||
+				$('link[rel="favicon"]').attr("href") ||
+				"";
+
+			removeEmptyKeys(metadata);
+
+			redditMetadata = metadata.allMetaTags;
+			// Parse Reddit JSON and create LLM-friendly markdown
+			const parseRedditData = (data) => {
+				if (!data || !data.data || !data.data.children) {
+					return { markdown: "No Reddit data found", posts: [] };
+				}
+
+				const posts = [];
+				let markdown = `# Reddit Posts from ${url}\n\n`;
+
+				data.data.children.forEach((child, index) => {
+					if (child.kind === "t3" && child.data) {
+						const post = child.data;
+
+						// Extract key information
+						const postData = {
+							title: post.title || "No Title",
+							author: post.author || "Unknown",
+							subreddit: post.subreddit || "Unknown",
+							score: post.score || 0,
+							upvoteRatio: post.upvote_ratio || 0,
+							numComments: post.num_comments || 0,
+							created: new Date(post.created_utc * 1000).toISOString(),
+							permalink: post.permalink
+								? `https://reddit.com${post.permalink}`
+								: "",
+							url: post.url || "",
+							selftext: post.selftext || "",
+							linkFlairText: post.link_flair_text || "",
+							domain: post.domain || "",
+							isSelf: post.is_self || false,
+							stickied: post.stickied || false,
+							over18: post.over_18 || false,
+							spoiler: post.spoiler || false,
+							locked: post.locked || false,
+							archived: post.archived || false,
+							distinguished: post.distinguished || null,
+							gilded: post.gilded || 0,
+							totalAwards: post.total_awards_received || 0,
+						};
+
+						posts.push(postData);
+
+						// Create markdown section for this post
+						markdown += `## Post ${index + 1}: ${postData.title}\n\n`;
+
+						// Basic info
+						markdown += `**Author:** u/${postData.author}\n`;
+						markdown += `**Subreddit:** r/${postData.subreddit}\n`;
+						markdown += `**Score:** ${postData.score} (${Math.round(
+							postData.upvoteRatio * 100
+						)}% upvoted)\n`;
+						markdown += `**Comments:** ${postData.numComments}\n`;
+						markdown += `**Posted:** ${postData.created}\n`;
+
+						// Post status indicators
+						const status = [];
+						if (postData.stickied) status.push("📌 Pinned");
+						if (postData.locked) status.push("🔒 Locked");
+						if (postData.archived) status.push("📁 Archived");
+						if (postData.over18) status.push("🔞 NSFW");
+						if (postData.spoiler) status.push("⚠️ Spoiler");
+						if (postData.distinguished)
+							status.push(`👑 ${postData.distinguished}`);
+						if (postData.gilded > 0)
+							status.push(`🏆 ${postData.gilded} gilded`);
+						if (postData.totalAwards > 0)
+							status.push(`🎖️ ${postData.totalAwards} awards`);
+
+						if (status.length > 0) {
+							markdown += `**Status:** ${status.join(", ")}\n`;
+						}
+
+						// Flair
+						if (postData.linkFlairText) {
+							markdown += `**Flair:** ${postData.linkFlairText}\n`;
+						}
+
+						// Content
+						if (postData.selftext) {
+							markdown += `\n**Content:**\n${postData.selftext}\n`;
+						}
+
+						// External link
+						if (!postData.isSelf && postData.url) {
+							markdown += `\n**External Link:** ${postData.url}\n`;
+						}
+
+						// Links
+						markdown += `\n**Reddit Link:** ${postData.permalink}\n`;
+
+						markdown += `\n---\n\n`;
+					}
+				});
+
+				// Add summary
+				markdown += `## Summary\n\n`;
+				markdown += `- **Total Posts:** ${posts.length}\n`;
+				markdown += `- **Subreddit:** r/${posts[0]?.subreddit || "Unknown"}\n`;
+				markdown += `- **Total Score:** ${posts.reduce(
+					(sum, post) => sum + post.score,
+					0
+				)}\n`;
+				markdown += `- **Total Comments:** ${posts.reduce(
+					(sum, post) => sum + post.numComments,
+					0
+				)}\n`;
+				markdown += `- **Average Score:** ${Math.round(
+					posts.reduce((sum, post) => sum + post.score, 0) / posts.length
+				)}\n`;
+				markdown += `- **Average Upvote Ratio:** ${Math.round(
+					(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) /
+						posts.length) *
+						100
+				)}%\n`;
+
+				return { markdown, posts };
+			};
+
+			const { markdown, posts } = parseRedditData(redditData);
+
+			return c.json({
+				success: true,
+				url: url,
+				markdown: markdown,
+				data: {
+					posts: posts,
+					metadata: redditMetadata,
+				},
+				timestamp: new Date().toISOString(),
+			});
+		} catch (fetchError) {
+			console.error("❌ Error fetching Reddit JSON:", fetchError);
+
+			return c.json(
+				{
+					success: false,
+					error: "Failed to fetch Reddit data",
+					details: fetchError.message,
+					url: url,
+				},
+				500
+			);
+		}
+	} catch (error) {
+		console.error("❌ Reddit scraper error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Internal server error",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
