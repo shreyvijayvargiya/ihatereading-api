@@ -5686,12 +5686,18 @@ app.post("/scrap-reddit", async (c) => {
 			redditMetadata = metadata.allMetaTags;
 			const { markdown, posts } = parseRedditData(redditData);
 
+			const allLinks = posts.map((post) => post.url);
+			const allImages = posts.map((post) => post.image);
+
 			return c.json({
 				success: true,
-				url: url,
 				markdown: markdown,
 				data: {
+					url: url,
 					posts: posts,
+					title: metadata.title,
+					links: allLinks,
+					images: allImages,
 					metadata: redditMetadata,
 				},
 				timestamp: new Date().toISOString(),
@@ -5720,30 +5726,12 @@ app.post("/scrap-reddit", async (c) => {
 					return c.json({
 						success: true,
 						url: url,
-						jsonUrl: jsonUrl,
 						markdown: markdown,
-						metadata: null, // No metadata due to fallback
-						posts: posts,
-						summary: {
-							totalPosts: posts.length,
-							subreddit: posts[0]?.subreddit || "Unknown",
-							totalScore: posts.reduce((sum, post) => sum + post.score, 0),
-							totalComments: posts.reduce(
-								(sum, post) => sum + post.numComments,
-								0
-							),
-							averageScore: Math.round(
-								posts.reduce((sum, post) => sum + post.score, 0) / posts.length
-							),
-							averageUpvoteRatio: Math.round(
-								(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) /
-									posts.length) *
-									100
-							),
+						data: {
+							metadata: null,
+							posts: posts,
 						},
-						rawData: redditData,
 						timestamp: new Date().toISOString(),
-						note: "Data fetched using fallback method due to bot detection",
 					});
 				} catch (fallbackError) {
 					console.error("❌ Fallback also failed:", fallbackError);
