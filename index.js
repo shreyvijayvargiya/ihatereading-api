@@ -5481,7 +5481,7 @@ app.post("/scrap-reddit", async (c) => {
 		};
 
 		try {
-			// Fetch Reddit JSON data with enhanced bot detection bypass
+			// Fetch Reddit JSON data with enhanced bot detection bypass and proxy support
 			const response = await axios.get(jsonUrl, {
 				headers: {
 					"User-Agent":
@@ -5503,12 +5503,31 @@ app.post("/scrap-reddit", async (c) => {
 					Referer: "https://www.reddit.com/",
 					Origin: "https://www.reddit.com",
 					"X-Requested-With": "XMLHttpRequest",
+					"X-Forwarded-For": "192.168.1.1",
+					"X-Real-IP": "192.168.1.1",
+					"CF-Connecting-IP": "192.168.1.1",
+					"X-Forwarded-Proto": "https",
+					"X-Forwarded-Host": "www.reddit.com",
 				},
 				timeout: 30000,
 				maxRedirects: 5,
 				validateStatus: function (status) {
 					return status >= 200 && status < 300; // Only resolve for 2xx status codes
 				},
+				// Proxy configuration
+				proxy: {
+					protocol: "https",
+					host: "proxy-server.com",
+					port: 8080,
+					auth: {
+						username: "proxy-user",
+						password: "proxy-pass",
+					},
+				},
+				// Alternative proxy configuration for different proxy types
+				// proxy: false, // Disable proxy
+				// proxy: 'http://proxy-server.com:8080', // Simple proxy
+				// proxy: 'socks5://proxy-server.com:1080', // SOCKS5 proxy
 			});
 
 			const redditData = response.data;
@@ -5710,14 +5729,26 @@ app.post("/scrap-reddit", async (c) => {
 				try {
 					console.log("🔄 JSON API blocked, trying alternative approach...");
 
-					// Try with different user agent and simpler headers
+					// Try with different user agent and simpler headers + proxy
 					const fallbackResponse = await axios.get(jsonUrl, {
 						headers: {
 							"User-Agent":
 								"Mozilla/5.0 (compatible; RedditBot/1.0; +https://www.reddit.com/robots.txt)",
 							Accept: "application/json",
+							"X-Forwarded-For": "192.168.1.1",
+							"X-Real-IP": "192.168.1.1",
 						},
 						timeout: 30000,
+						// Proxy configuration for fallback
+						proxy: {
+							protocol: "https",
+							host: "proxy-server.com",
+							port: 8080,
+							auth: {
+								username: "proxy-user",
+								password: "proxy-pass",
+							},
+						},
 					});
 
 					const redditData = fallbackResponse.data;
