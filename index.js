@@ -13,101 +13,11 @@ import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
 import axios from "axios";
-import { remark } from "remark";
-import remarkGfm from "remark-gfm";
-import remarkRehype from "remark-rehype";
-import rehypeStringify from "rehype-stringify";
 import https from "https";
 import { load } from "cheerio";
-import deepPruneMarkdown from "./lib/deepPruneMarkdown.js";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
-import puppeteer from "puppeteer";
-
-// Function to process markdown content using remark for LLM optimization
-async function processMarkdownForLLM(markdownContent) {
-	try {
-		if (!markdownContent || typeof markdownContent !== "string") {
-			return markdownContent;
-		}
-
-		// Process markdown with remark plugins
-		const processedContent = await remark()
-			.use(remarkGfm)
-			.use(remarkRehype)
-			.use(rehypeStringify)
-			.process(markdownContent);
-
-		// Convert VFile to string and clean up for LLM consumption
-		const processedString = String(processedContent);
-
-		// Additional cleaning for LLM consumption
-		const cleanedContent = processedString
-			.replace(/\n{3,}/g, "\n\n") // Remove excessive newlines
-			.replace(/\s{2,}/g, " ") // Remove excessive whitespace
-			.trim();
-
-		// In-depth pruning for better LLM consumption
-		const prunedContent = await deepPruneMarkdown(cleanedContent);
-
-		return prunedContent;
-	} catch (error) {
-		console.warn(
-			"Warning: Failed to process markdown with remark:",
-			error.message
-		);
-		// Return original content if processing fails
-		return markdownContent;
-	}
-}
-
-// Function to check model cache status
-async function checkModelCache(modelsDirectory) {
-	try {
-		const fs = await import("fs/promises");
-
-		const modelFiles = await fs.readdir(modelsDirectory);
-		console.log("📁 Models in cache:", modelFiles);
-
-		if (modelFiles.length === 0) {
-			console.log(
-				"⚠️ No models found in cache. Models will be downloaded on first use."
-			);
-		} else {
-			console.log("✅ Models found in cache");
-		}
-	} catch (error) {
-		console.warn("⚠️ Could not check model cache:", error.message);
-	}
-}
-
-// Function to get AI answers using transformers pipeline
-async function getAIAnswer(question, context = "") {
-	try {
-		if (!generator) {
-			throw new Error("Transformers pipeline not initialized");
-		}
-
-		// Format the input for flan-t5 model (better for question-answering)
-		let input;
-		if (context) {
-			input = `Answer the following question based on the context:\n\nContext: ${context}\n\nQuestion: ${question}`;
-		} else {
-			input = `Answer the following question: ${question}`;
-		}
-
-		const output = await generator(input, {
-			max_new_tokens: 1000,
-			temperature: 0.7,
-			do_sample: true,
-			top_p: 0.9,
-		});
-
-		return output[0]?.generated_text || "No answer generated";
-	} catch (error) {
-		console.error("Error getting AI answer:", error.message);
-		return `Error: ${error.message}`;
-	}
-}
+import { pipeline } from "@xenova/transformers";
+import { htmlToMarkdownAST } from "dom-to-semantic-markdown";
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -1301,9 +1211,6 @@ Please provide a comprehensive itinerary following the structure specified in th
 	}
 });
 
-// find-latest-jobs run this using mutliple APIS from RAPID API
-// make system like if nothing working then try next API
-// another API is to take 50+ jobs websites and scrap each everyday once, use set to get unique jobs
 app.post("/find-latest-jobs", async (c) => {
 	const { query } = await c.req.json();
 	const urlEncodedQuery = encodeURIComponent(query);
@@ -2638,195 +2545,6 @@ app.post("/reddit-post-to-json", async (c) => {
 	}
 });
 
-// goverment website to register complain or individual contact to share complaints
-// Wikipedia URL validation utility
-async function checkWikipediaURL(url) {
-	try {
-		const res = await fetch(url, { method: "HEAD" });
-		return res.ok;
-	} catch {
-		return false;
-	}
-}
-
-// Wikipedia URL generation utility with 3 specific strategies
-function generateWikipediaURLs(cityName, stateName) {
-	const urls = [];
-
-	// Clean city name - replace spaces with underscores
-	const cleanCity = cityName.trim().replace(/\s+/g, "_");
-
-	// Clean state name - keep original spaces, don't add underscores
-	const cleanState = stateName ? stateName.trim() : "";
-
-	// Strategy 1: domain.com/wiki/city,_state (with original spaces in state)
-	if (cleanState) {
-		urls.push(`https://en.wikipedia.org/wiki/${cleanCity},_${cleanState}`);
-	}
-
-	// Strategy 2: domain.com/wiki/city,_state (with underscores in state)
-	if (cleanState) {
-		const cleanStateWithUnderscores = cleanState.replace(/\s+/g, "_");
-		urls.push(
-			`https://en.wikipedia.org/wiki/${cleanCity},_${cleanStateWithUnderscores}`
-		);
-	}
-
-	// Strategy 3: domain.com/wiki/city (city only, no state)
-	urls.push(`https://en.wikipedia.org/wiki/${cleanCity}`);
-
-	return urls;
-}
-
-// Wikipedia content extraction utility using existing scrap-url API
-async function extractWikipediaContent(wikipediaUrl, useProxy = false) {
-	try {
-		console.log(`🔍 Scraping Wikipedia content from: ${wikipediaUrl}`);
-
-		// Use the existing scrap-url API endpoint
-		const response = await fetch(`http://localhost:3001/scrap-url`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				url: wikipediaUrl,
-				useProxy: useProxy,
-				includeImages: false,
-				includeLinks: false,
-				extractMetadata: true,
-				timeout: 30000,
-				waitForSelector: "#mw-content-text",
-			}),
-		});
-
-		if (!response.ok) {
-			throw new Error(`HTTP error! status: ${response.status}`);
-		}
-
-		const scrapedData = await response.json();
-
-		if (!scrapedData.success) {
-			return {
-				success: false,
-				error: scrapedData.error || "Failed to scrape Wikipedia page",
-				url: wikipediaUrl,
-			};
-		}
-
-		// Extract paragraphs from semantic content
-		const paragraphs =
-			scrapedData.data?.content?.semanticContent?.paragraphs || [];
-
-		if (paragraphs.length === 0) {
-			return {
-				success: false,
-				error: "No paragraphs found in Wikipedia content",
-				url: wikipediaUrl,
-			};
-		}
-
-		return {
-			success: true,
-			data: {
-				title: scrapedData.data.title,
-				url: wikipediaUrl,
-				extractedAt: new Date().toISOString(),
-				paragraphs: paragraphs,
-				summary: paragraphs.slice(0, 3).join(" ").substring(0, 500) + "...",
-				rawData: scrapedData.data,
-			},
-			url: wikipediaUrl,
-		};
-	} catch (error) {
-		console.error(
-			`❌ Wikipedia content extraction error for ${wikipediaUrl}:`,
-			error
-		);
-		return {
-			success: false,
-			error: error.message,
-			url: wikipediaUrl,
-		};
-	}
-}
-
-// Bulk Wikipedia scraping with queue management
-const wikipediaScrapingQueue = {
-	batches: new Map(),
-	currentBatch: 0,
-	isProcessing: false,
-
-	addBatch(batchNumber, locations) {
-		this.batches.set(batchNumber, {
-			locations,
-			status: "pending",
-			startedAt: null,
-			completedAt: null,
-			results: [],
-			successCount: 0,
-			failedCount: 0,
-			errors: [],
-		});
-	},
-
-	getNextBatch() {
-		for (const [batchNumber, batch] of this.batches) {
-			if (batch.status === "pending") {
-				return { batchNumber, batch };
-			}
-		}
-		return null;
-	},
-
-	markBatchStarted(batchNumber) {
-		const batch = this.batches.get(batchNumber);
-		if (batch) {
-			batch.status = "processing";
-			batch.startedAt = new Date();
-		}
-	},
-
-	markBatchCompleted(batchNumber, results) {
-		const batch = this.batches.get(batchNumber);
-		if (batch) {
-			batch.status = "completed";
-			batch.completedAt = new Date();
-			batch.results = results;
-			batch.successCount = results.filter((r) => r.success).length;
-			batch.failedCount = results.filter((r) => !r.success).length;
-		}
-	},
-
-	getStats() {
-		const total = this.batches.size;
-		const pending = Array.from(this.batches.values()).filter(
-			(b) => b.status === "pending"
-		).length;
-		const processing = Array.from(this.batches.values()).filter(
-			(b) => b.status === "processing"
-		).length;
-		const completed = Array.from(this.batches.values()).filter(
-			(b) => b.status === "completed"
-		).length;
-
-		return {
-			total,
-			pending,
-			processing,
-			completed,
-			batches: Array.from(this.batches.entries()).map(([number, batch]) => ({
-				batchNumber: number,
-				status: batch.status,
-				startedAt: batch.startedAt,
-				completedAt: batch.completedAt,
-				successCount: batch.successCount,
-				failedCount: batch.failedCount,
-			})),
-		};
-	},
-};
-
 app.post("/bulk-airbnb-scrap", async (c) => {
 	try {
 		const {
@@ -3154,7 +2872,7 @@ function rewriteUrl(url) {
 	) {
 		const id = url.match(/\/presentation\/d\/([-\w]+)/)?.[1];
 		if (id) {
-			return `https://docs.google.com/presentation/d/${id}/export?format=pdf`;
+			return `https://docs.google.com/presentation/d/${id}/export?format=json`;
 		}
 	} else if (
 		url.startsWith("https://drive.google.com/file/d/") ||
@@ -5802,4 +5520,594 @@ app.post("/scrap-reddit", async (c) => {
 			500
 		);
 	}
+});
+
+// similar to scrap github redirect to this API
+
+app.post("/scrap-git", async (c) => {
+	const { url } = await c.req.json();
+	const newUrl = new URL(url);
+	if (!newUrl || newUrl.hostname !== "github.com") {
+		return c.json(
+			{
+				success: false,
+				error: "URL is required and must be a github URL",
+			},
+			400
+		);
+	}
+	try {
+		const response = await axios.get(newUrl.toString());
+
+		const $ = load(response.data);
+		const metadata = {
+			title: $("title").text().trim(),
+			description: $("meta[name='description']").attr("content"),
+			image: $("meta[name='image']").attr("content"),
+			author: $("meta[name='author']").attr("content"),
+			pubDate: $("meta[name='pubdate']").attr("content"),
+		};
+
+		const article = $("article");
+		const dom = new JSDOM(article.html());
+		const content = dom.window.document;
+		const { markdown } = extractSemanticContentWithFormattedMarkdown(content.body);
+		return c.json({
+			success: true,
+			data: {
+				url: url,
+				title: metadata.title,
+				content: content,
+				metadata: metadata,
+			},
+			markdown: markdown,
+		});
+	} catch (error) {
+		console.error("❌ Github scraper error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Internal server error",
+			},
+			500
+		);
+	}
+});
+
+const embedder = await pipeline(
+	"feature-extraction",
+	"Xenova/all-MiniLM-L6-v2"
+);
+
+// Function to calculate cosine similarity
+function cosineSimilarity(vecA, vecB) {
+	const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
+	const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
+	const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+	return dotProduct / (magnitudeA * magnitudeB);
+}
+
+async function createEmbeddingRecord(
+	markdownContent,
+	id,
+	metadata = {},
+	timestamp = new Date().toISOString()
+) {
+	// Get embedding with pooling and normalization for fixed-length vector
+	const embeddingResult = await embedder(markdownContent, {
+		pooling: "mean",
+		normalize: true,
+	});
+
+	// embeddingResult.data is Float32Array of vector values
+	const embeddingVector = Array.from(embeddingResult.data); // Convert to plain array for storage
+
+	// Store embedding record
+	return {
+		id,
+		content: markdownContent,
+		vector: embeddingVector,
+		metadata,
+		timestamp,
+	};
+}
+
+// Create an API endpoint (example shown with ExpressJS)
+app.post("/api/embed", async (c) => {
+	const { query, limit = 5 } = await c.req.json();
+	const markdown = `
+[Sitemap](/sitemap/sitemap.xml)[Open in app](https://rsci.app.link/?%24canonical_url=https%3A%2F%2Fmedium.com%2Fp%2F34f95510167c&%7Efeature=LoOpenInAppButton&%7Echannel=ShowPostUnderUser&%7Estage=mobileNavBar&source=post_page---top_nav_layout_nav-----------------------------------------)Sign up
+
+Sign in
+
+[Sign in](/m/signin?operation=login&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=post_page---top_nav_layout_nav-----------------------global_nav------------------)[Medium Logo](/?source=post_page---top_nav_layout_nav-----------------------------------------)[Write](/m/signin?operation=register&redirect=https%3A%2F%2Fmedium.com%2Fnew-story&source=---top_nav_layout_nav-----------------------new_post_topnav------------------)[](/search?source=post_page---top_nav_layout_nav-----------------------------------------)Sign up
+
+Sign in
+
+[Sign in](/m/signin?operation=login&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=post_page---top_nav_layout_nav-----------------------global_nav------------------)
+![](https://miro.medium.com/v2/resize:fill:64:64/1*dmbNkD5D-u45r44go_cf0g.png)
+
+# Your website doesn’t RANK #1 because you’re missing These 3 Pages
+
+**Your website doesn’t RANK #1 because you’re missing These 3 Pages**
+
+## Most businesses skip this step (don’t be one of them!)
+
+*Most businesses skip this step (don’t be one of them!)*[](/@afghankhanbitani?source=post_page---byline--34f95510167c---------------------------------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:64:64/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---byline--34f95510167c---------------------------------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2F34f95510167c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&user=Afghan+Bitani+%7C+Local+SEO+%2B+Web+Design+Agency&userId=cd1a89a0ae87&source=---header_actions--34f95510167c---------------------clap_footer------------------)331
+
+9
+
+[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F34f95510167c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=---header_actions--34f95510167c---------------------bookmark_footer------------------)[Listen](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2Fplans%3Fdimension%3Dpost_audio_button%26postId%3D34f95510167c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=---header_actions--34f95510167c---------------------post_audio_button------------------)Listen
+
+Share
+
+Most small business websites are missing the three exact pages that would get them on page 1 of Google.
+
+*three*And no, it’s not because your site isn’t “pretty enough” or you didn’t write a cool 1000-word homepage.
+
+It’s because Google’s looking for structure. You’re giving it a brochure. And Google doesn’t rank brochures.
+
+**structure**If you want your website (and your Google Business Profile) to climb the map pack, you need to build the right pages.
+
+**build the right pages.**So here’s what most people skip:
+
+![](https://miro.medium.com/v2/resize:fit:700/1*S8F1QpAhPao9oABu0AGJ9g.png)
+
+## 1. Location Pages
+
+(Because Google needs to know where you work)
+
+*(Because Google needs to know where you work)*You wouldn’t believe how many mobile massage therapists in London try to rank across the city… With a single homepage. Like, “Hi, we serve all 32 boroughs, please rank us in all of them, thanks.”
+
+That’s not how it works.
+
+Google ranks relevance + proximity. If you want to show up when someone searches “Swedish massage in Notting Hill,” you need a page about Notting Hill.
+
+**relevance + proximity***about*So here’s the fix:
+
+Make location-specific landing pages. Example:
+
+**location-specific landing pages**
+
+1. /swedish-massage-london
+
+
+2. /deep-tissue-massage-london
+
+3. /couples-massage-london
+
+
+Each page should talk about:
+
+1. The specific service
+
+
+2. The area (mention streets, parks, landmarks)
+
+3. Why you serve that area
+
+
+4. Maybe even a few local testimonials or Google reviews
+
+Massage example:
+
+**Massage example:**Let’s say you’re offering Thai massage at home. Instead of saying “We serve all of London,” write a page like:
+
+> “Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you’re just off Brick Lane or relaxing near Hoxton Square.”
+
+
+“Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you’re just off Brick Lane or relaxing near Hoxton Square.”
+
+*“Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you’re just off Brick Lane or relaxing near Hoxton Square.”*See how that sounds like you actually know the area?
+
+Google eats that up.
+
+Not a massage therapist?
+
+**Not a massage therapist?**Dentists can create pages like /emergency-dentist-wembleySecurity installers can create /home-alarm-installation-hackney
+
+Same rule applies for all service based businesses.
+
+## 2. Service Pages
+
+(Because people don’t just search “massage,” they search for exactly what they need)
+
+*(Because people don’t just search “massage,” they search for exactly what they need)*Let’s say you’re a mobile massage therapist in London, and you offer:
+
+1. Swedish massage
+
+
+2. Thai massage
+
+3. Sports massage
+
+
+4. Pregnancy massage
+
+5. Couples massage
+
+
+If you only have one Services page, you’re leaving rankings (and bookings) on the table.
+
+**one Services page**You need a dedicated page for each service.
+
+**dedicated page**Why?
+
+Because someone searching “pregnancy massage near me” is a totally different intent than someone looking for “sports injury massage.”
+
+Google knows that.
+
+And if your competitors do have those pages, they’ll outrank you.
+
+*do*So build out:
+
+1. /swedish-massage-london
+
+
+2. /thai-massage-at-home
+
+3. /pregnancy-massage-service
+
+
+4. /deep-tissue-mobile-massage
+
+Make each page speak directly to that client.
+
+## Get Afghan Bitani | Local SEO + Web Design Agency’s stories in your inbox
+
+Join Medium for free to get updates from this writer.
+
+For couples massage?
+
+**For couples massage?**Write about setting up candles and relaxing music at home, and how it’s perfect for anniversaries or staycations in places like Kensington or Camden.
+
+Compare that with… A security installer might have pages like:
+
+**Compare that with…**
+
+1. /cctv-installation-london
+
+
+2. /home-alarm-systems
+
+3. /smart-doorbell-installation
+
+
+A dentist might create:
+
+1. /teeth-whitening-london
+
+
+2. /wisdom-teeth-removal
+
+3. /braces-for-teens
+
+
+See the pattern?
+
+If Google can’t find a page about the exact thing someone is searching, you won’t show up.
+
+## 3. FAQ Pages
+
+(Because Google, and your customers, have questions)
+
+*(Because Google, and your customers, have questions)*You know what customers love? Clear answers.
+
+You know what Google loves? Content that answers specific search queries.
+
+**specific search queries**So if you’re not using an FAQ page (or better, mini FAQs on every service page), you’re missing an easy win.
+
+**mini FAQs on every service page**Mobile massage example:
+
+**Mobile massage example:**Here are just a few questions you could answer:
+
+1. “Do I need to provide towels or equipment?”
+
+
+2. “Can I book a same-day massage in London?”
+
+3. “What areas do you cover for couples massage?”
+
+
+4. “Is Thai massage painful?”
+
+5. “Can I get a pregnancy massage in my third trimester?”
+
+
+Each of these is a keyword in disguise. People Google these questions every day.
+
+**keyword in disguise**When you answer them clearly, in plain English, with helpful detail, you’re giving Google more reasons to rank your site.
+
+For other industries:
+
+**For other industries:**Dentists:
+
+**Dentists:**
+
+1. “How much does Invisalign cost?”
+
+
+2. “Does wisdom tooth removal hurt?”
+
+3. “Is teeth whitening safe?”
+
+
+Security installers:
+
+**Security installers:**
+
+1. “How long does CCTV installation take?”
+
+
+2. “What’s the best alarm system for a flat?”
+
+3. “Do you install cameras in commercial spaces?”
+
+
+If you can answer your clients’ questions before they ask, you instantly build trust, and boost your SEO at the same time.
+
+*before*
+
+## Let’s wrap this up:
+
+If you’ve got a great service but no leads coming from Google, it’s probably not your fault.
+
+It’s just that your site’s missing the three exact pages Google looks for:
+
+**three exact pages**
+
+1. Location pages → Tell Google where you work
+
+
+2. Service pages → Tell Google what you do
+
+3. FAQ pages → Tell Google you’re useful and relevant
+
+
+*where**what**useful and relevant*These aren’t just nice-to-haves, they’re what separate page 1 rankings from page 5 oblivion.
+
+Whether you’re a Roofer in London, a Plumber in Birmingham, or a Gardner in Manchester…
+
+Build these pages, write them like you mean it, and watch what happens.
+
+**Build these pages, write them like you mean it, and watch what happens.**Let your website do the heavy lifting, so you don’t have to.
+
+## Want Help Ranking?
+
+If you’re serious about ranking your website or Google Business Profile, we do this all day.
+
+**website or Google Business Profile**We’ve helped dozens of Local business owners get more leads and customers.
+
+> Email: Afghankhanbitani@gmail.com
+
+
+Email: Afghankhanbitani@gmail.com
+
+*Email: Afghankhanbitani@gmail.com*Let’s rank your business #1.
+
+[SEO](/tag/seo?source=post_page-----34f95510167c---------------------------------------)[Marketing](/tag/marketing?source=post_page-----34f95510167c---------------------------------------)[Business](/tag/business?source=post_page-----34f95510167c---------------------------------------)[Technology](/tag/technology?source=post_page-----34f95510167c---------------------------------------)[Local Seo](/tag/local-seo?source=post_page-----34f95510167c---------------------------------------)[](/@afghankhanbitani?source=post_page---post_author_info--34f95510167c---------------------------------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:96:96/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[](/@afghankhanbitani?source=post_page---post_author_info--34f95510167c---------------------------------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:128:128/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[Written by Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---post_author_info--34f95510167c---------------------------------------)
+
+## Written by Afghan Bitani | Local SEO + Web Design Agency
+
+[226 followers](/@afghankhanbitani/followers?source=post_page---post_author_info--34f95510167c---------------------------------------)[157 following](/@afghankhanbitani/following?source=post_page---post_author_info--34f95510167c---------------------------------------)We’ve helped 197+ local businesses rank #1 on Google Search & Google Maps with SEO. Now it’s your turn. 📧 afghankhanbitani@gmail.com 🔗 linktr.ee/afghanbitani
+
+## Responses (9)
+
+[](https://policy.medium.com/medium-rules-30e5502c4eb4?source=post_page---post_responses--34f95510167c---------------------------------------)
+![](https://miro.medium.com/v2/resize:fill:32:32/1*dmbNkD5D-u45r44go_cf0g.png)
+
+Write a response
+
+[What are your thoughts?](/m/signin?operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=---post_responses--34f95510167c---------------------respond_sidebar------------------)What are your thoughts?
+
+[](/@soumyasrivastavaa?source=post_page---post_responses--34f95510167c----0-----------------------------------)
+![Soumya Srivastava](https://miro.medium.com/v2/resize:fill:32:32/1*MzxSAEaz_FBA9gRsQmnqeA.jpeg)
+
+[Soumya Srivastava](/@soumyasrivastavaa?source=post_page---post_responses--34f95510167c----0-----------------------------------)Soumya Srivastava
+
+[Aug 7](/@soumyasrivastavaa/redirecting-attention-from-backlinks-or-speed-to-structural-gaps-like-not-having-a-dedicated-about-04295ac5c0c4?source=post_page---post_responses--34f95510167c----0-----------------------------------)Aug 7
+
+
+[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2F04295ac5c0c4&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40soumyasrivastavaa%2Fredirecting-attention-from-backlinks-or-speed-to-structural-gaps-like-not-having-a-dedicated-about-04295ac5c0c4&user=Soumya+Srivastava&userId=4d25c8a7e4b3&source=---post_responses--04295ac5c0c4----0-----------------respond_sidebar------------------)--
+
+Reply
+
+[](/@lisapats?source=post_page---post_responses--34f95510167c----1-----------------------------------)
+![Lisa Sicard](https://miro.medium.com/v2/resize:fill:32:32/1*NEKV0483PiGRp5u31VHtQg.jpeg)
+
+[Lisa Sicard](/@lisapats?source=post_page---post_responses--34f95510167c----1-----------------------------------)Lisa Sicard
+
+[Aug 19](https://lisapats.medium.com/thanks-i-had-started-an-faq-page-and-never-finished-it-this-article-motivates-me-now-ef0556a04301?source=post_page---post_responses--34f95510167c----1-----------------------------------)Aug 19
+
+
+[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2Fef0556a04301&operation=register&redirect=https%3A%2F%2Flisapats.medium.com%2Fthanks-i-had-started-an-faq-page-and-never-finished-it-this-article-motivates-me-now-ef0556a04301&user=Lisa+Sicard&userId=856a3ca110f&source=---post_responses--ef0556a04301----1-----------------respond_sidebar------------------)--
+
+1 reply
+
+Reply
+
+[](/@chinmaybhatk?source=post_page---post_responses--34f95510167c----2-----------------------------------)
+![Chinmay Bhat](https://miro.medium.com/v2/resize:fill:32:32/1*XTnuH2LTGY24KlFfTNSqcQ.png)
+
+[Chinmay Bhat](/@chinmaybhatk?source=post_page---post_responses--34f95510167c----2-----------------------------------)Chinmay Bhat
+
+[Aug 17](https://chinmaybhatk.medium.com/along-with-this-we-should-consider-geo-so-that-website-would-appear-as-suggestion-when-someone-141722961575?source=post_page---post_responses--34f95510167c----2-----------------------------------)Aug 17
+
+
+[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2F141722961575&operation=register&redirect=https%3A%2F%2Fchinmaybhatk.medium.com%2Falong-with-this-we-should-consider-geo-so-that-website-would-appear-as-suggestion-when-someone-141722961575&user=Chinmay+Bhat&userId=95fa394a3c2d&source=---post_responses--141722961575----2-----------------respond_sidebar------------------)--
+
+1 reply
+
+Reply
+
+## More from Afghan Bitani | Local SEO + Web Design Agency
+
+![How I Boosted My Website Traffic by 108% in Just 5 Minutes](https://miro.medium.com/v2/resize:fit:679/format:webp/0*cryeVkHxaVmlRFaa)
+
+[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----0---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----0---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
+
+[A response icon16](/@afghankhanbitani/how-i-boosted-my-website-traffic-by-108-in-just-5-minutes-d5c1c944942f?source=post_page---author_recirc--34f95510167c----0---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd5c1c944942f&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fhow-i-boosted-my-website-traffic-by-108-in-just-5-minutes-d5c1c944942f&source=---author_recirc--34f95510167c----0-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
+![Copy My Exact Blog Post Formula That Turns Readers Into Customers](https://miro.medium.com/v2/resize:fit:679/format:webp/1*wwUMFUalu3V1Vy13tOwauA.png)
+
+[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----1---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----1---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
+
+[A response icon5](/@afghankhanbitani/copy-my-exact-blog-post-formula-that-turns-readers-into-customers-cb1a65bb11ec?source=post_page---author_recirc--34f95510167c----1---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fcb1a65bb11ec&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fcopy-my-exact-blog-post-formula-that-turns-readers-into-customers-cb1a65bb11ec&source=---author_recirc--34f95510167c----1-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
+![9 Tips to Rank Your WEBSITE From Page 20 to Page 1 in One Month](https://miro.medium.com/v2/resize:fit:679/format:webp/1*Wnb36TWJwsaS7DK16MBWAQ.png)
+
+[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
+
+[A response icon1](/@afghankhanbitani/9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd18ed65a3cc8&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2F9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8&source=---author_recirc--34f95510167c----2-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
+![SEO vs AEO: What Most “Experts” Aren’t Telling You](https://miro.medium.com/v2/resize:fit:679/format:webp/0*xVLz-wzTpOg6rOhl)
+
+[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----3---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----3---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
+
+[A response icon4](/@afghankhanbitani/seo-vs-aeo-what-most-experts-arent-telling-you-7dd07dba91ea?source=post_page---author_recirc--34f95510167c----3---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F7dd07dba91ea&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fseo-vs-aeo-what-most-experts-arent-telling-you-7dd07dba91ea&source=---author_recirc--34f95510167c----3-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[See all from Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c---------------------------------------)
+
+## Recommended from Medium
+
+![12 High‑Selling Digital Products You Can Build with ChatGPT](https://miro.medium.com/v2/resize:fit:679/format:webp/1*AF61oVIEC6lUHDMJ1ldsKQ.png)
+
+[](https://medium.com/how-to-profit-ai?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
+![How To Profit AI](https://miro.medium.com/v2/resize:fill:20:20/1*MhopXz6GfyxYDCrmlBxymQ.png)
+
+In
+
+[How To Profit AI](https://medium.com/how-to-profit-ai?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)How To Profit AI
+
+by
+
+[Mohamed Bakry](/@mbakry?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Mohamed Bakry
+
+[A response icon81](/how-to-profit-ai/12-high-selling-digital-products-you-can-build-with-chatgpt-3905e8d315a5?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F3905e8d315a5&operation=register&redirect=https%3A%2F%2Fblog.howtoprofitai.com%2F12-high-selling-digital-products-you-can-build-with-chatgpt-3905e8d315a5&source=---read_next_recirc--34f95510167c----0-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
+![9 Tips to Rank Your WEBSITE From Page 20 to Page 1 in One Month](https://miro.medium.com/v2/resize:fit:679/format:webp/1*Wnb36TWJwsaS7DK16MBWAQ.png)
+
+[](/@afghankhanbitani?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
+![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
+
+[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Afghan Bitani | Local SEO + Web Design Agency
+
+[A response icon1](/@afghankhanbitani/9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd18ed65a3cc8&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2F9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8&source=---read_next_recirc--34f95510167c----1-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
+![Identifying the Hero in Your Brand Story (Hint: It’s Not You)](https://miro.medium.com/v2/resize:fit:679/format:webp/0*o4HkZSHuiXJxcVto)
+
+[](https://medium.com/strategic-content-marketing?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
+![Strategic Content Marketing](https://miro.medium.com/v2/resize:fill:20:20/1*1iPCCoU6fSd9A_juU1EGbw.png)
+
+In
+
+[Strategic Content Marketing](https://medium.com/strategic-content-marketing?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Strategic Content Marketing
+
+by
+
+[Dan Salva](/@dansalva?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Dan Salva
+
+[](/strategic-content-marketing/identifying-the-hero-in-your-brand-story-hint-its-not-you-6ae8797762b1?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F6ae8797762b1&operation=register&redirect=https%3A%2F%2Fmedium.com%2Fstrategic-content-marketing%2Fidentifying-the-hero-in-your-brand-story-hint-its-not-you-6ae8797762b1&source=---read_next_recirc--34f95510167c----0-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
+![14 SEO Steps I Recommend for Your New Website in 2025](https://miro.medium.com/v2/resize:fit:679/format:webp/0*_7fg4P8ahsR56JId)
+
+[](/@makarenko.roman121?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
+![Makarenko Roman](https://miro.medium.com/v2/resize:fill:20:20/1*Bg_8xtFL7Aab6NmiNiq59w.jpeg)
+
+[Makarenko Roman](/@makarenko.roman121?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Makarenko Roman
+
+[A response icon14](/@makarenko.roman121/14-seo-steps-i-recommend-for-your-new-website-in-2025-3cd3c1587c3a?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F3cd3c1587c3a&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40makarenko.roman121%2F14-seo-steps-i-recommend-for-your-new-website-in-2025-3cd3c1587c3a&source=---read_next_recirc--34f95510167c----1-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
+![An iPad is being used on a coffee shop](https://miro.medium.com/v2/resize:fit:679/format:webp/0*txJMGOWNUl2HvVoM)
+
+[](/@bberkerceylan?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
+![Berker Ceylan](https://miro.medium.com/v2/resize:fill:20:20/1*oTmUxbLgxXAxhPWNuPFZlw.jpeg)
+
+[Berker Ceylan](/@bberkerceylan?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Berker Ceylan
+
+[A response icon15](/@bberkerceylan/the-definitive-ipados-tips-tricks-list-d85f77c2ac1c?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd85f77c2ac1c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40bberkerceylan%2Fthe-definitive-ipados-tips-tricks-list-d85f77c2ac1c&source=---read_next_recirc--34f95510167c----2-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
+![The Ultra-Rich Know What’s Coming](https://miro.medium.com/v2/resize:fit:679/format:webp/1*qlgMEv4WryAx9oCNzfQ8WQ.jpeg)
+
+[](https://medium.com/the-investors-handbook?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
+![Investor’s Handbook](https://miro.medium.com/v2/resize:fill:20:20/1*u0wu5PnC9aa0840jj0t6Gw.png)
+
+In
+
+[Investor’s Handbook](https://medium.com/the-investors-handbook?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Investor’s Handbook
+
+by
+
+[Noel Johnson](/@johnsonanthonyservices?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Noel Johnson
+
+[A response icon137](/the-investors-handbook/the-ultra-rich-know-whats-coming-98ada61425f8?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F98ada61425f8&operation=register&redirect=https%3A%2F%2Fmedium.com%2Fthe-investors-handbook%2Fthe-ultra-rich-know-whats-coming-98ada61425f8&source=---read_next_recirc--34f95510167c----3-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)[See more recommendations](/?source=post_page---read_next_recirc--34f95510167c---------------------------------------)[Help](https://help.medium.com/hc/en-us?source=post_page-----34f95510167c---------------------------------------)Help
+
+[Status](https://medium.statuspage.io/?source=post_page-----34f95510167c---------------------------------------)Status
+
+[About](/about?autoplay=1&source=post_page-----34f95510167c---------------------------------------)About
+
+[Careers](/jobs-at-medium/work-at-medium-959d1a85284e?source=post_page-----34f95510167c---------------------------------------)Careers
+
+[Press](mailto:pressinquiries@medium.com)Press
+
+[Blog](https://blog.medium.com/?source=post_page-----34f95510167c---------------------------------------)Blog
+
+[Privacy](https://policy.medium.com/medium-privacy-policy-f03bf92035c9?source=post_page-----34f95510167c---------------------------------------)Privacy
+
+[Rules](https://policy.medium.com/medium-rules-30e5502c4eb4?source=post_page-----34f95510167c---------------------------------------)Rules
+
+[Terms](https://policy.medium.com/medium-terms-of-service-9db0094a1e0f?source=post_page-----34f95510167c---------------------------------------)Terms
+
+[Text to speech](https://speechify.com/medium?source=post_page-----34f95510167c---------------------------------------)Text to speech`;
+
+	if (!query) {
+		return c.json({ success: false, error: "Query is required" }, 400);
+	}
+
+	// Generate embedding for the search query
+	const markdownEmbedding = await createEmbeddingRecord(
+		markdown,
+		`unique_id_${Math.random() + Date.now()}`,
+		query
+	);
+	const markdownVector = Array.from(markdownEmbedding.vector);
+
+	const queryEmbeddingData = await embedder(query, {
+		pooling: "mean",
+		normalize: true,
+	});
+	const queryVector = Array.from(queryEmbeddingData.data);
+
+	let results = [];
+	const similarity = cosineSimilarity(queryVector, markdownVector);
+
+	results.push({
+		similarity,
+		content: markdownEmbedding.content,
+	});
+
+	// Sort by similarity (highest first) and limit results
+	results.sort((a, b) => b.similarity - a.similarity);
+	const topResults = results.slice(0, limit);
+
+	return c.json({
+		success: true,
+		query,
+		results: topResults,
+		matchedContent:
+			similarity > 0.7
+				? markdownEmbedding.content.slice(0, 500) + "..."
+				: "No significant match",
+	});
 });
