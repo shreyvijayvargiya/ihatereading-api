@@ -18,6 +18,7 @@ import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import { pipeline } from "@xenova/transformers";
 import { htmlToMarkdownAST } from "dom-to-semantic-markdown";
+import { logger } from "hono/logger";
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -645,6 +646,10 @@ const supabase = createClient(
 );
 
 const app = new Hono();
+export const customLogger = (message, ...rest) => {
+	console.log(message, ...rest);
+};
+app.use(logger(customLogger));
 
 // Add CORS middleware
 app.use(
@@ -1839,22 +1844,6 @@ app.post("/scrap-url", async (c) => {
 			}
 		);
 
-		// Add page info
-		scrapedData.pageInfo = {
-			url: url,
-			scrapedAt: new Date().toISOString(),
-			userAgent: userAgents.random().toString(),
-			viewport: await page.viewportSize(),
-			proxyInfo:
-				useProxy && context.proxyInfo
-					? {
-							host: context.proxyInfo.host,
-							port: context.proxyInfo.port,
-							country: context.proxyInfo.country,
-					  }
-					: null,
-		};
-
 		await page.close();
 		await context.close();
 
@@ -1866,85 +1855,11 @@ app.post("/scrap-url", async (c) => {
 			);
 		}
 
-		// const prompt = `
-		// We are providing you the JSON format scraped data from the URL ${url} given by the user. Understand the JSON prompt to
-		// answer the user question.
-		// Here is the JSON data:
-		// ${JSON.stringify(scrapedData)}
-		// Here is the user question:
-		// ${userQuestion}
-		// `;
-		// const response = genai.models.generateContent({
-		// 	model: "gemini-1.5-flash",
-		// 	prompt: "Extract the main content of the page",
-		// 	contents: [
-		// 		{
-		// 			role: "model",
-		// 			parts: [
-		// 				{
-		// 					text: prompt,
-		// 				},
-		// 			],
-		// 		},
-		// 	],
-		// });
-
-		// End performance monitoring
-		const endTime = performance.now();
-		const endCpuUsage = process.cpuUsage();
-		const endMemoryUsage = process.memoryUsage();
-
-		const performanceMetrics = {
-			duration: endTime - startTime,
-			cpuUsage: {
-				user: endCpuUsage.user - startCpuUsage.user,
-				system: endCpuUsage.system - startCpuUsage.system,
-				total:
-					endCpuUsage.user +
-					endCpuUsage.system -
-					(startCpuUsage.user + startCpuUsage.system),
-			},
-			memoryUsage: {
-				rss: endMemoryUsage.rss - startMemoryUsage.rss,
-				heapUsed: endMemoryUsage.heapUsed - startMemoryUsage.heapUsed,
-				heapTotal: endMemoryUsage.heapTotal - startMemoryUsage.heapTotal,
-			},
-			resourceBlocking: blockedResources,
-		};
-
-		// Log performance metrics
-		console.log(`📊 Scrap-URL Performance:`);
-		console.log(`   ⏱️ Duration: ${performanceMetrics.duration.toFixed(2)}ms`);
-		console.log(
-			`   💻 CPU: ${(performanceMetrics.cpuUsage.total / 1000000).toFixed(2)}s`
-		);
-		console.log(
-			`   🧠 Memory: ${(
-				performanceMetrics.memoryUsage.heapUsed /
-				1024 /
-				1024
-			).toFixed(2)} MB`
-		);
-		console.log(
-			`   🚫 Blocked: ${blockedResources.images} images, ${blockedResources.fonts} fonts, ${blockedResources.stylesheets} stylesheets, ${blockedResources.media} media`
-		);
-
 		return c.json({
 			success: true,
 			data: scrapedData,
-			//answer: (await response).candidates[0].content.parts[0].text,
 			url: url,
 			timestamp: new Date().toISOString(),
-			proxyUsed:
-				useProxy && context.proxyInfo
-					? {
-							host: context.proxyInfo.host,
-							port: context.proxyInfo.port,
-							country: context.proxyInfo.country,
-					  }
-					: null,
-			useProxy: useProxy, // Include the flag to show what was used
-			performance: performanceMetrics,
 		});
 	} catch (error) {
 		console.error("❌ Web scraping error:", error);
@@ -3141,6 +3056,7 @@ const dataExtractionFromHtml = (html, options) => {
 
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
+	customLogger("Scraping URL with Puppeteer", await c.req.header());
 	let {
 		url,
 		selectors = {}, // Custom selectors for specific elements
@@ -5551,11 +5467,248 @@ app.post("/scrap-git", async (c) => {
 		const article = $("article");
 		const dom = new JSDOM(article.html());
 		const content = dom.window.document;
-		const { markdown } = extractSemanticContentWithFormattedMarkdown(content.body);
+		const { markdown } = extractSemanticContentWithFormattedMarkdown(
+			content.body
+		);
 		return c.json({
 			success: true,
 			data: {
 				url: url,
+				title: metadata.title,
+				content: content,
+				metadata: metadata,
+			},
+			markdown: markdown,
+		});
+	} catch (error) {
+		console.error("❌ Github scraper error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Internal server error",
+			},
+			500
+		);
+	}
+});
+
+// new set
+// flat the entire links then use git
+const buildRepositoryStructure = async (repo, depth = 0) => {
+	console.log(
+		`${"  ".repeat(depth)}Building structure for ${repo.length} items`
+	);
+
+	// Safety check
+	if (!Array.isArray(repo)) {
+		console.log("Error: repo is not an array:", typeof repo, repo);
+		return [];
+	}
+
+	const structure = [];
+
+	for (const item of repo) {
+		try {
+			// Check if this is a directory (no file extension) or a file
+			const isDirectory = item.text && !item.text.split(".")[1];
+
+			console.log(
+				`${"  ".repeat(depth)}${isDirectory ? "📁" : "📄"} Processing: ${
+					item.text
+				}`
+			);
+
+			if (isDirectory) {
+				// This is a directory - fetch its contents and recurse
+				console.log(`${"  ".repeat(depth)}Going into directory: ${item.text}`);
+
+				const response = await axios.get(
+					"https://github.com" + item.href.toString()
+				);
+				const $ = load(response.data);
+
+				// Look for table with directory contents
+				const table = $("table");
+				if (table.length > 0) {
+					const dom = new JSDOM(table.html());
+					const content = dom.window.document;
+					const { content: tableSemanticContent } =
+						extractSemanticContentWithFormattedMarkdown(content.body);
+
+					// Recursively build structure for directory contents
+					if (
+						Array.isArray(tableSemanticContent) &&
+						tableSemanticContent.length > 0
+					) {
+						const children = await buildRepositoryStructure(
+							tableSemanticContent,
+							depth + 1
+						);
+
+						structure.push({
+							type: "directory",
+							name: item.text,
+							path: item.href,
+							children: children,
+						});
+
+						console.log(
+							`${"  ".repeat(depth)}✅ Directory ${item.text} has ${
+								children.length
+							} children`
+						);
+					} else {
+						// Empty directory
+						structure.push({
+							type: "directory",
+							name: item.text,
+							path: item.href,
+							children: [],
+						});
+					}
+				} else {
+					console.log(
+						`${"  ".repeat(depth)}❌ No table found in directory: ${item.text}`
+					);
+					// Directory without table - still add it but with empty children
+					structure.push({
+						type: "directory",
+						name: item.text,
+						path: item.href,
+						children: [],
+					});
+				}
+			} else {
+				// This is a file - extract its content
+				console.log(
+					`${"  ".repeat(depth)}Extracting content from file: ${item.text}`
+				);
+
+				const response = await axios.get(
+					"https://github.com" + item.href.toString()
+				);
+				const $ = load(response.data);
+				const article = $("article");
+
+				if (article.length > 0) {
+					const dom = new JSDOM(article.html());
+					const content = dom.window.document;
+					const { markdown } = extractSemanticContentWithFormattedMarkdown(
+						content.body
+					);
+
+					structure.push({
+						type: "file",
+						name: item.text,
+						path: item.href,
+						content: markdown,
+						contentLength: markdown.length,
+					});
+
+					console.log(
+						`${"  ".repeat(depth)}✅ Extracted ${
+							markdown.length
+						} characters from ${item.text}`
+					);
+				} else {
+					console.log(
+						`${"  ".repeat(depth)}❌ No article content found in file: ${
+							item.text
+						}`
+					);
+					// File without content - still add it but with empty content
+					structure.push({
+						type: "file",
+						name: item.text,
+						path: item.href,
+						content: "",
+						contentLength: 0,
+					});
+				}
+			}
+		} catch (error) {
+			console.error(
+				`${"  ".repeat(depth)}❌ Error processing ${item.text}:`,
+				error.message
+			);
+			// Add error entry to structure
+			structure.push({
+				type: "error",
+				name: item.text,
+				path: item.href,
+				error: error.message,
+			});
+		}
+	}
+
+	console.log(
+		`${"  ".repeat(depth)}Completed building structure. Found ${
+			structure.length
+		} items.`
+	);
+	return structure;
+};
+
+app.post("/git-json", async (c) => {
+	const { url } = await c.req.json();
+	const newUrl = new URL(url);
+	if (!newUrl || newUrl.hostname !== "github.com") {
+		return c.json(
+			{
+				success: false,
+				error: "URL is required and must be a github URL",
+			},
+			400
+		);
+	}
+	try {
+		const response = await axios.get(newUrl.toString());
+
+		const $ = load(response.data);
+		const metadata = {
+			title: $("title").text().trim(),
+			description: $("meta[name='description']").attr("content"),
+			image: $("meta[name='image']").attr("content"),
+			author: $("meta[name='author']").attr("content"),
+			pubDate: $("meta[name='pubdate']").attr("content"),
+		};
+		const table = $("table");
+		const tableDom = new JSDOM(table.html());
+		const tableContent = tableDom.window.document;
+		const { content: tableSemanticContent } =
+			extractSemanticContentWithFormattedMarkdown(tableContent.body);
+
+		const tableLinks = [];
+		const links = new Set();
+		for (const item of tableSemanticContent) {
+			if (
+				item.type === "link" &&
+				!links.has(item.href) &&
+				!item.href.split("/").includes("commits") &&
+				!item.href.split("/").includes("pulls") &&
+				!item.href.split("/").includes("issues")
+			) {
+				links.add(item.href);
+				tableLinks.push(item);
+			}
+		}
+		// Build the complete repository structure
+		const repoStructure = await buildRepositoryStructure(tableLinks);
+
+		const article = $("article");
+		const dom = new JSDOM(article.html());
+		const content = dom.window.document;
+
+		const { markdown } = extractSemanticContentWithFormattedMarkdown(
+			content.body
+		);
+
+		return c.json({
+			success: true,
+			data: {
+				url: url,
+				repoStructure: repoStructure,
+				tableSemanticContent: tableLinks,
 				title: metadata.title,
 				content: content,
 				metadata: metadata,

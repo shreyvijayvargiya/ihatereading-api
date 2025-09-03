@@ -1,0 +1,12 @@
+Screenshot API
+- [ ] allow URLs in param 
+- [ ] add network idle and timeout other selectors from param
+- [ ] allow compressed format for webp format
+- [ ] Build MCP server to use outside by LLMs
+- [ ] Add cropping feature
+- [ ] multiple formats for final image PNG, JPEG, GIF, 
+- [ ] Full page and scrolling
+- [ ] allow multiple screenshots for one webpage
+- [ ] increase FREE trial to 200 screenshots per month per user
+- [ ] Add queuin using upstash and redis to make it fast
+- [ ] use supabase as DB to store
