@@ -5585,13 +5585,14 @@ const buildRepositoryStructure = async (repo, depth = 0) => {
 				);
 
 				const response = await axios.get(
-					"https://github.com" + item.href.toString()
+					"https://github.com/" + item.href.toString()
 				);
 				const $ = load(response.data);
-				const article = $("article");
+				const article = $("textarea.react-blog-textarea").contents();
 
-				if (article.length > 0) {
-					const dom = new JSDOM(article.html());
+				const dom = new JSDOM($.html());
+
+				if (article.html().length > 0) {
 					const content = dom.window.document;
 					const { markdown } = extractSemanticContentWithFormattedMarkdown(
 						content.body
@@ -5780,13 +5781,13 @@ Sign in
 [Sign in](/m/signin?operation=login&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=post_page---top_nav_layout_nav-----------------------global_nav------------------)
 ![](https://miro.medium.com/v2/resize:fill:64:64/1*dmbNkD5D-u45r44go_cf0g.png)
 
-# Your website doesn’t RANK #1 because you’re missing These 3 Pages
+# Your website doesn't RANK #1 because you're missing These 3 Pages
 
-**Your website doesn’t RANK #1 because you’re missing These 3 Pages**
+**Your website doesn't RANK #1 because you're missing These 3 Pages**
 
-## Most businesses skip this step (don’t be one of them!)
+## Most businesses skip this step (don't be one of them!)
 
-*Most businesses skip this step (don’t be one of them!)*[](/@afghankhanbitani?source=post_page---byline--34f95510167c---------------------------------------)
+*Most businesses skip this step (don't be one of them!)*[](/@afghankhanbitani?source=post_page---byline--34f95510167c---------------------------------------)
 ![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:64:64/1*wGOKTooNLrc7wps8WuRweg.png)
 
 [Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---byline--34f95510167c---------------------------------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2F34f95510167c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&user=Afghan+Bitani+%7C+Local+SEO+%2B+Web+Design+Agency&userId=cd1a89a0ae87&source=---header_actions--34f95510167c---------------------clap_footer------------------)331
@@ -5799,13 +5800,13 @@ Share
 
 Most small business websites are missing the three exact pages that would get them on page 1 of Google.
 
-*three*And no, it’s not because your site isn’t “pretty enough” or you didn’t write a cool 1000-word homepage.
+*three*And no, it's not because your site isn't "pretty enough" or you didn't write a cool 1000-word homepage.
 
-It’s because Google’s looking for structure. You’re giving it a brochure. And Google doesn’t rank brochures.
+It's because Google's looking for structure. You're giving it a brochure. And Google doesn't rank brochures.
 
 **structure**If you want your website (and your Google Business Profile) to climb the map pack, you need to build the right pages.
 
-**build the right pages.**So here’s what most people skip:
+**build the right pages.**So here's what most people skip:
 
 ![](https://miro.medium.com/v2/resize:fit:700/1*S8F1QpAhPao9oABu0AGJ9g.png)
 
@@ -5813,13 +5814,13 @@ It’s because Google’s looking for structure. You’re giving it a brochure. 
 
 (Because Google needs to know where you work)
 
-*(Because Google needs to know where you work)*You wouldn’t believe how many mobile massage therapists in London try to rank across the city… With a single homepage. Like, “Hi, we serve all 32 boroughs, please rank us in all of them, thanks.”
+*(Because Google needs to know where you work)*You wouldn't believe how many mobile massage therapists in London try to rank across the city… With a single homepage. Like, "Hi, we serve all 32 boroughs, please rank us in all of them, thanks."
 
-That’s not how it works.
+That's not how it works.
 
-Google ranks relevance + proximity. If you want to show up when someone searches “Swedish massage in Notting Hill,” you need a page about Notting Hill.
+Google ranks relevance + proximity. If you want to show up when someone searches "Swedish massage in Notting Hill," you need a page about Notting Hill.
 
-**relevance + proximity***about*So here’s the fix:
+**relevance + proximity***about*So here's the fix:
 
 Make location-specific landing pages. Example:
 
@@ -5847,14 +5848,14 @@ Each page should talk about:
 
 Massage example:
 
-**Massage example:**Let’s say you’re offering Thai massage at home. Instead of saying “We serve all of London,” write a page like:
+**Massage example:**Let's say you're offering Thai massage at home. Instead of saying "We serve all of London," write a page like:
 
-> “Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you’re just off Brick Lane or relaxing near Hoxton Square.”
+> "Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you're just off Brick Lane or relaxing near Hoxton Square."
 
 
-“Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you’re just off Brick Lane or relaxing near Hoxton Square.”
+"Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you're just off Brick Lane or relaxing near Hoxton Square."
 
-*“Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you’re just off Brick Lane or relaxing near Hoxton Square.”*See how that sounds like you actually know the area?
+*Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you're just off Brick Lane or relaxing near Hoxton Square.*See how that sounds like you actually know the area?
 
 Google eats that up.
 
@@ -5866,9 +5867,9 @@ Same rule applies for all service based businesses.
 
 ## 2. Service Pages
 
-(Because people don’t just search “massage,” they search for exactly what they need)
+(Because people don't just search "massage," they search for exactly what they need)
 
-*(Because people don’t just search “massage,” they search for exactly what they need)*Let’s say you’re a mobile massage therapist in London, and you offer:
+*(Because people don't just search "massage," they search for exactly what they need)*Let's say you're a mobile massage therapist in London, and you offer:
 
 1. Swedish massage
 
@@ -5883,17 +5884,17 @@ Same rule applies for all service based businesses.
 5. Couples massage
 
 
-If you only have one Services page, you’re leaving rankings (and bookings) on the table.
+If you only have one Services page, you're leaving rankings (and bookings) on the table.
 
 **one Services page**You need a dedicated page for each service.
 
 **dedicated page**Why?
 
-Because someone searching “pregnancy massage near me” is a totally different intent than someone looking for “sports injury massage.”
+Because someone searching "pregnancy massage near me" is a totally different intent than someone looking for "sports injury massage."
 
 Google knows that.
 
-And if your competitors do have those pages, they’ll outrank you.
+And if your competitors do have those pages, they'll outrank you.
 
 *do*So build out:
 
@@ -5909,13 +5910,13 @@ And if your competitors do have those pages, they’ll outrank you.
 
 Make each page speak directly to that client.
 
-## Get Afghan Bitani | Local SEO + Web Design Agency’s stories in your inbox
+## Get Afghan Bitani | Local SEO + Web Design Agency's stories in your inbox
 
-Join Medium for free to get updates from this writer.
+Join Medium for free to get updates from this writer.
 
 For couples massage?
 
-**For couples massage?**Write about setting up candles and relaxing music at home, and how it’s perfect for anniversaries or staycations in places like Kensington or Camden.
+**For couples massage?**Write about setting up candles and relaxing music at home, and how it's perfect for anniversaries or staycations in places like Kensington or Camden.
 
 Compare that with… A security installer might have pages like:
 
@@ -5941,7 +5942,7 @@ A dentist might create:
 
 See the pattern?
 
-If Google can’t find a page about the exact thing someone is searching, you won’t show up.
+If Google can't find a page about the exact thing someone is searching, you won't show up.
 
 ## 3. FAQ Pages
 
@@ -5951,28 +5952,28 @@ If Google can’t find a page about the exact thing someone is searching, you wo
 
 You know what Google loves? Content that answers specific search queries.
 
-**specific search queries**So if you’re not using an FAQ page (or better, mini FAQs on every service page), you’re missing an easy win.
+**specific search queries**So if you're not using an FAQ page (or better, mini FAQs on every service page), you're missing an easy win.
 
 **mini FAQs on every service page**Mobile massage example:
 
 **Mobile massage example:**Here are just a few questions you could answer:
 
-1. “Do I need to provide towels or equipment?”
+1. "Do I need to provide towels or equipment?"
 
 
-2. “Can I book a same-day massage in London?”
+2. "Can I book a same-day massage in London?"
 
-3. “What areas do you cover for couples massage?”
+3. "What areas do you cover for couples massage?"
 
 
-4. “Is Thai massage painful?”
+4. "Is Thai massage painful?"
 
-5. “Can I get a pregnancy massage in my third trimester?”
+5. "Can I get a pregnancy massage in my third trimester?"
 
 
 Each of these is a keyword in disguise. People Google these questions every day.
 
-**keyword in disguise**When you answer them clearly, in plain English, with helpful detail, you’re giving Google more reasons to rank your site.
+**keyword in disguise**When you answer them clearly, in plain English, with helpful detail, you're giving Google more reasons to rank your site.
 
 For other industries:
 
@@ -5980,35 +5981,35 @@ For other industries:
 
 **Dentists:**
 
-1. “How much does Invisalign cost?”
+1. "How much does Invisalign cost?"
 
 
-2. “Does wisdom tooth removal hurt?”
+2. "Does wisdom tooth removal hurt?"
 
-3. “Is teeth whitening safe?”
+3. "Is teeth whitening safe?"
 
 
 Security installers:
 
 **Security installers:**
 
-1. “How long does CCTV installation take?”
+1. "How long does CCTV installation take?"
 
 
-2. “What’s the best alarm system for a flat?”
+2. "What's the best alarm system for a flat?"
 
-3. “Do you install cameras in commercial spaces?”
+3. "Do you install cameras in commercial spaces?"
 
 
-If you can answer your clients’ questions before they ask, you instantly build trust, and boost your SEO at the same time.
+If you can answer your clients' questions before they ask, you instantly build trust, and boost your SEO at the same time.
 
 *before*
 
-## Let’s wrap this up:
+## Let's wrap this up:
 
-If you’ve got a great service but no leads coming from Google, it’s probably not your fault.
+If you've got a great service but no leads coming from Google, it's probably not your fault.
 
-It’s just that your site’s missing the three exact pages Google looks for:
+It's just that your site's missing the three exact pages Google looks for:
 
 **three exact pages**
 
@@ -6017,29 +6018,29 @@ It’s just that your site’s missing the three exact pages Google looks for:
 
 2. Service pages → Tell Google what you do
 
-3. FAQ pages → Tell Google you’re useful and relevant
+3. FAQ pages → Tell Google you're useful and relevant
 
 
-*where**what**useful and relevant*These aren’t just nice-to-haves, they’re what separate page 1 rankings from page 5 oblivion.
+*where**what**useful and relevant*These aren't just nice-to-haves, they're what separate page 1 rankings from page 5 oblivion.
 
-Whether you’re a Roofer in London, a Plumber in Birmingham, or a Gardner in Manchester…
+Whether you're a Roofer in London, a Plumber in Birmingham, or a Gardner in Manchester…
 
 Build these pages, write them like you mean it, and watch what happens.
 
-**Build these pages, write them like you mean it, and watch what happens.**Let your website do the heavy lifting, so you don’t have to.
+**Build these pages, write them like you mean it, and watch what happens.**Let your website do the heavy lifting, so you don't have to.
 
 ## Want Help Ranking?
 
-If you’re serious about ranking your website or Google Business Profile, we do this all day.
+If you're serious about ranking your website or Google Business Profile, we do this all day.
 
-**website or Google Business Profile**We’ve helped dozens of Local business owners get more leads and customers.
+**website or Google Business Profile**We've helped dozens of Local business owners get more leads and customers.
 
 > Email: Afghankhanbitani@gmail.com
 
 
 Email: Afghankhanbitani@gmail.com
 
-*Email: Afghankhanbitani@gmail.com*Let’s rank your business #1.
+*Email: Afghankhanbitani@gmail.com*Let's rank your business #1.
 
 [SEO](/tag/seo?source=post_page-----34f95510167c---------------------------------------)[Marketing](/tag/marketing?source=post_page-----34f95510167c---------------------------------------)[Business](/tag/business?source=post_page-----34f95510167c---------------------------------------)[Technology](/tag/technology?source=post_page-----34f95510167c---------------------------------------)[Local Seo](/tag/local-seo?source=post_page-----34f95510167c---------------------------------------)[](/@afghankhanbitani?source=post_page---post_author_info--34f95510167c---------------------------------------)
 ![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:96:96/1*wGOKTooNLrc7wps8WuRweg.png)
@@ -6051,7 +6052,7 @@ Email: Afghankhanbitani@gmail.com
 
 ## Written by Afghan Bitani | Local SEO + Web Design Agency
 
-[226 followers](/@afghankhanbitani/followers?source=post_page---post_author_info--34f95510167c---------------------------------------)[157 following](/@afghankhanbitani/following?source=post_page---post_author_info--34f95510167c---------------------------------------)We’ve helped 197+ local businesses rank #1 on Google Search & Google Maps with SEO. Now it’s your turn. 📧 afghankhanbitani@gmail.com 🔗 linktr.ee/afghanbitani
+[226 followers](/@afghankhanbitani/followers?source=post_page---post_author_info--34f95510167c---------------------------------------)[157 following](/@afghankhanbitani/following?source=post_page---post_author_info--34f95510167c---------------------------------------)We've helped 197+ local businesses rank #1 on Google Search & Google Maps with SEO. Now it's your turn. 📧 afghankhanbitani@gmail.com 🔗 linktr.ee/afghanbitani
 
 ## Responses (9)
 
@@ -6128,7 +6129,7 @@ Reply
 [Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
 
 [A response icon1](/@afghankhanbitani/9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd18ed65a3cc8&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2F9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8&source=---author_recirc--34f95510167c----2-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![SEO vs AEO: What Most “Experts” Aren’t Telling You](https://miro.medium.com/v2/resize:fit:679/format:webp/0*xVLz-wzTpOg6rOhl)
+![SEO vs AEO: What Most "Experts" Aren't Telling You](https://miro.medium.com/v2/resize:fit:679/format:webp/0*xVLz-wzTpOg6rOhl)
 
 [](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----3---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
 ![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
@@ -6139,7 +6140,7 @@ Reply
 
 ## Recommended from Medium
 
-![12 High‑Selling Digital Products You Can Build with ChatGPT](https://miro.medium.com/v2/resize:fit:679/format:webp/1*AF61oVIEC6lUHDMJ1ldsKQ.png)
+![12 High-Selling Digital Products You Can Build with ChatGPT](https://miro.medium.com/v2/resize:fit:679/format:webp/1*AF61oVIEC6lUHDMJ1ldsKQ.png)
 
 [](https://medium.com/how-to-profit-ai?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
 ![How To Profit AI](https://miro.medium.com/v2/resize:fill:20:20/1*MhopXz6GfyxYDCrmlBxymQ.png)
@@ -6161,7 +6162,7 @@ by
 [Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Afghan Bitani | Local SEO + Web Design Agency
 
 [A response icon1](/@afghankhanbitani/9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd18ed65a3cc8&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2F9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8&source=---read_next_recirc--34f95510167c----1-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
-![Identifying the Hero in Your Brand Story (Hint: It’s Not You)](https://miro.medium.com/v2/resize:fit:679/format:webp/0*o4HkZSHuiXJxcVto)
+![Identifying the Hero in Your Brand Story (Hint: It's Not You)](https://miro.medium.com/v2/resize:fit:679/format:webp/0*o4HkZSHuiXJxcVto)
 
 [](https://medium.com/strategic-content-marketing?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
 ![Strategic Content Marketing](https://miro.medium.com/v2/resize:fill:20:20/1*1iPCCoU6fSd9A_juU1EGbw.png)
@@ -6191,14 +6192,14 @@ by
 [Berker Ceylan](/@bberkerceylan?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Berker Ceylan
 
 [A response icon15](/@bberkerceylan/the-definitive-ipados-tips-tricks-list-d85f77c2ac1c?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd85f77c2ac1c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40bberkerceylan%2Fthe-definitive-ipados-tips-tricks-list-d85f77c2ac1c&source=---read_next_recirc--34f95510167c----2-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
-![The Ultra-Rich Know What’s Coming](https://miro.medium.com/v2/resize:fit:679/format:webp/1*qlgMEv4WryAx9oCNzfQ8WQ.jpeg)
+![The Ultra-Rich Know What's Coming](https://miro.medium.com/v2/resize:fit:679/format:webp/1*qlgMEv4WryAx9oCNzfQ8WQ.jpeg)
 
 [](https://medium.com/the-investors-handbook?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
-![Investor’s Handbook](https://miro.medium.com/v2/resize:fill:20:20/1*u0wu5PnC9aa0840jj0t6Gw.png)
+![Investor's Handbook](https://miro.medium.com/v2/resize:fill:20:20/1*u0wu5PnC9aa0840jj0t6Gw.png)
 
 In
 
-[Investor’s Handbook](https://medium.com/the-investors-handbook?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Investor’s Handbook
+[Investor's Handbook](https://medium.com/the-investors-handbook?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Investor's Handbook
 
 by
 
@@ -6264,3 +6265,5 @@ by
 				: "No significant match",
 	});
 });
+
+export default app;
