@@ -5363,15 +5363,152 @@ app.post("/scrap-reddit", async (c) => {
 			jsonUrl = url.endsWith("/") ? url + ".json" : url + "/.json";
 		}
 
+		// Parse Reddit JSON and create LLM-friendly markdown
+		const parseRedditData = (data) => {
+			if (!data || !data.data || !data.data.children) {
+				return { markdown: "No Reddit data found", posts: [] };
+			}
+
+			const posts = [];
+			let markdown = `# Reddit Posts from ${url}\n\n`;
+
+			data.data.children.forEach((child, index) => {
+				if (child.kind === "t3" && child.data) {
+					const post = child.data;
+
+					// Extract key information
+					const postData = {
+						title: post.title || "No Title",
+						author: post.author || "Unknown",
+						subreddit: post.subreddit || "Unknown",
+						score: post.score || 0,
+						upvoteRatio: post.upvote_ratio || 0,
+						numComments: post.num_comments || 0,
+						created: new Date(post.created_utc * 1000).toISOString(),
+						permalink: post.permalink
+							? `https://reddit.com${post.permalink}`
+							: "",
+						url: post.url || "",
+						selftext: post.selftext || "",
+						linkFlairText: post.link_flair_text || "",
+						domain: post.domain || "",
+						isSelf: post.is_self || false,
+						stickied: post.stickied || false,
+						over18: post.over_18 || false,
+						spoiler: post.spoiler || false,
+						locked: post.locked || false,
+						archived: post.archived || false,
+						distinguished: post.distinguished || null,
+						gilded: post.gilded || 0,
+						totalAwards: post.total_awards_received || 0,
+					};
+
+					posts.push(postData);
+
+					// Create markdown section for this post
+					markdown += `## Post ${index + 1}: ${postData.title}\n\n`;
+
+					// Basic info
+					markdown += `**Author:** u/${postData.author}\n`;
+					markdown += `**Subreddit:** r/${postData.subreddit}\n`;
+					markdown += `**Score:** ${postData.score} (${Math.round(
+						postData.upvoteRatio * 100
+					)}% upvoted)\n`;
+					markdown += `**Comments:** ${postData.numComments}\n`;
+					markdown += `**Posted:** ${postData.created}\n`;
+
+					// Post status indicators
+					const status = [];
+					if (postData.stickied) status.push("📌 Pinned");
+					if (postData.locked) status.push("🔒 Locked");
+					if (postData.archived) status.push("📁 Archived");
+					if (postData.over18) status.push("🔞 NSFW");
+					if (postData.spoiler) status.push("⚠️ Spoiler");
+					if (postData.distinguished)
+						status.push(`👑 ${postData.distinguished}`);
+					if (postData.gilded > 0) status.push(`🏆 ${postData.gilded} gilded`);
+					if (postData.totalAwards > 0)
+						status.push(`🎖️ ${postData.totalAwards} awards`);
+
+					if (status.length > 0) {
+						markdown += `**Status:** ${status.join(", ")}\n`;
+					}
+
+					// Flair
+					if (postData.linkFlairText) {
+						markdown += `**Flair:** ${postData.linkFlairText}\n`;
+					}
+
+					// Content
+					if (postData.selftext) {
+						markdown += `\n**Content:**\n${postData.selftext}\n`;
+					}
+
+					// External link
+					if (!postData.isSelf && postData.url) {
+						markdown += `\n**External Link:** ${postData.url}\n`;
+					}
+
+					// Links
+					markdown += `\n**Reddit Link:** ${postData.permalink}\n`;
+
+					markdown += `\n---\n\n`;
+				}
+			});
+
+			// Add summary
+			markdown += `## Summary\n\n`;
+			markdown += `- **Total Posts:** ${posts.length}\n`;
+			markdown += `- **Subreddit:** r/${posts[0]?.subreddit || "Unknown"}\n`;
+			markdown += `- **Total Score:** ${posts.reduce(
+				(sum, post) => sum + post.score,
+				0
+			)}\n`;
+			markdown += `- **Total Comments:** ${posts.reduce(
+				(sum, post) => sum + post.numComments,
+				0
+			)}\n`;
+			markdown += `- **Average Score:** ${Math.round(
+				posts.reduce((sum, post) => sum + post.score, 0) / posts.length
+			)}\n`;
+			markdown += `- **Average Upvote Ratio:** ${Math.round(
+				(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) /
+					posts.length) *
+					100
+			)}%\n`;
+
+			return { markdown, posts };
+		};
+
 		try {
-			// Fetch Reddit JSON data
+			// Fetch Reddit JSON data with enhanced bot detection bypass
 			const response = await axios.get(jsonUrl, {
 				headers: {
 					"User-Agent":
-						"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-					Accept: "application/json",
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+					Accept: "application/json, text/plain, */*",
+					"Accept-Language": "en-US,en;q=0.9",
+					"Accept-Encoding": "gzip, deflate, br",
+					"Cache-Control": "no-cache",
+					Pragma: "no-cache",
+					"Sec-Ch-Ua":
+						'"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+					"Sec-Ch-Ua-Mobile": "?0",
+					"Sec-Ch-Ua-Platform": '"Windows"',
+					"Sec-Fetch-Dest": "empty",
+					"Sec-Fetch-Mode": "cors",
+					"Sec-Fetch-Site": "same-origin",
+					DNT: "1",
+					Connection: "keep-alive",
+					Referer: "https://www.reddit.com/",
+					Origin: "https://www.reddit.com",
+					"X-Requested-With": "XMLHttpRequest",
 				},
 				timeout: 30000,
+				maxRedirects: 5,
+				validateStatus: function (status) {
+					return status >= 200 && status < 300; // Only resolve for 2xx status codes
+				},
 			});
 
 			const redditData = response.data;
@@ -5547,124 +5684,6 @@ app.post("/scrap-reddit", async (c) => {
 			removeEmptyKeys(metadata);
 
 			redditMetadata = metadata.allMetaTags;
-			// Parse Reddit JSON and create LLM-friendly markdown
-			const parseRedditData = (data) => {
-				if (!data || !data.data || !data.data.children) {
-					return { markdown: "No Reddit data found", posts: [] };
-				}
-
-				const posts = [];
-				let markdown = `# Reddit Posts from ${url}\n\n`;
-
-				data.data.children.forEach((child, index) => {
-					if (child.kind === "t3" && child.data) {
-						const post = child.data;
-
-						// Extract key information
-						const postData = {
-							title: post.title || "No Title",
-							author: post.author || "Unknown",
-							subreddit: post.subreddit || "Unknown",
-							score: post.score || 0,
-							upvoteRatio: post.upvote_ratio || 0,
-							numComments: post.num_comments || 0,
-							created: new Date(post.created_utc * 1000).toISOString(),
-							permalink: post.permalink
-								? `https://reddit.com${post.permalink}`
-								: "",
-							url: post.url || "",
-							selftext: post.selftext || "",
-							linkFlairText: post.link_flair_text || "",
-							domain: post.domain || "",
-							isSelf: post.is_self || false,
-							stickied: post.stickied || false,
-							over18: post.over_18 || false,
-							spoiler: post.spoiler || false,
-							locked: post.locked || false,
-							archived: post.archived || false,
-							distinguished: post.distinguished || null,
-							gilded: post.gilded || 0,
-							totalAwards: post.total_awards_received || 0,
-						};
-
-						posts.push(postData);
-
-						// Create markdown section for this post
-						markdown += `## Post ${index + 1}: ${postData.title}\n\n`;
-
-						// Basic info
-						markdown += `**Author:** u/${postData.author}\n`;
-						markdown += `**Subreddit:** r/${postData.subreddit}\n`;
-						markdown += `**Score:** ${postData.score} (${Math.round(
-							postData.upvoteRatio * 100
-						)}% upvoted)\n`;
-						markdown += `**Comments:** ${postData.numComments}\n`;
-						markdown += `**Posted:** ${postData.created}\n`;
-
-						// Post status indicators
-						const status = [];
-						if (postData.stickied) status.push("📌 Pinned");
-						if (postData.locked) status.push("🔒 Locked");
-						if (postData.archived) status.push("📁 Archived");
-						if (postData.over18) status.push("🔞 NSFW");
-						if (postData.spoiler) status.push("⚠️ Spoiler");
-						if (postData.distinguished)
-							status.push(`👑 ${postData.distinguished}`);
-						if (postData.gilded > 0)
-							status.push(`🏆 ${postData.gilded} gilded`);
-						if (postData.totalAwards > 0)
-							status.push(`🎖️ ${postData.totalAwards} awards`);
-
-						if (status.length > 0) {
-							markdown += `**Status:** ${status.join(", ")}\n`;
-						}
-
-						// Flair
-						if (postData.linkFlairText) {
-							markdown += `**Flair:** ${postData.linkFlairText}\n`;
-						}
-
-						// Content
-						if (postData.selftext) {
-							markdown += `\n**Content:**\n${postData.selftext}\n`;
-						}
-
-						// External link
-						if (!postData.isSelf && postData.url) {
-							markdown += `\n**External Link:** ${postData.url}\n`;
-						}
-
-						// Links
-						markdown += `\n**Reddit Link:** ${postData.permalink}\n`;
-
-						markdown += `\n---\n\n`;
-					}
-				});
-
-				// Add summary
-				markdown += `## Summary\n\n`;
-				markdown += `- **Total Posts:** ${posts.length}\n`;
-				markdown += `- **Subreddit:** r/${posts[0]?.subreddit || "Unknown"}\n`;
-				markdown += `- **Total Score:** ${posts.reduce(
-					(sum, post) => sum + post.score,
-					0
-				)}\n`;
-				markdown += `- **Total Comments:** ${posts.reduce(
-					(sum, post) => sum + post.numComments,
-					0
-				)}\n`;
-				markdown += `- **Average Score:** ${Math.round(
-					posts.reduce((sum, post) => sum + post.score, 0) / posts.length
-				)}\n`;
-				markdown += `- **Average Upvote Ratio:** ${Math.round(
-					(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) /
-						posts.length) *
-						100
-				)}%\n`;
-
-				return { markdown, posts };
-			};
-
 			const { markdown, posts } = parseRedditData(redditData);
 
 			return c.json({
@@ -5679,6 +5698,69 @@ app.post("/scrap-reddit", async (c) => {
 			});
 		} catch (fetchError) {
 			console.error("❌ Error fetching Reddit JSON:", fetchError);
+
+			// If JSON API is blocked, try alternative approach
+			if (fetchError.response?.status === 403) {
+				try {
+					console.log("🔄 JSON API blocked, trying alternative approach...");
+
+					// Try with different user agent and simpler headers
+					const fallbackResponse = await axios.get(jsonUrl, {
+						headers: {
+							"User-Agent":
+								"Mozilla/5.0 (compatible; RedditBot/1.0; +https://www.reddit.com/robots.txt)",
+							Accept: "application/json",
+						},
+						timeout: 30000,
+					});
+
+					const redditData = fallbackResponse.data;
+					const { markdown, posts } = parseRedditData(redditData);
+
+					return c.json({
+						success: true,
+						url: url,
+						jsonUrl: jsonUrl,
+						markdown: markdown,
+						metadata: null, // No metadata due to fallback
+						posts: posts,
+						summary: {
+							totalPosts: posts.length,
+							subreddit: posts[0]?.subreddit || "Unknown",
+							totalScore: posts.reduce((sum, post) => sum + post.score, 0),
+							totalComments: posts.reduce(
+								(sum, post) => sum + post.numComments,
+								0
+							),
+							averageScore: Math.round(
+								posts.reduce((sum, post) => sum + post.score, 0) / posts.length
+							),
+							averageUpvoteRatio: Math.round(
+								(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) /
+									posts.length) *
+									100
+							),
+						},
+						rawData: redditData,
+						timestamp: new Date().toISOString(),
+						note: "Data fetched using fallback method due to bot detection",
+					});
+				} catch (fallbackError) {
+					console.error("❌ Fallback also failed:", fallbackError);
+
+					return c.json(
+						{
+							success: false,
+							error:
+								"Reddit API is currently blocking requests. Please try again later or use a different approach.",
+							details: `Primary error: ${fetchError.message}, Fallback error: ${fallbackError.message}`,
+							url: url,
+							status: "blocked",
+						},
+						503
+					);
+				}
+			}
 
 			return c.json(
 				{
