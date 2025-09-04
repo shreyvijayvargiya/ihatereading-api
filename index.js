@@ -19,6 +19,8 @@ import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemant
 import { pipeline } from "@xenova/transformers";
 import { htmlToMarkdownAST } from "dom-to-semantic-markdown";
 import { logger } from "hono/logger";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import puppeteer from "puppeteer-extra";
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -1395,6 +1397,7 @@ app.post("/google-search", async (c) => {
 			}),
 		});
 
+		console.log(encodeURIComponent(query));
 		// Use response.data directly - axios already handles UTF-8
 		const dom = new JSDOM(response.data, {
 			contentType: "text/html",
@@ -2890,9 +2893,8 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 	try {
 		// Import puppeteer-core and chromium
-		const puppeteer = await import("puppeteer-core");
 		const chromium = (await import("@sparticuz/chromium")).default;
-
+		puppeteer.use(StealthPlugin());
 		try {
 			const executablePath = await chromium.executablePath();
 
