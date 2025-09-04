@@ -41,6 +41,7 @@
 		"nodemon": "^3.1.10",
 		"ollama": "^0.5.17",
 		"onnxruntime-node": "^1.22.0-rev",
+		"parse-url": "^10.0.3",
 		"playwright": "^1.54.2",
 		"puppeteer": "^24.17.0",
 		"puppeteer-core": "^24.17.0",

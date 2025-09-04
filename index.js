@@ -18,7 +18,8 @@ import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import { pipeline } from "@xenova/transformers";
 import { logger } from "hono/logger";
-import toMarkdown from "./lib/toMarkdown.js";
+import parseUrl from "parse-url";
+
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
 	Math.floor(Math.random() * (max - min + 1)) + min;
@@ -1361,12 +1362,32 @@ app.post("/bing-search", async (c) => {
 	}
 });
 
+function cleanGoogleUrl(url) {
+	try {
+		// If url starts with "/url?", prepend a fake host to parse
+		if (url.startsWith("/url?")) {
+			url = "https://google.com" + url;
+		}
+		if (!url.includes("https://")) {
+			url = "https://" + url.hostname + url;
+		}
+		const parsedUrl = new URL(url);
+		const realUrl = parsedUrl.searchParams.get("q");
+		if (realUrl) {
+			return realUrl; // cleaned URL
+		}
+		return url; // return original if no 'q' param
+	} catch (e) {
+		return url; // fallback to original url if parsing fails
+	}
+}
+
 app.post("/google-search", async (c) => {
 	const {
 		query,
 		num = 10,
 		language = "en",
-		country = "us",
+		country = "in",
 	} = await c.req.json();
 
 	const results = [];
@@ -1394,7 +1415,6 @@ app.post("/google-search", async (c) => {
 			}),
 		});
 
-		console.log(encodeURIComponent(query));
 		// Use response.data directly - axios already handles UTF-8
 		const dom = new JSDOM(response.data, {
 			contentType: "text/html",
@@ -1420,40 +1440,24 @@ app.post("/google-search", async (c) => {
 					.trim()
 					.normalize("NFC");
 
-				// now we can scrap the link at the same time using cheerio
-
-				// const response = await axios.get(link, {
-				// 	headers: {
-				// 		"User-Agent": get_useragent(),
-				// 	},
-				// 	httpsAgent: new https.Agent({
-				// 		rejectUnauthorized: true,
-				// 	}),
-				// });
-				// const $ = load(response.data);
-				// const dom = new JSDOM(response.data);
-				// const content = dom.window.document.body;
-				// const { markdown: scrapedData } = extractSemanticContentWithFormattedMarkdown(content);
-
-				try {
+				if (link.startsWith("http") || link.startsWith("https")) {
 					results.push({
 						title,
 						description,
-						link,
-					});
-				} catch (e) {
-					console.error("Error scraping link:", e);
-					return results.push({
-						title,
-						description,
-						link,
+						link: cleanGoogleUrl(link),
 					});
 				}
 			}
 		}
+
+		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
+			document.body
+		);
+
 		return c.json({
 			query,
 			results,
+			markdown: markdown,
 		});
 	} catch (error) {
 		console.error("Google search error:", error);
@@ -2683,6 +2687,8 @@ const dataExtractionFromHtml = (html, options) => {
 			seenLinks.add(key);
 			return true;
 		});
+		const cleanedLinks = data.links.filter((link) => cleanGoogleUrl(link.href));
+		data.links = cleanedLinks;
 	}
 
 	if (options.includeSemanticContent) {
@@ -2802,7 +2808,11 @@ const dataExtractionFromHtml = (html, options) => {
 
 	return data;
 };
-
+console.log(
+	cleanGoogleUrl(
+		"/search?safe=active&sca_esv=7550878c098e0420&hl=en&gl=in&ie=UTF-8&q=delhi+to+manali+distance&sa=X&ved=2ahUKEwiO59zFpL-PAxXCXWwGHTDUBCYQ1QJ6BAgDEAg"
+	)
+);
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
 	customLogger("Scraping URL with Puppeteer", await c.req.header());
