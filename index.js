@@ -1367,7 +1367,7 @@ app.post("/google-search", async (c) => {
 		query,
 		num = 10,
 		language = "en",
-		country = "in",
+		country = "us",
 	} = await c.req.json();
 
 	const results = [];
@@ -1420,11 +1420,35 @@ app.post("/google-search", async (c) => {
 					.trim()
 					.normalize("NFC");
 
-				results.push({
-					title,
-					description,
-					link,
-				});
+				// now we can scrap the link at the same time using cheerio
+
+				// const response = await axios.get(link, {
+				// 	headers: {
+				// 		"User-Agent": get_useragent(),
+				// 	},
+				// 	httpsAgent: new https.Agent({
+				// 		rejectUnauthorized: true,
+				// 	}),
+				// });
+				// const $ = load(response.data);
+				// const dom = new JSDOM(response.data);
+				// const content = dom.window.document.body;
+				// const { markdown: scrapedData } = extractSemanticContentWithFormattedMarkdown(content);
+
+				try {
+					results.push({
+						title,
+						description,
+						link,
+					});
+				} catch (e) {
+					console.error("Error scraping link:", e);
+					return results.push({
+						title,
+						description,
+						link,
+					});
+				}
 			}
 		}
 		return c.json({
@@ -2460,281 +2484,6 @@ app.post("/reddit-post-to-json", async (c) => {
 	}
 });
 
-app.post("/bulk-airbnb-scrap", async (c) => {
-	try {
-		const {
-			batchSize = 50,
-			maxConcurrentBrowsers = 3,
-			useProxy = false,
-		} = await c.req.json();
-
-		// Fetch locations from Supabase
-		const { data: locations, error: fetchError } = await supabase
-			.from("locations")
-			.select("id, name, state")
-			.order("id", { ascending: false })
-			.limit(40);
-
-		if (fetchError) {
-			console.error("❌ Error fetching locations from Supabase:", fetchError);
-			return c.json(
-				{
-					success: false,
-					error: "Failed to fetch locations from database",
-					details: fetchError.message,
-				},
-				500
-			);
-		}
-
-		if (!locations || locations.length === 0) {
-			return c.json(
-				{
-					success: false,
-					error: "No locations found in database",
-					suggestion:
-						"Ensure the locations table has data before running Airbnb scraping",
-				},
-				404
-			);
-		}
-
-		// Create batches
-		const batches = [];
-		for (let i = 0; i < locations.length; i += batchSize) {
-			const batch = locations.slice(i, i + batchSize);
-			const batchNumber = batches.length;
-			batches.push({ batchNumber, locations: batch });
-
-			// Add to queue
-			airbnbScrapingQueue.addBatch(batchNumber, batch);
-		}
-
-		// Start processing in background
-		airbnbScrapingQueue.isProcessing = true;
-		processAirbnbBatches(batches, maxConcurrentBrowsers, useProxy);
-
-		return c.json({
-			success: true,
-			message: "Bulk Airbnb scraping started successfully",
-			data: {
-				totalLocations: locations.length,
-				batchSize,
-				totalBatches: batches.length,
-				maxConcurrentBrowsers,
-				useProxy,
-				queueStatus: airbnbScrapingQueue.getStats(),
-			},
-			endpoints: {
-				status: "/airbnb-scraping-status",
-				results: "/airbnb-scraping-results",
-			},
-		});
-	} catch (error) {
-		console.error("❌ Bulk Airbnb scraping error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to start bulk Airbnb scraping",
-				details: error.message,
-			},
-			500
-		);
-	}
-});
-
-// Background processing function
-async function processAirbnbBatches(batches, maxConcurrentBrowsers, useProxy) {
-	try {
-		// Process batches sequentially to avoid overwhelming Airbnb
-		for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-			const { batchNumber, locations } = batches[batchIndex];
-
-			// Mark batch as started
-			airbnbScrapingQueue.markBatchStarted(batchNumber);
-
-			// Process current batch
-			const batchResults = await processAirbnbBatch(
-				locations,
-				maxConcurrentBrowsers,
-				useProxy
-			);
-
-			console.log(`📊 Batch ${batchNumber} results:`, {
-				totalResults: batchResults.length,
-				successful: batchResults.filter((r) => r.success).length,
-				failed: batchResults.filter((r) => !r.success).length,
-				results: batchResults,
-			});
-
-			// Data is already stored in Supabase during chunk processing
-			// No need to call storeAirbnbResults again
-
-			// Mark batch as completed
-			airbnbScrapingQueue.markBatchCompleted(batchNumber, batchResults);
-
-			// Add delay between batches to be respectful to Airbnb
-			if (batchIndex < batches.length - 1) {
-				const delay = Math.min(10000, locations.length * 200); // Adaptive delay
-				console.log(`⏳ Waiting ${delay}ms before next batch...`);
-				await new Promise((resolve) => setTimeout(resolve, delay));
-			}
-		}
-
-		console.log("🎉 All Airbnb batches completed successfully!");
-		airbnbScrapingQueue.isProcessing = false;
-	} catch (error) {
-		console.error("❌ Error processing Airbnb batches:", error);
-		airbnbScrapingQueue.isProcessing = false;
-	}
-}
-
-// Process a single batch of locations
-async function processAirbnbBatch(locations, maxConcurrentBrowsers, useProxy) {
-	const results = [];
-
-	try {
-		// Process locations with controlled concurrency
-		const concurrencyLimit = Math.min(maxConcurrentBrowsers, 3); // Cap at 3 concurrent requests
-		const chunks = [];
-
-		// Split locations into chunks for controlled concurrency
-		for (let i = 0; i < locations.length; i += concurrencyLimit) {
-			chunks.push(locations.slice(i, i + concurrencyLimit));
-		}
-
-		// Process chunks sequentially to avoid overwhelming the API
-		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-			const chunk = chunks[chunkIndex];
-
-			// Process current chunk in parallel
-			const chunkPromises = chunk.map(async (location) => {
-				try {
-					// Call the existing scrap-airbnb endpoint logic
-					const searchQuery = `${location.name.replaceAll(
-						" ",
-						"-"
-					)}--${location.state.replaceAll(" ", "-")}`;
-					const airbnbUrl = `https://www.airbnb.com/s/${searchQuery}--India/homes`;
-
-					const response = await fetch(`http://localhost:3001/scrap-airbnb`, {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({
-							city: location.name,
-							state: location.state,
-						}),
-					});
-
-					if (!response.ok) {
-						throw new Error(`HTTP error! status: ${response.status}`);
-					}
-
-					const scrapData = await response.json();
-
-					return {
-						locationId: location.id,
-						locationName: location.name,
-						locationState: location.state,
-						success: true,
-						airbnbUrl: airbnbUrl,
-						listings: scrapData.listings,
-						totalListings: scrapData.listings.length,
-					};
-				} catch (error) {
-					console.warn(
-						`⚠️ Failed to scrape Airbnb for ${location.name}:`,
-						error.message
-					);
-					return {
-						locationId: location.id,
-						locationName: location.name,
-						locationState: location.state,
-						success: false,
-						error: error.message,
-					};
-				}
-			});
-
-			// Wait for current chunk to complete
-			const chunkResults = await Promise.all(chunkPromises);
-
-			// Store results directly to Supabase here
-			console.log(
-				`💾 Storing ${chunkResults.length} chunk results to Supabase...`
-			);
-			for (const result of chunkResults) {
-				if (
-					result.success &&
-					result.listings &&
-					Array.isArray(result.listings)
-				) {
-					try {
-						console.log(
-							`💾 Updating location ${result.locationId} with ${result.totalListings} listings...`
-						);
-
-						const { error } = await supabase
-							.from("locations")
-							.update({
-								airbnb_listings: result.listings,
-								airbnb_url: [result.airbnbUrl],
-							})
-							.eq("id", result.locationId);
-
-						if (error) {
-							console.error(
-								`❌ Failed to update location ${result.locationId}:`,
-								error
-							);
-						} else {
-							console.log(
-								`✅ Updated location ${result.locationId} with Airbnb listings (${result.totalListings} listings)`
-							);
-						}
-					} catch (dbError) {
-						console.error(
-							`❌ Database error for location ${result.locationId}:`,
-							dbError
-						);
-					}
-				} else {
-					console.log(
-						`⚠️ Skipping location ${result.locationId} - success: ${
-							result.success
-						}, hasListings: ${!!result.listings}`
-					);
-				}
-			}
-
-			results.push(...chunkResults);
-
-			// Add small delay between chunks to be respectful
-			if (chunkIndex < chunks.length - 1) {
-				const delay = 500; // 2 second delay between chunks
-				await new Promise((resolve) => setTimeout(resolve, delay));
-			}
-		}
-	} catch (error) {
-		console.error("❌ Error processing Airbnb batch:", error);
-	}
-
-	console.log(
-		`📊 Batch processing completed. Total results: ${results.length}`
-	);
-	console.log(
-		`📋 Results summary:`,
-		results.map((r) => ({
-			location: r.locationName,
-			success: r.success,
-			listings: r.totalListings || 0,
-			error: r.error || "none",
-		}))
-	);
-
-	return results;
-}
-
 const port = 3001;
 console.log(`Server is running on port ${port}`);
 
@@ -3322,10 +3071,19 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				return;
 			}
 
-			// Always block fonts and stylesheets for faster loading
-			if (["font", "stylesheet"].includes(resourceType)) {
-				if (resourceType === "font") blockedResources.fonts++;
-				if (resourceType === "stylesheet") blockedResources.stylesheets++;
+			// Always block fonts and handle stylesheets gracefully for faster loading
+			if (resourceType === "stylesheet") {
+				blockedResources.stylesheets++;
+				// Respond with empty CSS to avoid 'Could not parse CSS stylesheet' errors
+				request.respond({
+					status: 200,
+					contentType: "text/css",
+					body: "",
+				});
+				return;
+			}
+			if (resourceType === "font") {
+				blockedResources.fonts++;
 				request.abort();
 				return;
 			}
@@ -3354,67 +3112,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				console.warn(`Selector ${waitForSelector} not found within timeout`);
 			}
 		}
-
-		// Get page content and process with JSDOM
-		const pageHtml = await page.content();
-		const dom = new JSDOM(pageHtml);
-		const document = dom.window.document;
-
-		// Remove unwanted elements from JSDOM document
-		const selectorsToRemove = [
-			"header",
-			"footer",
-			"nav",
-			"aside",
-			".header",
-			".top",
-			".navbar",
-			"#header",
-			".footer",
-			".bottom",
-			"#footer",
-			".sidebar",
-			".side",
-			".aside",
-			"#sidebar",
-			".modal",
-			".popup",
-			"#modal",
-			".overlay",
-			".ad",
-			".ads",
-			".advert",
-			"#ad",
-			".lang-selector",
-			".language",
-			"#language-selector",
-			".social",
-			".social-media",
-			".social-links",
-			"#social",
-			".menu",
-			".navigation",
-			"#nav",
-			".breadcrumbs",
-			"#breadcrumbs",
-			".share",
-			"#share",
-			".widget",
-			"#widget",
-			".cookie",
-			"#cookie",
-			"script",
-			"style",
-			"noscript",
-		];
-
-		selectorsToRemove.forEach((sel) => {
-			document.querySelectorAll(sel).forEach((el) => el.remove());
-		});
-
-		const { markdown } = extractSemanticContentWithFormattedMarkdown(
-			document.body
-		);
 
 		// Extract page content
 		if (includeSemanticContent) {
@@ -3684,6 +3381,67 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				}
 			);
 		}
+
+		// Get page content and process with JSDOM
+		const pageHtml = await page.content();
+		const dom = new JSDOM(pageHtml);
+		const document = dom.window.document;
+
+		// Remove unwanted elements from JSDOM document
+		const selectorsToRemove = [
+			"header",
+			"footer",
+			"nav",
+			"aside",
+			".header",
+			".top",
+			".navbar",
+			"#header",
+			".footer",
+			".bottom",
+			"#footer",
+			".sidebar",
+			".side",
+			".aside",
+			"#sidebar",
+			".modal",
+			".popup",
+			"#modal",
+			".overlay",
+			".ad",
+			".ads",
+			".advert",
+			"#ad",
+			".lang-selector",
+			".language",
+			"#language-selector",
+			".social",
+			".social-media",
+			".social-links",
+			"#social",
+			".menu",
+			".navigation",
+			"#nav",
+			".breadcrumbs",
+			"#breadcrumbs",
+			".share",
+			"#share",
+			".widget",
+			"#widget",
+			".cookie",
+			"#cookie",
+			"script",
+			"style",
+			"noscript",
+		];
+
+		selectorsToRemove.forEach((sel) => {
+			document.querySelectorAll(sel).forEach((el) => el.remove());
+		});
+
+		const { markdown } = extractSemanticContentWithFormattedMarkdown(
+			document.body
+		);
 
 		await page.close();
 
