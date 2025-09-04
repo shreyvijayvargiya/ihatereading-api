@@ -17,11 +17,8 @@ import https from "https";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import { pipeline } from "@xenova/transformers";
-import { htmlToMarkdownAST } from "dom-to-semantic-markdown";
 import { logger } from "hono/logger";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import puppeteer from "puppeteer-extra";
-
+import toMarkdown from "./lib/toMarkdown.js";
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
 	Math.floor(Math.random() * (max - min + 1)) + min;
@@ -2892,9 +2889,12 @@ app.post("/scrap-url-puppeteer", async (c) => {
 	let scrapedData = {};
 
 	try {
-		// Import puppeteer-core and chromium
+		// Import puppeteer-core and chromiumimport StealthPlugin from "puppeteer-extra-plugin-stealth";
+		// const StealthPlugin = await import("puppeteer-extra-plugin-stealth");
+		// puppeteer.use(StealthPlugin);
+
+		const puppeteer = await import("puppeteer-core");
 		const chromium = (await import("@sparticuz/chromium")).default;
-		puppeteer.use(StealthPlugin());
 		try {
 			const executablePath = await chromium.executablePath();
 
