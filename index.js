@@ -13,12 +13,16 @@ import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
 import axios from "axios";
+import {
+	Agent as UndiciAgent,
+	ProxyAgent as UndiciProxyAgent,
+	fetch as undiciFetch,
+} from "undici";
 import https from "https";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
-import { pipeline } from "@xenova/transformers";
 import { logger } from "hono/logger";
-import parseUrl from "parse-url";
+import { env, pipeline as hgpipeline } from "@huggingface/transformers";
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -42,7 +46,7 @@ function get_useragent() {
 
 const ollama = new ChatOllama({
 	// model: "gemma:2b",
-	model: "deepseek-r1:1.5b ",
+	model: "granite3.3:2b",
 	baseURL: "http://localhost:11434",
 });
 
@@ -456,10 +460,17 @@ class ProxyManager {
 			return this.proxies[0];
 		}
 
-		// Sort by last used time and fail count
+		// Sort by fail count, then avgLatency, then last used time
 		const sortedProxies = availableProxies.sort((a, b) => {
 			if (a.failCount !== b.failCount) {
 				return a.failCount - b.failCount;
+			}
+			const aLatency =
+				typeof a.avgLatency === "number" ? a.avgLatency : Infinity;
+			const bLatency =
+				typeof b.avgLatency === "number" ? b.avgLatency : Infinity;
+			if (aLatency !== bLatency) {
+				return aLatency - bLatency;
 			}
 			return a.lastUsed - b.lastUsed;
 		});
@@ -475,6 +486,7 @@ class ProxyManager {
 		const proxy = this.proxies.find((p) => p.host === proxyHost);
 		if (proxy) {
 			proxy.failCount++;
+			proxy.lastFailureAt = Date.now();
 			if (proxy.failCount >= 3) {
 				proxy.isHealthy = false;
 				console.warn(
@@ -492,6 +504,36 @@ class ProxyManager {
 			if (proxy.failCount === 0) {
 				proxy.isHealthy = true;
 			}
+		}
+	}
+
+	// Record latency for a proxy to track performance
+	markProxyLatency(proxyHost, latencyMs) {
+		const proxy = this.proxies.find((p) => p.host === proxyHost);
+		if (!proxy) return;
+		if (typeof proxy.avgLatency !== "number") {
+			proxy.avgLatency = latencyMs;
+			proxy.totalRequests = 1;
+			proxy.successfulRequests = 0;
+			return;
+		}
+		// Exponential moving average for stability
+		const alpha = 0.3;
+		proxy.avgLatency = alpha * latencyMs + (1 - alpha) * proxy.avgLatency;
+		proxy.totalRequests = (proxy.totalRequests || 0) + 1;
+	}
+
+	// Record request outcome and latency
+	recordProxyResult(proxyHost, success, latencyMs) {
+		if (typeof latencyMs === "number") {
+			this.markProxyLatency(proxyHost, latencyMs);
+		}
+		if (success) {
+			this.markProxySuccess(proxyHost);
+			const proxy = this.proxies.find((p) => p.host === proxyHost);
+			if (proxy) proxy.successfulRequests = (proxy.successfulRequests || 0) + 1;
+		} else {
+			this.markProxyFailed(proxyHost);
 		}
 	}
 
@@ -650,6 +692,88 @@ export const customLogger = (message, ...rest) => {
 	console.log(message, ...rest);
 };
 app.use(logger(customLogger));
+
+// --- Anti-bot utilities: randomized headers/timing and session reuse ---
+import UserAgents from "user-agents";
+
+const sessionStore = new Map(); // key: domain, value: { cookies: [], updatedAt: number }
+
+const getDomainFromUrl = (rawUrl) => {
+	try {
+		const u = new URL(rawUrl);
+		return u.hostname;
+	} catch {
+		return null;
+	}
+};
+
+const randomDelay = async (minMs = 150, maxMs = 650) => {
+	const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+	return new Promise((resolve) => setTimeout(resolve, jitter));
+};
+
+const commonViewports = [
+	{ width: 1920, height: 1080 },
+	{ width: 1366, height: 768 },
+	{ width: 1536, height: 864 },
+	{ width: 1440, height: 900 },
+	{ width: 1280, height: 800 },
+];
+
+const pickRandomViewport = () =>
+	commonViewports[Math.floor(Math.random() * commonViewports.length)];
+
+const generateRandomHeaders = () => {
+	const acceptLanguages = [
+		"en-US,en;q=0.9",
+		"en-GB,en;q=0.9",
+		"en-CA,en;q=0.8",
+		"en-IN,en;q=0.8",
+		"en;q=0.9",
+	];
+	const ua = new UserAgents();
+	return {
+		userAgent: ua.random().toString(),
+		extraHTTPHeaders: {
+			Accept:
+				"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+			"Accept-Encoding": "gzip, deflate, br",
+			"Accept-Language":
+				acceptLanguages[Math.floor(Math.random() * acceptLanguages.length)],
+			"Cache-Control": "no-cache",
+			Pragma: "no-cache",
+			"Sec-Ch-Ua":
+				'"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+			"Sec-Ch-Ua-Mobile": "?0",
+			"Sec-Ch-Ua-Platform": '"macOS"',
+			"Sec-Fetch-Dest": "document",
+			"Sec-Fetch-Mode": "navigate",
+			"Sec-Fetch-Site": "none",
+			"Sec-Fetch-User": "?1",
+			"Upgrade-Insecure-Requests": "1",
+		},
+		viewport: pickRandomViewport(),
+	};
+};
+
+const getSessionCookies = (url) => {
+	const domain = getDomainFromUrl(url);
+	if (!domain) return [];
+	const entry = sessionStore.get(domain);
+	if (!entry) return [];
+	// TTL 1 hour
+	if (Date.now() - entry.updatedAt > 60 * 60 * 1000) {
+		sessionStore.delete(domain);
+		return [];
+	}
+	return entry.cookies || [];
+};
+
+const saveSessionCookies = (url, cookies) => {
+	const domain = getDomainFromUrl(url);
+	if (!domain) return;
+	sessionStore.set(domain, { cookies, updatedAt: Date.now() });
+};
 
 // Add CORS middleware
 app.use(
@@ -1188,11 +1312,19 @@ ${prompt}
 Please provide a comprehensive itinerary following the structure specified in the system prompt.`;
 
 		const initialItineraryResult = await genai.models.generateContent({
-			model: "gemini-2.5-flash-lite",
+			model: "gemini-1.5-flash",
 			contents: [
 				{ role: "model", parts: [{ text: generateItineraryPrompt(prompt) }] },
 				{ role: "user", parts: [{ text: userPrompt }] },
 			],
+			config: {
+				tools: [
+					{
+						googleSearch: true,
+						googleSearchRetrieval: true,
+					},
+				],
+			},
 		});
 
 		const itinerary =
@@ -1247,13 +1379,15 @@ app.post("/find-latest-jobs", async (c) => {
 	});
 });
 
+// reading markdown using machine learning models to extract data using
+
 // Enhanced Bing Search endpoint using Axios
 app.post("/bing-search", async (c) => {
 	const {
 		query,
 		num = 10,
 		language = "en",
-		country = "us",
+		country = "in",
 		timeout = 10000,
 	} = await c.req.json();
 
@@ -1277,19 +1411,16 @@ app.post("/bing-search", async (c) => {
 				"Upgrade-Insecure-Requests": "1",
 			},
 			params: {
-				q: query,
+				q: encodeURIComponent(query),
 				first: 1, // Start position (Bing uses 'first' instead of 'start')
 				count: Math.min(num, 10), // Bing's count parameter, max 10 per page
-				setlang: language,
+				ln: language,
 				cc: country.toUpperCase(),
-				safesearch: "moderate",
-				format: "rss", // Request RSS format for better parsing
-				ensearch: 0, // English search
 			},
 			timeout: timeout,
-			httpsAgent: new https.Agent({
-				rejectUnauthorized: true,
-			}),
+			// httpsAgent: new https.Agent({
+			// 	rejectUnauthorized: true,
+			// }),
 		});
 
 		// Use response.data directly - axios already handles UTF-8
@@ -1297,7 +1428,7 @@ app.post("/bing-search", async (c) => {
 		const document = dom.window.document;
 
 		// Get Bing search results using correct selectors
-		const result_block = document.querySelectorAll(".b_algo, .b_results li");
+		const result_block = document.querySelectorAll("li.b_algo,");
 
 		for (const result of result_block) {
 			// Try multiple title selectors for Bing
@@ -2808,11 +2939,7 @@ const dataExtractionFromHtml = (html, options) => {
 
 	return data;
 };
-console.log(
-	cleanGoogleUrl(
-		"/search?safe=active&sca_esv=7550878c098e0420&hl=en&gl=in&ie=UTF-8&q=delhi+to+manali+distance&sa=X&ved=2ahUKEwiO59zFpL-PAxXCXWwGHTDUBCYQ1QJ6BAgDEAg"
-	)
-);
+
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
 	customLogger("Scraping URL with Puppeteer", await c.req.header());
@@ -2899,606 +3026,678 @@ app.post("/scrap-url-puppeteer", async (c) => {
 	let scrapedData = {};
 
 	try {
-		// Import puppeteer-core and chromiumimport StealthPlugin from "puppeteer-extra-plugin-stealth";
-		// const StealthPlugin = await import("puppeteer-extra-plugin-stealth");
-		// puppeteer.use(StealthPlugin);
-
-		const puppeteer = await import("puppeteer-core");
+		const puppeteerExtra = (await import("puppeteer-extra")).default;
+		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
+			.default;
+		puppeteerExtra.use(StealthPlugin());
 		const chromium = (await import("@sparticuz/chromium")).default;
-		try {
-			const executablePath = await chromium.executablePath();
 
-			browser = await puppeteer.launch({
-				headless: true,
-				args: chromium.args,
-				executablePath: executablePath,
-				ignoreDefaultArgs: ["--disable-extensions"],
-			});
-		} catch (chromiumError) {
-			// Fallback: try to use system Chrome or let puppeteer find a browser
-			browser = await puppeteer.launch({
-				headless: true,
-				executablePath:
-					"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-				args: [
-					"--no-sandbox",
-					"--disable-setuid-sandbox",
-					"--disable-dev-shm-usage",
-					"--disable-gpu",
-					"--disable-web-security",
-				],
-			});
-		}
+		const maxAttempts = useProxy ? 3 : 1;
 
-		const page = await browser.newPage();
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			let selectedProxy = null;
+			let launchArgs = [...chromium.args, "--disable-web-security"];
+			const { userAgent, extraHTTPHeaders, viewport } = generateRandomHeaders();
 
-		// Set viewport and user agent
-		await page.setViewport({ width: 1920, height: 1080 });
-		await page.setUserAgent(
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-		);
-
-		// Set additional headers to avoid bot detection
-		await page.setExtraHTTPHeaders({
-			Accept:
-				"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-			"Accept-Encoding": "gzip, deflate, br",
-			"Accept-Language": "en-US,en;q=0.9",
-			"Cache-Control": "no-cache",
-			Pragma: "no-cache",
-			"Sec-Ch-Ua":
-				'"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-			"Sec-Ch-Ua-Mobile": "?0",
-			"Sec-Ch-Ua-Platform": '"macOS"',
-			"Sec-Fetch-Dest": "document",
-			"Sec-Fetch-Mode": "navigate",
-			"Sec-Fetch-Site": "none",
-			"Sec-Fetch-User": "?1",
-			"Upgrade-Insecure-Requests": "1",
-		});
-
-		// Set extra headers
-		if (useProxy) {
-			// If using proxy, set up proxy credentials and server
-			const proxy = proxyManager.getNextProxy();
-			await page.authenticate({
-				username: proxy.username,
-				password: proxy.password,
-			});
-		}
-
-		// Enable JavaScript and set additional properties to avoid detection
-		await page.evaluateOnNewDocument(() => {
-			// Override webdriver property
-			Object.defineProperty(navigator, "webdriver", {
-				get: () => undefined,
-			});
-
-			// Override plugins
-			Object.defineProperty(navigator, "plugins", {
-				get: () => [1, 2, 3, 4, 5],
-			});
-
-			// Override languages
-			Object.defineProperty(navigator, "languages", {
-				get: () => ["en-US", "en"],
-			});
-
-			// Override permissions
-			const originalQuery = window.navigator.permissions.query;
-			window.navigator.permissions.query = (parameters) =>
-				parameters.name === "notifications"
-					? Promise.resolve({ state: Notification.permission })
-					: originalQuery(parameters);
-		});
-
-		// Enhanced resource blocking for faster loading
-		let blockedResources = { images: 0, fonts: 0, stylesheets: 0, media: 0 };
-
-		// Set request interception
-		await page.setRequestInterception(true);
-		page.on("request", (request) => {
-			const resourceType = request.resourceType();
-			const url = request.url().toLowerCase();
-
-			// Block Vercel security checkpoints and bot detection
-			if (
-				url.includes("vercel") &&
-				(url.includes("security") || url.includes("checkpoint"))
-			) {
-				request.abort();
-				return;
-			}
-
-			// Block Cloudflare and other bot detection services
-			if (
-				url.includes("cloudflare") ||
-				url.includes("bot-detection") ||
-				url.includes("challenge")
-			) {
-				request.abort();
-				return;
-			}
-
-			// Enhanced resource blocking when includeImages is false
-
-			// Block all image-related resources
-			if (resourceType === "image") {
-				blockedResources.images++;
-				request.abort();
-				return;
-			}
-
-			// Block image URLs by file extension
-			const imageExtensions = [
-				".jpg",
-				".jpeg",
-				".png",
-				".gif",
-				".bmp",
-				".webp",
-				".svg",
-				".ico",
-				".tiff",
-				".tif",
-				".heic",
-				".heif",
-				".avif",
-			];
-			const hasImageExtension = imageExtensions.some((ext) =>
-				url.includes(ext)
-			);
-			if (hasImageExtension) {
-				blockedResources.images++;
-				request.abort();
-				return;
-			}
-
-			// Block common image CDN and hosting services
-			const imageServices = [
-				"cdn",
-				"images",
-				"img",
-				"photo",
-				"pic",
-				"media",
-				"assets",
-			];
-			const hasImageService = imageServices.some((service) =>
-				url.includes(service)
-			);
-			if (
-				hasImageService &&
-				(url.includes(".jpg") || url.includes(".png") || url.includes(".gif"))
-			) {
-				blockedResources.images++;
-				request.abort();
-				return;
-			}
-
-			// Block data URLs (base64 encoded images)
-			if (url.startsWith("data:image/")) {
-				blockedResources.images++;
-				request.abort();
-				return;
-			}
-
-			// Always block fonts and handle stylesheets gracefully for faster loading
-			if (resourceType === "stylesheet") {
-				blockedResources.stylesheets++;
-				// Respond with empty CSS to avoid 'Could not parse CSS stylesheet' errors
-				request.respond({
-					status: 200,
-					contentType: "text/css",
-					body: "",
-				});
-				return;
-			}
-			if (resourceType === "font") {
-				blockedResources.fonts++;
-				request.abort();
-				return;
-			}
-
-			// Block media files (videos, audio) for faster loading
-			if (["media"].includes(resourceType)) {
-				blockedResources.media++;
-				request.abort();
-				return;
-			}
-
-			request.continue();
-		});
-
-		// Navigate to URL
-		await page.goto(url, {
-			waitUntil: "domcontentloaded",
-			timeout: timeout,
-		});
-
-		// Wait for specific selector if provided
-		if (waitForSelector) {
 			try {
-				await page.waitForSelector(waitForSelector, { timeout: 10000 });
-			} catch (error) {
-				console.warn(`Selector ${waitForSelector} not found within timeout`);
-			}
-		}
+				if (useProxy) {
+					selectedProxy = proxyManager.getNextProxy();
+					launchArgs.push(
+						`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+					);
+				}
 
-		// Extract page content
-		if (includeSemanticContent) {
-			scrapedData = await page.evaluate(
-				async (options, preProcessedContent) => {
-					const data = {
-						url: window.location.href,
-						title: document.title,
-						content: {},
-						metadata: {},
-						links: [],
-						images: [],
-						screenshot: null,
-						orderedContent: preProcessedContent, // Use the pre-processed content
-					};
+				try {
+					const executablePath = await chromium.executablePath();
+					browser = await puppeteerExtra.launch({
+						headless: true,
+						args: launchArgs,
+						executablePath: executablePath,
+						ignoreDefaultArgs: ["--disable-extensions"],
+					});
+				} catch (chromiumError) {
+					// Fallback to system Chrome
+					browser = await puppeteerExtra.launch({
+						headless: true,
+						executablePath:
+							"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+						args: [
+							"--no-sandbox",
+							"--disable-setuid-sandbox",
+							"--disable-dev-shm-usage",
+							"--disable-gpu",
+							"--disable-web-security",
+							...(useProxy && selectedProxy
+								? [
+										`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+								  ]
+								: []),
+						],
+					});
+				}
 
-					const selectorsToRemove = [
-						"header",
-						"footer",
-						"nav",
-						"aside",
-						".header",
-						".top",
-						".navbar",
-						"#header",
-						".footer",
-						".bottom",
-						"#footer",
-						".sidebar",
-						".side",
-						".aside",
-						"#sidebar",
-						".modal",
-						".popup",
-						"#modal",
-						".overlay",
-						".ad",
-						".ads",
-						".advert",
-						"#ad",
-						".lang-selector",
-						".language",
-						"#language-selector",
-						".social",
-						".social-media",
-						".social-links",
-						"#social",
-						".menu",
-						".navigation",
-						"#nav",
-						".breadcrumbs",
-						"#breadcrumbs",
-						".share",
-						"#share",
-						".widget",
-						"#widget",
-						".cookie",
-						"#cookie",
-						"script",
-						"style",
-						"noscript",
+				const page = await browser.newPage();
+
+				// Apply randomized profile
+				await page.setViewport(viewport);
+				await page.setUserAgent(userAgent);
+				await page.setExtraHTTPHeaders(extraHTTPHeaders);
+
+				// Per-request proxy auth
+				if (useProxy && selectedProxy?.username) {
+					await page.authenticate({
+						username: selectedProxy.username,
+						password: selectedProxy.password,
+					});
+				}
+
+				// Subtle evasions beyond stealth
+				await page.evaluateOnNewDocument(() => {
+					Object.defineProperty(navigator, "webdriver", {
+						get: () => undefined,
+					});
+					Object.defineProperty(navigator, "plugins", {
+						get: () => [1, 2, 3, 4, 5],
+					});
+					Object.defineProperty(navigator, "languages", {
+						get: () => ["en-US", "en"],
+					});
+					const originalQuery = window.navigator.permissions.query;
+					window.navigator.permissions.query = (parameters) =>
+						parameters.name === "notifications"
+							? Promise.resolve({ state: Notification.permission })
+							: originalQuery(parameters);
+				});
+
+				// Enhanced resource blocking for faster loading
+				let blockedResources = {
+					images: 0,
+					fonts: 0,
+					stylesheets: 0,
+					media: 0,
+				};
+
+				// Set request interception
+				await page.setRequestInterception(true);
+				page.on("request", (request) => {
+					const resourceType = request.resourceType();
+					const url = request.url().toLowerCase();
+
+					// Block Vercel security checkpoints and bot detection
+					if (
+						url.includes("vercel") &&
+						(url.includes("security") || url.includes("checkpoint"))
+					) {
+						request.abort();
+						return;
+					}
+
+					// Block Cloudflare and other bot detection services
+					if (
+						url.includes("cloudflare") ||
+						url.includes("bot-detection") ||
+						url.includes("challenge")
+					) {
+						request.abort();
+						return;
+					}
+
+					// Enhanced resource blocking when includeImages is false
+
+					// Block all image-related resources
+					if (resourceType === "image") {
+						blockedResources.images++;
+						request.abort();
+						return;
+					}
+
+					// Block image URLs by file extension
+					const imageExtensions = [
+						".jpg",
+						".jpeg",
+						".png",
+						".gif",
+						".bmp",
+						".webp",
+						".svg",
+						".ico",
+						".tiff",
+						".tif",
+						".heic",
+						".heif",
+						".avif",
 					];
-
-					selectorsToRemove.forEach((sel) => {
-						document.querySelectorAll(sel).forEach((el) => el.remove());
-					});
-
-					[("h1", "h2", "h3", "h4", "h5", "h6")].forEach((tag) => {
-						data.content[tag] = Array.from(document.querySelectorAll(tag)).map(
-							(h) => h.textContent.trim()
-						);
-					});
-
-					// Extract metadata
-					if (options.extractMetadata) {
-						// Meta tags
-						const metaTags = document.querySelectorAll("meta");
-						metaTags.forEach((meta) => {
-							const name =
-								meta.getAttribute("name") || meta.getAttribute("property");
-							const content = meta.getAttribute("content");
-							if (name && content) {
-								data.metadata[name] = content;
-							}
-						});
-
-						// Open Graph tags
-						const ogTags = document.querySelectorAll('meta[property^="og:"]');
-						ogTags.forEach((meta) => {
-							const property = meta.getAttribute("property");
-							const content = meta.getAttribute("content");
-							if (property && content) {
-								data.metadata[property] = content;
-							}
-						});
-
-						// Twitter Card tags
-						const twitterTags = document.querySelectorAll(
-							'meta[name^="twitter:"]'
-						);
-						twitterTags.forEach((meta) => {
-							const name = meta.getAttribute("name");
-							const content = meta.getAttribute("content");
-							if (name && content) {
-								data.metadata[name] = content;
-							}
-						});
+					const hasImageExtension = imageExtensions.some((ext) =>
+						url.includes(ext)
+					);
+					if (hasImageExtension) {
+						blockedResources.images++;
+						request.abort();
+						return;
 					}
 
-					// Extract links
-					if (options.includeLinks) {
-						const links = document.querySelectorAll("a[href]");
-
-						const currentUrl = new URL(window.location.href);
-						const seedDomain = currentUrl.hostname;
-
-						const rawLinks = Array.from(links).map((link) => ({
-							text: link.textContent.trim(),
-							href: link.href,
-							title: link.getAttribute("title") || "",
-						}));
-
-						// Filter links by domain and remove duplicates
-						const seenLinks = new Set();
-						data.links = rawLinks.filter((link) => {
-							// Skip if no meaningful text or title
-							if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
-								return false;
-							}
-
-							try {
-								// Check if link URL is valid and matches seed domain
-								const linkUrl = new URL(link.href);
-								if (linkUrl.hostname !== seedDomain) {
-									return false; // Skip external links
-								}
-							} catch (error) {
-								// Skip invalid URLs
-								return false;
-							}
-
-							// Remove duplicates based on text, href, or title
-							const key = `${link.text}|${link.href}|${link.title}`;
-							if (seenLinks.has(key)) return false;
-							seenLinks.add(key);
-							return true;
-						});
+					// Block common image CDN and hosting services
+					const imageServices = [
+						"cdn",
+						"images",
+						"img",
+						"photo",
+						"pic",
+						"media",
+						"assets",
+					];
+					const hasImageService = imageServices.some((service) =>
+						url.includes(service)
+					);
+					if (
+						hasImageService &&
+						(url.includes(".jpg") ||
+							url.includes(".png") ||
+							url.includes(".gif"))
+					) {
+						blockedResources.images++;
+						request.abort();
+						return;
 					}
 
-					if (options.includeSemanticContent) {
-						// Extract semantic content with optimized methods - prioritizing important content
-						const extractSemanticContent = (
-							selector,
-							processor = (el) => el.textContent.trim()
-						) => {
-							const elements = document.querySelectorAll(selector);
-							return elements.length > 0
-								? Array.from(elements).map(processor)
-								: [];
-						};
+					// Block data URLs (base64 encoded images)
+					if (url.startsWith("data:image/")) {
+						blockedResources.images++;
+						request.abort();
+						return;
+					}
 
-						const extractTableContent = (table) => {
-							const rows = Array.from(table.querySelectorAll("tr"));
-							return rows
-								.map((row) => {
-									const cells = Array.from(row.querySelectorAll("td, th")).map(
-										(cell) => cell.textContent.trim()
-									);
-									return cells.filter((cell) => cell.length > 0);
-								})
-								.filter((row) => row.length > 0);
-						};
+					// Always block fonts and handle stylesheets gracefully for faster loading
+					if (resourceType === "stylesheet") {
+						blockedResources.stylesheets++;
+						// Respond with empty CSS to avoid 'Could not parse CSS stylesheet' errors
+						request.respond({
+							status: 200,
+							contentType: "text/css",
+							body: "",
+						});
+						return;
+					}
+					if (resourceType === "font") {
+						blockedResources.fonts++;
+						request.abort();
+						return;
+					}
 
-						const extractListContent = (list) => {
-							return Array.from(list.querySelectorAll("li"))
-								.map((li) => li.textContent.trim())
-								.filter((item) => item.length > 0);
-						};
+					// Block media files (videos, audio) for faster loading
+					if (["media"].includes(resourceType)) {
+						blockedResources.media++;
+						request.abort();
+						return;
+					}
 
-						// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
-						const rawSemanticContent = {
-							// High priority: Main content elements
-							articleContent: extractSemanticContent("article"),
+					request.continue();
+				});
 
-							divs: extractSemanticContent("div"),
+				// Navigate to URL
+				const navStart = Date.now();
+				let redditUrl = null;
+				if (url.includes("reddit.com")) {
+					redditUrl = url.endsWith("/")
+						? url.slice(0, -1) + ".json"
+						: url + "/.json";
+					await page.goto(redditUrl, {
+						waitUntil: "domcontentloaded",
+						timeout: timeout,
+					});
+					const jsonText = await page.$eval("pre", (el) => el.textContent);
+					const parsedData = await parseRedditData(jsonText, url);
+					const { markdown, posts } = parsedData;
 
-							// High priority: Core text content
-							paragraphs: extractSemanticContent("p"),
-							span: extractSemanticContent("span"),
-							blockquotes: extractSemanticContent("blockquote"),
-							codeBlocks: extractSemanticContent("code"),
-							preformatted: extractSemanticContent("pre"),
-							tables: extractSemanticContent("table", extractTableContent),
-							unorderedLists: extractSemanticContent("ul", extractListContent),
-							orderedLists: extractSemanticContent("ol", extractListContent),
-						};
+					return c.json({
+						success: true,
+						url: url,
+						jsonText: jsonText,
+						markdown: markdown,
+						data: {
+							posts: posts,
+							url: url,
+							title: "Reddit Posts",
+							metadata: null,
+						},
+					});
+				}
+				await page.goto(url, {
+					waitUntil: "domcontentloaded",
+					timeout: timeout,
+				});
+				const navLatency = Date.now() - navStart;
 
-						// Remove duplicates from semantic content
-						const removeDuplicates = (array) => {
-							if (!Array.isArray(array)) return array;
-							const seen = new Set();
-							return array.filter((item) => {
-								if (typeof item === "string") {
-									const normalized = item.toLowerCase().trim();
-									if (seen.has(normalized)) return false;
-									seen.add(normalized);
-									return true;
-								} else if (typeof item === "object" && item !== null) {
-									// Handle complex objects like tables
-									const key = JSON.stringify(item);
-									if (seen.has(key)) return false;
-									seen.add(key);
-									return true;
-								}
-								return true;
+				// Wait for specific selector if provided
+				if (waitForSelector) {
+					try {
+						await page.waitForSelector(waitForSelector, { timeout: 10000 });
+					} catch (error) {
+						console.warn(
+							`Selector ${waitForSelector} not found within timeout`
+						);
+					}
+				}
+
+				// Extract page content
+				if (includeSemanticContent) {
+					scrapedData = await page.evaluate(
+						async (options, preProcessedContent) => {
+							const data = {
+								url: window.location.href,
+								title: document.title,
+								content: {},
+								metadata: {},
+								links: [],
+								images: [],
+								screenshot: null,
+								orderedContent: preProcessedContent, // Use the pre-processed content
+							};
+
+							const selectorsToRemove = [
+								"header",
+								"footer",
+								"nav",
+								"aside",
+								".header",
+								".top",
+								".navbar",
+								"#header",
+								".footer",
+								".bottom",
+								"#footer",
+								".sidebar",
+								".side",
+								".aside",
+								"#sidebar",
+								".modal",
+								".popup",
+								"#modal",
+								".overlay",
+								".ad",
+								".ads",
+								".advert",
+								"#ad",
+								".lang-selector",
+								".language",
+								"#language-selector",
+								".social",
+								".social-media",
+								".social-links",
+								"#social",
+								".menu",
+								".navigation",
+								"#nav",
+								".breadcrumbs",
+								"#breadcrumbs",
+								".share",
+								"#share",
+								".widget",
+								"#widget",
+								".cookie",
+								"#cookie",
+								"script",
+								"style",
+								"noscript",
+							];
+
+							selectorsToRemove.forEach((sel) => {
+								document.querySelectorAll(sel).forEach((el) => el.remove());
 							});
-						};
 
-						// Apply duplicate removal to prioritized semantic content
-						data.content.semanticContent = Object.fromEntries(
-							Object.entries(rawSemanticContent).map(([key, value]) => [
-								key,
-								removeDuplicates(value),
-							])
-						);
-					}
+							[("h1", "h2", "h3", "h4", "h5", "h6")].forEach((tag) => {
+								data.content[tag] = Array.from(
+									document.querySelectorAll(tag)
+								).map((h) => h.textContent.trim());
+							});
 
-					// Extract images
-					if (options.includeImages) {
-						const images = document.querySelectorAll("img[src]");
-						data.images = Array.from(images).map((img) => ({
-							src: img.src,
-							alt: img.alt || "",
-							title: img.title || "",
-							width: img.naturalWidth || img.width,
-							height: img.naturalHeight || img.height,
-						}));
-					}
+							// Extract metadata
+							if (options.extractMetadata) {
+								// Meta tags
+								const metaTags = document.querySelectorAll("meta");
+								metaTags.forEach((meta) => {
+									const name =
+										meta.getAttribute("name") || meta.getAttribute("property");
+									const content = meta.getAttribute("content");
+									if (name && content) {
+										data.metadata[name] = content;
+									}
+								});
 
-					// Extract custom selectors if provided
-					if (options.selectors && Object.keys(options.selectors).length > 0) {
-						data.customSelectors = {};
-						for (const [key, selector] of Object.entries(options.selectors)) {
-							try {
-								const elements = document.querySelectorAll(selector);
-								if (elements.length === 1) {
-									data.customSelectors[key] = elements[0].textContent.trim();
-								} else if (elements.length > 1) {
-									data.customSelectors[key] = Array.from(elements).map((el) =>
-										el.textContent.trim()
-									);
-								}
-							} catch (error) {
-								data.customSelectors[key] = null;
+								// Open Graph tags
+								const ogTags = document.querySelectorAll(
+									'meta[property^="og:"]'
+								);
+								ogTags.forEach((meta) => {
+									const property = meta.getAttribute("property");
+									const content = meta.getAttribute("content");
+									if (property && content) {
+										data.metadata[property] = content;
+									}
+								});
+
+								// Twitter Card tags
+								const twitterTags = document.querySelectorAll(
+									'meta[name^="twitter:"]'
+								);
+								twitterTags.forEach((meta) => {
+									const name = meta.getAttribute("name");
+									const content = meta.getAttribute("content");
+									if (name && content) {
+										data.metadata[name] = content;
+									}
+								});
 							}
+
+							// Extract links
+							if (options.includeLinks) {
+								const links = document.querySelectorAll("a[href]");
+
+								const currentUrl = new URL(window.location.href);
+								const seedDomain = currentUrl.hostname;
+
+								const rawLinks = Array.from(links).map((link) => ({
+									text: link.textContent.trim(),
+									href: link.href,
+									title: link.getAttribute("title") || "",
+								}));
+
+								// Filter links by domain and remove duplicates
+								const seenLinks = new Set();
+								data.links = rawLinks.filter((link) => {
+									// Skip if no meaningful text or title
+									if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
+										return false;
+									}
+
+									try {
+										// Check if link URL is valid and matches seed domain
+										const linkUrl = new URL(link.href);
+										if (linkUrl.hostname !== seedDomain) {
+											return false; // Skip external links
+										}
+									} catch (error) {
+										// Skip invalid URLs
+										return false;
+									}
+
+									// Remove duplicates based on text, href, or title
+									const key = `${link.text}|${link.href}|${link.title}`;
+									if (seenLinks.has(key)) return false;
+									seenLinks.add(key);
+									return true;
+								});
+							}
+
+							if (options.includeSemanticContent) {
+								// Extract semantic content with optimized methods - prioritizing important content
+								const extractSemanticContent = (
+									selector,
+									processor = (el) => el.textContent.trim()
+								) => {
+									const elements = document.querySelectorAll(selector);
+									return elements.length > 0
+										? Array.from(elements).map(processor)
+										: [];
+								};
+
+								const extractTableContent = (table) => {
+									const rows = Array.from(table.querySelectorAll("tr"));
+									return rows
+										.map((row) => {
+											const cells = Array.from(
+												row.querySelectorAll("td, th")
+											).map((cell) => cell.textContent.trim());
+											return cells.filter((cell) => cell.length > 0);
+										})
+										.filter((row) => row.length > 0);
+								};
+
+								const extractListContent = (list) => {
+									return Array.from(list.querySelectorAll("li"))
+										.map((li) => li.textContent.trim())
+										.filter((item) => item.length > 0);
+								};
+
+								// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
+								const rawSemanticContent = {
+									// High priority: Main content elements
+									articleContent: extractSemanticContent("article"),
+
+									divs: extractSemanticContent("div"),
+
+									// High priority: Core text content
+									paragraphs: extractSemanticContent("p"),
+									span: extractSemanticContent("span"),
+									blockquotes: extractSemanticContent("blockquote"),
+									codeBlocks: extractSemanticContent("code"),
+									preformatted: extractSemanticContent("pre"),
+									tables: extractSemanticContent("table", extractTableContent),
+									unorderedLists: extractSemanticContent(
+										"ul",
+										extractListContent
+									),
+									orderedLists: extractSemanticContent(
+										"ol",
+										extractListContent
+									),
+								};
+
+								// Remove duplicates from semantic content
+								const removeDuplicates = (array) => {
+									if (!Array.isArray(array)) return array;
+									const seen = new Set();
+									return array.filter((item) => {
+										if (typeof item === "string") {
+											const normalized = item.toLowerCase().trim();
+											if (seen.has(normalized)) return false;
+											seen.add(normalized);
+											return true;
+										} else if (typeof item === "object" && item !== null) {
+											// Handle complex objects like tables
+											const key = JSON.stringify(item);
+											if (seen.has(key)) return false;
+											seen.add(key);
+											return true;
+										}
+										return true;
+									});
+								};
+
+								// Apply duplicate removal to prioritized semantic content
+								data.content.semanticContent = Object.fromEntries(
+									Object.entries(rawSemanticContent).map(([key, value]) => [
+										key,
+										removeDuplicates(value),
+									])
+								);
+							}
+
+							// Extract images
+							if (options.includeImages) {
+								const images = document.querySelectorAll("img[src]");
+								data.images = Array.from(images).filter((img) => {
+									if (
+										img.src.startsWith("data:image/") ||
+										img.src.startsWith("blob:") ||
+										img.src.startsWith("image:") ||
+										img.src.startsWith("data:")
+									) {
+										return;
+									}
+									return {
+										src: img.src,
+										alt: img.alt || "",
+										title: img.title || "",
+										width: img.naturalWidth || img.width,
+										height: img.naturalHeight || img.height,
+									};
+								});
+							}
+
+							// Extract custom selectors if provided
+							if (
+								options.selectors &&
+								Object.keys(options.selectors).length > 0
+							) {
+								data.customSelectors = {};
+								for (const [key, selector] of Object.entries(
+									options.selectors
+								)) {
+									try {
+										const elements = document.querySelectorAll(selector);
+										if (elements.length === 1) {
+											data.customSelectors[key] =
+												elements[0].textContent.trim();
+										} else if (elements.length > 1) {
+											data.customSelectors[key] = Array.from(elements).map(
+												(el) => el.textContent.trim()
+											);
+										}
+									} catch (error) {
+										data.customSelectors[key] = null;
+									}
+								}
+							}
+
+							return data;
+						},
+						{
+							extractMetadata,
+							includeImages,
+							includeLinks,
+							includeSemanticContent,
+							selectors,
+						}
+					);
+				}
+
+				// Get page content and process with JSDOM
+				const pageHtml = await page.content();
+				const dom = new JSDOM(pageHtml);
+				const document = dom.window.document;
+
+				// Remove unwanted elements from JSDOM document
+				const selectorsToRemove = [
+					"header",
+					"footer",
+					"nav",
+					"aside",
+					".header",
+					".top",
+					".navbar",
+					"#header",
+					".footer",
+					".bottom",
+					"#footer",
+					".sidebar",
+					".side",
+					".aside",
+					"#sidebar",
+					".modal",
+					".popup",
+					"#modal",
+					".overlay",
+					".ad",
+					".ads",
+					".advert",
+					"#ad",
+					".lang-selector",
+					".language",
+					"#language-selector",
+					".social",
+					".social-media",
+					".social-links",
+					"#social",
+					".menu",
+					".navigation",
+					"#nav",
+					".breadcrumbs",
+					"#breadcrumbs",
+					".share",
+					"#share",
+					".widget",
+					"#widget",
+					".cookie",
+					"#cookie",
+					"script",
+					"style",
+					"noscript",
+				];
+
+				selectorsToRemove.forEach((sel) => {
+					document.querySelectorAll(sel).forEach((el) => el.remove());
+				});
+
+				const { markdown } = extractSemanticContentWithFormattedMarkdown(
+					document.body
+				);
+
+				await page.close();
+
+				// Record proxy performance
+				if (useProxy && selectedProxy) {
+					proxyManager.recordProxyResult(selectedProxy.host, true, navLatency);
+				}
+
+				// Store new data in Supabase
+				try {
+					if (!includeCache) {
+						// Check if the URL already exists in the "universo" table
+						const { data: existingRows, error: fetchError } = await supabase
+							.from("universo")
+							.select("id")
+							.eq("url", url);
+
+						let insertError = null;
+						if (!fetchError && (!existingRows || existingRows.length === 0)) {
+							const { error } = await supabase.from("universo").insert({
+								title: scrapedData.title || "No Title",
+								url: url,
+								markdown: markdown,
+								scraped_at: new Date().toISOString(),
+								scraped_data: JSON.stringify(scrapedData),
+							});
+							insertError = error;
+						}
+
+						if (insertError) {
+							console.error("❌ Error storing data in Supabase:", insertError);
+							throw insertError;
 						}
 					}
-
-					return data;
-				},
-				{
-					extractMetadata,
-					includeImages,
-					includeLinks,
-					includeSemanticContent,
-					selectors,
-				}
-			);
-		}
-
-		// Get page content and process with JSDOM
-		const pageHtml = await page.content();
-		const dom = new JSDOM(pageHtml);
-		const document = dom.window.document;
-
-		// Remove unwanted elements from JSDOM document
-		const selectorsToRemove = [
-			"header",
-			"footer",
-			"nav",
-			"aside",
-			".header",
-			".top",
-			".navbar",
-			"#header",
-			".footer",
-			".bottom",
-			"#footer",
-			".sidebar",
-			".side",
-			".aside",
-			"#sidebar",
-			".modal",
-			".popup",
-			"#modal",
-			".overlay",
-			".ad",
-			".ads",
-			".advert",
-			"#ad",
-			".lang-selector",
-			".language",
-			"#language-selector",
-			".social",
-			".social-media",
-			".social-links",
-			"#social",
-			".menu",
-			".navigation",
-			"#nav",
-			".breadcrumbs",
-			"#breadcrumbs",
-			".share",
-			"#share",
-			".widget",
-			"#widget",
-			".cookie",
-			"#cookie",
-			"script",
-			"style",
-			"noscript",
-		];
-
-		selectorsToRemove.forEach((sel) => {
-			document.querySelectorAll(sel).forEach((el) => el.remove());
-		});
-
-		const { markdown } = extractSemanticContentWithFormattedMarkdown(
-			document.body
-		);
-
-		await page.close();
-
-		// Store new data in Supabase
-		try {
-			if (!includeCache) {
-				// Check if the URL already exists in the "universo" table
-				const { data: existingRows, error: fetchError } = await supabase
-					.from("universo")
-					.select("id")
-					.eq("url", url);
-
-				let insertError = null;
-				if (!fetchError && (!existingRows || existingRows.length === 0)) {
-					const { error } = await supabase.from("universo").insert({
-						title: scrapedData.title || "No Title",
-						url: url,
-						markdown: markdown,
-						scraped_at: new Date().toISOString(),
-						scraped_data: JSON.stringify(scrapedData),
-					});
-					insertError = error;
+				} catch (supabaseError) {
+					console.error("❌ Supabase storage error:", supabaseError);
 				}
 
-				if (insertError) {
-					console.error("❌ Error storing data in Supabase:", insertError);
-					throw insertError;
+				// Remove empty keys from content
+				if (includeSemanticContent && scrapedData?.content) {
+					removeEmptyKeys(scrapedData?.content);
 				}
+
+				return c.json({
+					success: true,
+					data: scrapedData,
+					url: url,
+					markdown: markdown,
+					timestamp: new Date().toISOString(),
+				});
+			} catch (attemptError) {
+				lastError = attemptError;
+				if (useProxy && selectedProxy) {
+					proxyManager.recordProxyResult(selectedProxy.host, false);
+				}
+				try {
+					if (browser) await browser.close();
+				} catch {}
+				// Backoff before retrying
+				if (attempt < maxAttempts) {
+					await randomDelay(300, 1200);
+					continue;
+				}
+				throw attemptError;
 			}
-		} catch (supabaseError) {
-			console.error("❌ Supabase storage error:", supabaseError);
 		}
-
-		// Remove empty keys from content
-		if (includeSemanticContent && scrapedData?.content) {
-			removeEmptyKeys(scrapedData?.content);
-		}
-
-		return c.json({
-			success: true,
-			data: scrapedData,
-			url: url,
-			markdown: markdown,
-			timestamp: new Date().toISOString(),
-		});
 	} catch (error) {
 		console.error("❌ Web scraping error (Puppeteer):", error);
 
@@ -3515,6 +3714,73 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		if (browser) {
 			await browser.close();
 		}
+	}
+});
+
+app.post("/simple-scrap", async (c) => {
+	const {
+		url,
+		useProxy = true,
+		skipTlsVerification = true,
+	} = await c.req.json();
+	try {
+		const proxy = useProxy ? proxyManager.getNextProxy() : null;
+		const agentOpts = { maxRedirections: 10 };
+		const dispatcher = proxy
+			? new UndiciProxyAgent({
+					uri: `http://${proxy.host}:${proxy.port}`,
+					token: proxy.username
+						? `Basic ${Buffer.from(
+								`${proxy.username}:${proxy.password ?? ""}`
+						  ).toString("base64")}`
+						: undefined,
+					requestTls: { rejectUnauthorized: !skipTlsVerification },
+					...agentOpts,
+			  })
+			: new UndiciAgent({
+					connect: { rejectUnauthorized: !skipTlsVerification },
+					...agentOpts,
+			  });
+
+		const randomUA = new UserAgents().toString();
+		const start = Date.now();
+		const res = await undiciFetch(url.trim(), {
+			dispatcher,
+			headers: {
+				"User-Agent": randomUA,
+				Accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+				"Accept-Encoding": "gzip, deflate, br",
+			},
+			redirect: "follow",
+		});
+		const html = await res.text();
+		const latency = Date.now() - start;
+		if (useProxy && proxy) {
+			proxyManager.recordProxyResult(proxy.host, res.ok, latency);
+		}
+
+		const dom = new JSDOM(html);
+		const document = dom.window.document;
+		const { markdown } = extractSemanticContentWithFormattedMarkdown(
+			document.body
+		);
+
+		return c.json({
+			success: true,
+			data: {
+				url: url,
+				html: html,
+				metadata: {},
+				title: "",
+			},
+			markdown: markdown,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.log(error);
+		return c.json({ error: error.message, success: false }, 500);
 	}
 });
 
@@ -4480,7 +4746,7 @@ app.post("/crawl-url", async (c) => {
 	try {
 		const {
 			url,
-			maxUrls = 10,
+			maxUrls = 5,
 			allowSeedDomains = false,
 			waitForSelector,
 			timeout = 60000,
@@ -4748,10 +5014,124 @@ app.post("/crawl-url", async (c) => {
 	}
 });
 
+const parseRedditData = (data, url) => {
+	console.log(data, "data");
+	if (!data || !data.data || !data.data.children) {
+		return { markdown: "No Reddit data found", posts: [] };
+	}
+
+	const posts = [];
+	let markdown = `# Reddit Posts from ${url}\n\n`;
+
+	data.data.children.forEach((child, index) => {
+		if (child.kind === "t3" && child.data) {
+			const post = child.data;
+
+			// Extract key information
+			const postData = {
+				title: post.title || "No Title",
+				author: post.author || "Unknown",
+				subreddit: post.subreddit || "Unknown",
+				score: post.score || 0,
+				upvoteRatio: post.upvote_ratio || 0,
+				numComments: post.num_comments || 0,
+				created: new Date(post.created_utc * 1000).toISOString(),
+				permalink: post.permalink ? `https://reddit.com${post.permalink}` : "",
+				url: post.url || "",
+				selftext: post.selftext || "",
+				linkFlairText: post.link_flair_text || "",
+				domain: post.domain || "",
+				isSelf: post.is_self || false,
+				stickied: post.stickied || false,
+				over18: post.over_18 || false,
+				spoiler: post.spoiler || false,
+				locked: post.locked || false,
+				archived: post.archived || false,
+				distinguished: post.distinguished || null,
+				gilded: post.gilded || 0,
+				totalAwards: post.total_awards_received || 0,
+			};
+
+			posts.push(postData);
+
+			// Create markdown section for this post
+			markdown += `## Post ${index + 1}: ${postData.title}\n\n`;
+
+			// Basic info
+			markdown += `**Author:** u/${postData.author}\n`;
+			markdown += `**Subreddit:** r/${postData.subreddit}\n`;
+			markdown += `**Score:** ${postData.score} (${Math.round(
+				postData.upvoteRatio * 100
+			)}% upvoted)\n`;
+			markdown += `**Comments:** ${postData.numComments}\n`;
+			markdown += `**Posted:** ${postData.created}\n`;
+
+			// Post status indicators
+			const status = [];
+			if (postData.stickied) status.push("📌 Pinned");
+			if (postData.locked) status.push("🔒 Locked");
+			if (postData.archived) status.push("📁 Archived");
+			if (postData.over18) status.push("🔞 NSFW");
+			if (postData.spoiler) status.push("⚠️ Spoiler");
+			if (postData.distinguished) status.push(`👑 ${postData.distinguished}`);
+			if (postData.gilded > 0) status.push(`🏆 ${postData.gilded} gilded`);
+			if (postData.totalAwards > 0)
+				status.push(`🎖️ ${postData.totalAwards} awards`);
+
+			if (status.length > 0) {
+				markdown += `**Status:** ${status.join(", ")}\n`;
+			}
+
+			// Flair
+			if (postData.linkFlairText) {
+				markdown += `**Flair:** ${postData.linkFlairText}\n`;
+			}
+
+			// Content
+			if (postData.selftext) {
+				markdown += `\n**Content:**\n${postData.selftext}\n`;
+			}
+
+			// External link
+			if (!postData.isSelf && postData.url) {
+				markdown += `\n**External Link:** ${postData.url}\n`;
+			}
+
+			// Links
+			markdown += `\n**Reddit Link:** ${postData.permalink}\n`;
+
+			markdown += `\n---\n\n`;
+		}
+	});
+
+	// Add summary
+	markdown += `## Summary\n\n`;
+	markdown += `- **Total Posts:** ${posts.length}\n`;
+	markdown += `- **Subreddit:** r/${posts[0]?.subreddit || "Unknown"}\n`;
+	markdown += `- **Total Score:** ${posts.reduce(
+		(sum, post) => sum + post.score,
+		0
+	)}\n`;
+	markdown += `- **Total Comments:** ${posts.reduce(
+		(sum, post) => sum + post.numComments,
+		0
+	)}\n`;
+	markdown += `- **Average Score:** ${Math.round(
+		posts.reduce((sum, post) => sum + post.score, 0) / posts.length
+	)}\n`;
+	markdown += `- **Average Upvote Ratio:** ${Math.round(
+		(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) / posts.length) *
+			100
+	)}%\n`;
+
+	return { markdown, posts };
+};
+
 app.post("/scrap-reddit", async (c) => {
 	try {
 		const { url } = await c.req.json();
 
+		const proxy = proxyManager.getNextProxy();
 		if (!url) {
 			return c.json({ success: false, error: "Reddit URL is required" }, 400);
 		}
@@ -4764,125 +5144,11 @@ app.post("/scrap-reddit", async (c) => {
 		// Convert Reddit URL to JSON API URL
 		let jsonUrl = url;
 		if (!url.endsWith(".json")) {
-			jsonUrl = url.endsWith("/") ? url + ".json" : url + "/.json";
+			jsonUrl = url.endsWith("/") ? url.slice(0, -1) + ".json" : url + "/.json";
 		}
 
 		// Parse Reddit JSON and create LLM-friendly markdown
-		const parseRedditData = (data) => {
-			if (!data || !data.data || !data.data.children) {
-				return { markdown: "No Reddit data found", posts: [] };
-			}
-
-			const posts = [];
-			let markdown = `# Reddit Posts from ${url}\n\n`;
-
-			data.data.children.forEach((child, index) => {
-				if (child.kind === "t3" && child.data) {
-					const post = child.data;
-
-					// Extract key information
-					const postData = {
-						title: post.title || "No Title",
-						author: post.author || "Unknown",
-						subreddit: post.subreddit || "Unknown",
-						score: post.score || 0,
-						upvoteRatio: post.upvote_ratio || 0,
-						numComments: post.num_comments || 0,
-						created: new Date(post.created_utc * 1000).toISOString(),
-						permalink: post.permalink
-							? `https://reddit.com${post.permalink}`
-							: "",
-						url: post.url || "",
-						selftext: post.selftext || "",
-						linkFlairText: post.link_flair_text || "",
-						domain: post.domain || "",
-						isSelf: post.is_self || false,
-						stickied: post.stickied || false,
-						over18: post.over_18 || false,
-						spoiler: post.spoiler || false,
-						locked: post.locked || false,
-						archived: post.archived || false,
-						distinguished: post.distinguished || null,
-						gilded: post.gilded || 0,
-						totalAwards: post.total_awards_received || 0,
-					};
-
-					posts.push(postData);
-
-					// Create markdown section for this post
-					markdown += `## Post ${index + 1}: ${postData.title}\n\n`;
-
-					// Basic info
-					markdown += `**Author:** u/${postData.author}\n`;
-					markdown += `**Subreddit:** r/${postData.subreddit}\n`;
-					markdown += `**Score:** ${postData.score} (${Math.round(
-						postData.upvoteRatio * 100
-					)}% upvoted)\n`;
-					markdown += `**Comments:** ${postData.numComments}\n`;
-					markdown += `**Posted:** ${postData.created}\n`;
-
-					// Post status indicators
-					const status = [];
-					if (postData.stickied) status.push("📌 Pinned");
-					if (postData.locked) status.push("🔒 Locked");
-					if (postData.archived) status.push("📁 Archived");
-					if (postData.over18) status.push("🔞 NSFW");
-					if (postData.spoiler) status.push("⚠️ Spoiler");
-					if (postData.distinguished)
-						status.push(`👑 ${postData.distinguished}`);
-					if (postData.gilded > 0) status.push(`🏆 ${postData.gilded} gilded`);
-					if (postData.totalAwards > 0)
-						status.push(`🎖️ ${postData.totalAwards} awards`);
-
-					if (status.length > 0) {
-						markdown += `**Status:** ${status.join(", ")}\n`;
-					}
-
-					// Flair
-					if (postData.linkFlairText) {
-						markdown += `**Flair:** ${postData.linkFlairText}\n`;
-					}
-
-					// Content
-					if (postData.selftext) {
-						markdown += `\n**Content:**\n${postData.selftext}\n`;
-					}
-
-					// External link
-					if (!postData.isSelf && postData.url) {
-						markdown += `\n**External Link:** ${postData.url}\n`;
-					}
-
-					// Links
-					markdown += `\n**Reddit Link:** ${postData.permalink}\n`;
-
-					markdown += `\n---\n\n`;
-				}
-			});
-
-			// Add summary
-			markdown += `## Summary\n\n`;
-			markdown += `- **Total Posts:** ${posts.length}\n`;
-			markdown += `- **Subreddit:** r/${posts[0]?.subreddit || "Unknown"}\n`;
-			markdown += `- **Total Score:** ${posts.reduce(
-				(sum, post) => sum + post.score,
-				0
-			)}\n`;
-			markdown += `- **Total Comments:** ${posts.reduce(
-				(sum, post) => sum + post.numComments,
-				0
-			)}\n`;
-			markdown += `- **Average Score:** ${Math.round(
-				posts.reduce((sum, post) => sum + post.score, 0) / posts.length
-			)}\n`;
-			markdown += `- **Average Upvote Ratio:** ${Math.round(
-				(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) /
-					posts.length) *
-					100
-			)}%\n`;
-
-			return { markdown, posts };
-		};
+		const parsedData = await parseRedditData(jsonUrl, url);
 
 		try {
 			// Fetch Reddit JSON data with enhanced bot detection bypass and proxy support
@@ -4915,19 +5181,17 @@ app.post("/scrap-reddit", async (c) => {
 				},
 				timeout: 30000,
 				maxRedirects: 5,
-				validateStatus: function (status) {
-					return status >= 200 && status < 300; // Only resolve for 2xx status codes
-				},
-				// Proxy configuration
+
 				proxy: {
-					protocol: "https",
-					host: "proxy-server.com",
-					port: 8080,
+					protocol: "http",
+					host: proxy.host,
+					port: proxy.port,
 					auth: {
-						username: "proxy-user",
-						password: "proxy-pass",
+						username: proxy.username,
+						password: proxy.password,
 					},
 				},
+				// Proxy configuration
 				// Alternative proxy configuration for different proxy types
 				// proxy: false, // Disable proxy
 				// proxy: 'http://proxy-server.com:8080', // Simple proxy
@@ -5107,7 +5371,7 @@ app.post("/scrap-reddit", async (c) => {
 			removeEmptyKeys(metadata);
 
 			redditMetadata = metadata.allMetaTags;
-			const { markdown, posts } = parseRedditData(redditData);
+			const { markdown, posts } = parsedData(redditData);
 
 			const allLinks = posts.map((post) => post.url);
 			const allImages = posts.map((post) => post.image);
@@ -5209,7 +5473,6 @@ app.post("/scrap-reddit", async (c) => {
 });
 
 // similar to scrap github redirect to this API
-
 app.post("/scrap-git", async (c) => {
 	const { url } = await c.req.json();
 	const newUrl = new URL(url);
@@ -5420,96 +5683,11 @@ const buildRepositoryStructure = async (repo, depth = 0) => {
 	return structure;
 };
 
-app.post("/git-json", async (c) => {
-	const { url } = await c.req.json();
-	const newUrl = new URL(url);
-	if (!newUrl || newUrl.hostname !== "github.com") {
-		return c.json(
-			{
-				success: false,
-				error: "URL is required and must be a github URL",
-			},
-			400
-		);
-	}
-	try {
-		const response = await axios.get(newUrl.toString());
-
-		const $ = load(response.data);
-		const metadata = {
-			title: $("title").text().trim(),
-			description: $("meta[name='description']").attr("content"),
-			image: $("meta[name='image']").attr("content"),
-			author: $("meta[name='author']").attr("content"),
-			pubDate: $("meta[name='pubdate']").attr("content"),
-		};
-		const table = $("table");
-		const tableDom = new JSDOM(table.html());
-		const tableContent = tableDom.window.document;
-		const { content: tableSemanticContent } =
-			extractSemanticContentWithFormattedMarkdown(tableContent.body);
-
-		const tableLinks = [];
-		const links = new Set();
-		for (const item of tableSemanticContent) {
-			if (
-				item.type === "link" &&
-				!links.has(item.href) &&
-				!item.href.split("/").includes("commits") &&
-				!item.href.split("/").includes("pulls") &&
-				!item.href.split("/").includes("issues")
-			) {
-				links.add(item.href);
-				tableLinks.push(item);
-			}
-		}
-		// Build the complete repository structure
-		const repoStructure = await buildRepositoryStructure(tableLinks);
-
-		const article = $("article");
-		const dom = new JSDOM(article.html());
-		const content = dom.window.document;
-
-		const { markdown } = extractSemanticContentWithFormattedMarkdown(
-			content.body
-		);
-
-		return c.json({
-			success: true,
-			data: {
-				url: url,
-				repoStructure: repoStructure,
-				tableSemanticContent: tableLinks,
-				title: metadata.title,
-				content: content,
-				metadata: metadata,
-			},
-			markdown: markdown,
-		});
-	} catch (error) {
-		console.error("❌ Github scraper error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Internal server error",
-			},
-			500
-		);
-	}
-});
-
-const embedder = await pipeline(
-	"feature-extraction",
-	"Xenova/all-MiniLM-L6-v2"
-);
-
-// Function to calculate cosine similarity
-function cosineSimilarity(vecA, vecB) {
-	const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
-	const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
-	const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
-	return dotProduct / (magnitudeA * magnitudeB);
-}
+env.useWebWorkers = false;
+env.useFSCache = true;
+env.useBrowserCache = false;
+env.cacheDir =
+	process.env.NODE_ENV === "production" ? "/tmp/hf-cache" : "./cache";
 
 async function createEmbeddingRecord(
 	markdownContent,
@@ -5518,15 +5696,19 @@ async function createEmbeddingRecord(
 	timestamp = new Date().toISOString()
 ) {
 	// Get embedding with pooling and normalization for fixed-length vector
-	const embeddingResult = await embedder(markdownContent, {
-		pooling: "mean",
-		normalize: true,
+	const embeddingResult = await hgpipeline("embeddings", model, {
+		cache_dir: "./cache",
+		revision: "main",
+		device: "cpu",
+		dtype: "float32",
+		subfolder: "onnx",
+		use_external_data_format: true,
+		model_file_name: "model.onnx",
 	});
 
 	// embeddingResult.data is Float32Array of vector values
 	const embeddingVector = Array.from(embeddingResult.data); // Convert to plain array for storage
 
-	// Store embedding record
 	return {
 		id,
 		content: markdownContent,
@@ -5536,504 +5718,92 @@ async function createEmbeddingRecord(
 	};
 }
 
-// Create an API endpoint (example shown with ExpressJS)
-app.post("/api/embed", async (c) => {
-	const { query, limit = 5 } = await c.req.json();
-	const markdown = `
-[Sitemap](/sitemap/sitemap.xml)[Open in app](https://rsci.app.link/?%24canonical_url=https%3A%2F%2Fmedium.com%2Fp%2F34f95510167c&%7Efeature=LoOpenInAppButton&%7Echannel=ShowPostUnderUser&%7Estage=mobileNavBar&source=post_page---top_nav_layout_nav-----------------------------------------)Sign up
-
-Sign in
-
-[Sign in](/m/signin?operation=login&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=post_page---top_nav_layout_nav-----------------------global_nav------------------)[Medium Logo](/?source=post_page---top_nav_layout_nav-----------------------------------------)[Write](/m/signin?operation=register&redirect=https%3A%2F%2Fmedium.com%2Fnew-story&source=---top_nav_layout_nav-----------------------new_post_topnav------------------)[](/search?source=post_page---top_nav_layout_nav-----------------------------------------)Sign up
-
-Sign in
-
-[Sign in](/m/signin?operation=login&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=post_page---top_nav_layout_nav-----------------------global_nav------------------)
-![](https://miro.medium.com/v2/resize:fill:64:64/1*dmbNkD5D-u45r44go_cf0g.png)
-
-# Your website doesn't RANK #1 because you're missing These 3 Pages
-
-**Your website doesn't RANK #1 because you're missing These 3 Pages**
-
-## Most businesses skip this step (don't be one of them!)
-
-*Most businesses skip this step (don't be one of them!)*[](/@afghankhanbitani?source=post_page---byline--34f95510167c---------------------------------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:64:64/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---byline--34f95510167c---------------------------------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2F34f95510167c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&user=Afghan+Bitani+%7C+Local+SEO+%2B+Web+Design+Agency&userId=cd1a89a0ae87&source=---header_actions--34f95510167c---------------------clap_footer------------------)331
-
-9
-
-[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F34f95510167c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=---header_actions--34f95510167c---------------------bookmark_footer------------------)[Listen](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2Fplans%3Fdimension%3Dpost_audio_button%26postId%3D34f95510167c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=---header_actions--34f95510167c---------------------post_audio_button------------------)Listen
-
-Share
-
-Most small business websites are missing the three exact pages that would get them on page 1 of Google.
-
-*three*And no, it's not because your site isn't "pretty enough" or you didn't write a cool 1000-word homepage.
-
-It's because Google's looking for structure. You're giving it a brochure. And Google doesn't rank brochures.
-
-**structure**If you want your website (and your Google Business Profile) to climb the map pack, you need to build the right pages.
-
-**build the right pages.**So here's what most people skip:
-
-![](https://miro.medium.com/v2/resize:fit:700/1*S8F1QpAhPao9oABu0AGJ9g.png)
-
-## 1. Location Pages
-
-(Because Google needs to know where you work)
-
-*(Because Google needs to know where you work)*You wouldn't believe how many mobile massage therapists in London try to rank across the city… With a single homepage. Like, "Hi, we serve all 32 boroughs, please rank us in all of them, thanks."
-
-That's not how it works.
-
-Google ranks relevance + proximity. If you want to show up when someone searches "Swedish massage in Notting Hill," you need a page about Notting Hill.
-
-**relevance + proximity***about*So here's the fix:
-
-Make location-specific landing pages. Example:
-
-**location-specific landing pages**
-
-1. /swedish-massage-london
-
-
-2. /deep-tissue-massage-london
-
-3. /couples-massage-london
-
-
-Each page should talk about:
-
-1. The specific service
-
-
-2. The area (mention streets, parks, landmarks)
-
-3. Why you serve that area
-
-
-4. Maybe even a few local testimonials or Google reviews
-
-Massage example:
-
-**Massage example:**Let's say you're offering Thai massage at home. Instead of saying "We serve all of London," write a page like:
-
-> "Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you're just off Brick Lane or relaxing near Hoxton Square."
-
-
-"Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you're just off Brick Lane or relaxing near Hoxton Square."
-
-*Looking for authentic Thai massage in Shoreditch? We bring the spa to your doorstep, whether you're just off Brick Lane or relaxing near Hoxton Square.*See how that sounds like you actually know the area?
-
-Google eats that up.
-
-Not a massage therapist?
-
-**Not a massage therapist?**Dentists can create pages like /emergency-dentist-wembleySecurity installers can create /home-alarm-installation-hackney
-
-Same rule applies for all service based businesses.
-
-## 2. Service Pages
-
-(Because people don't just search "massage," they search for exactly what they need)
-
-*(Because people don't just search "massage," they search for exactly what they need)*Let's say you're a mobile massage therapist in London, and you offer:
-
-1. Swedish massage
-
-
-2. Thai massage
-
-3. Sports massage
-
-
-4. Pregnancy massage
-
-5. Couples massage
-
-
-If you only have one Services page, you're leaving rankings (and bookings) on the table.
-
-**one Services page**You need a dedicated page for each service.
-
-**dedicated page**Why?
-
-Because someone searching "pregnancy massage near me" is a totally different intent than someone looking for "sports injury massage."
-
-Google knows that.
-
-And if your competitors do have those pages, they'll outrank you.
-
-*do*So build out:
-
-1. /swedish-massage-london
-
-
-2. /thai-massage-at-home
-
-3. /pregnancy-massage-service
-
-
-4. /deep-tissue-mobile-massage
-
-Make each page speak directly to that client.
-
-## Get Afghan Bitani | Local SEO + Web Design Agency's stories in your inbox
-
-Join Medium for free to get updates from this writer.
-
-For couples massage?
-
-**For couples massage?**Write about setting up candles and relaxing music at home, and how it's perfect for anniversaries or staycations in places like Kensington or Camden.
-
-Compare that with… A security installer might have pages like:
-
-**Compare that with…**
-
-1. /cctv-installation-london
-
-
-2. /home-alarm-systems
-
-3. /smart-doorbell-installation
-
-
-A dentist might create:
-
-1. /teeth-whitening-london
-
-
-2. /wisdom-teeth-removal
-
-3. /braces-for-teens
-
-
-See the pattern?
-
-If Google can't find a page about the exact thing someone is searching, you won't show up.
-
-## 3. FAQ Pages
-
-(Because Google, and your customers, have questions)
-
-*(Because Google, and your customers, have questions)*You know what customers love? Clear answers.
-
-You know what Google loves? Content that answers specific search queries.
-
-**specific search queries**So if you're not using an FAQ page (or better, mini FAQs on every service page), you're missing an easy win.
-
-**mini FAQs on every service page**Mobile massage example:
-
-**Mobile massage example:**Here are just a few questions you could answer:
-
-1. "Do I need to provide towels or equipment?"
-
-
-2. "Can I book a same-day massage in London?"
-
-3. "What areas do you cover for couples massage?"
-
-
-4. "Is Thai massage painful?"
-
-5. "Can I get a pregnancy massage in my third trimester?"
-
-
-Each of these is a keyword in disguise. People Google these questions every day.
-
-**keyword in disguise**When you answer them clearly, in plain English, with helpful detail, you're giving Google more reasons to rank your site.
-
-For other industries:
-
-**For other industries:**Dentists:
-
-**Dentists:**
-
-1. "How much does Invisalign cost?"
-
-
-2. "Does wisdom tooth removal hurt?"
-
-3. "Is teeth whitening safe?"
-
-
-Security installers:
-
-**Security installers:**
-
-1. "How long does CCTV installation take?"
-
-
-2. "What's the best alarm system for a flat?"
-
-3. "Do you install cameras in commercial spaces?"
-
-
-If you can answer your clients' questions before they ask, you instantly build trust, and boost your SEO at the same time.
-
-*before*
-
-## Let's wrap this up:
-
-If you've got a great service but no leads coming from Google, it's probably not your fault.
-
-It's just that your site's missing the three exact pages Google looks for:
-
-**three exact pages**
-
-1. Location pages → Tell Google where you work
-
-
-2. Service pages → Tell Google what you do
-
-3. FAQ pages → Tell Google you're useful and relevant
-
-
-*where**what**useful and relevant*These aren't just nice-to-haves, they're what separate page 1 rankings from page 5 oblivion.
-
-Whether you're a Roofer in London, a Plumber in Birmingham, or a Gardner in Manchester…
-
-Build these pages, write them like you mean it, and watch what happens.
-
-**Build these pages, write them like you mean it, and watch what happens.**Let your website do the heavy lifting, so you don't have to.
-
-## Want Help Ranking?
-
-If you're serious about ranking your website or Google Business Profile, we do this all day.
-
-**website or Google Business Profile**We've helped dozens of Local business owners get more leads and customers.
-
-> Email: Afghankhanbitani@gmail.com
-
-
-Email: Afghankhanbitani@gmail.com
-
-*Email: Afghankhanbitani@gmail.com*Let's rank your business #1.
-
-[SEO](/tag/seo?source=post_page-----34f95510167c---------------------------------------)[Marketing](/tag/marketing?source=post_page-----34f95510167c---------------------------------------)[Business](/tag/business?source=post_page-----34f95510167c---------------------------------------)[Technology](/tag/technology?source=post_page-----34f95510167c---------------------------------------)[Local Seo](/tag/local-seo?source=post_page-----34f95510167c---------------------------------------)[](/@afghankhanbitani?source=post_page---post_author_info--34f95510167c---------------------------------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:96:96/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[](/@afghankhanbitani?source=post_page---post_author_info--34f95510167c---------------------------------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:128:128/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[Written by Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---post_author_info--34f95510167c---------------------------------------)
-
-## Written by Afghan Bitani | Local SEO + Web Design Agency
-
-[226 followers](/@afghankhanbitani/followers?source=post_page---post_author_info--34f95510167c---------------------------------------)[157 following](/@afghankhanbitani/following?source=post_page---post_author_info--34f95510167c---------------------------------------)We've helped 197+ local businesses rank #1 on Google Search & Google Maps with SEO. Now it's your turn. 📧 afghankhanbitani@gmail.com 🔗 linktr.ee/afghanbitani
-
-## Responses (9)
-
-[](https://policy.medium.com/medium-rules-30e5502c4eb4?source=post_page---post_responses--34f95510167c---------------------------------------)
-![](https://miro.medium.com/v2/resize:fill:32:32/1*dmbNkD5D-u45r44go_cf0g.png)
-
-Write a response
-
-[What are your thoughts?](/m/signin?operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fyour-website-doesnt-rank-1-because-you-re-missing-these-3-pages-34f95510167c&source=---post_responses--34f95510167c---------------------respond_sidebar------------------)What are your thoughts?
-
-[](/@soumyasrivastavaa?source=post_page---post_responses--34f95510167c----0-----------------------------------)
-![Soumya Srivastava](https://miro.medium.com/v2/resize:fill:32:32/1*MzxSAEaz_FBA9gRsQmnqeA.jpeg)
-
-[Soumya Srivastava](/@soumyasrivastavaa?source=post_page---post_responses--34f95510167c----0-----------------------------------)Soumya Srivastava
-
-[Aug 7](/@soumyasrivastavaa/redirecting-attention-from-backlinks-or-speed-to-structural-gaps-like-not-having-a-dedicated-about-04295ac5c0c4?source=post_page---post_responses--34f95510167c----0-----------------------------------)Aug 7
-
-
-[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2F04295ac5c0c4&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40soumyasrivastavaa%2Fredirecting-attention-from-backlinks-or-speed-to-structural-gaps-like-not-having-a-dedicated-about-04295ac5c0c4&user=Soumya+Srivastava&userId=4d25c8a7e4b3&source=---post_responses--04295ac5c0c4----0-----------------respond_sidebar------------------)--
-
-Reply
-
-[](/@lisapats?source=post_page---post_responses--34f95510167c----1-----------------------------------)
-![Lisa Sicard](https://miro.medium.com/v2/resize:fill:32:32/1*NEKV0483PiGRp5u31VHtQg.jpeg)
-
-[Lisa Sicard](/@lisapats?source=post_page---post_responses--34f95510167c----1-----------------------------------)Lisa Sicard
-
-[Aug 19](https://lisapats.medium.com/thanks-i-had-started-an-faq-page-and-never-finished-it-this-article-motivates-me-now-ef0556a04301?source=post_page---post_responses--34f95510167c----1-----------------------------------)Aug 19
-
-
-[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2Fef0556a04301&operation=register&redirect=https%3A%2F%2Flisapats.medium.com%2Fthanks-i-had-started-an-faq-page-and-never-finished-it-this-article-motivates-me-now-ef0556a04301&user=Lisa+Sicard&userId=856a3ca110f&source=---post_responses--ef0556a04301----1-----------------respond_sidebar------------------)--
-
-1 reply
-
-Reply
-
-[](/@chinmaybhatk?source=post_page---post_responses--34f95510167c----2-----------------------------------)
-![Chinmay Bhat](https://miro.medium.com/v2/resize:fill:32:32/1*XTnuH2LTGY24KlFfTNSqcQ.png)
-
-[Chinmay Bhat](/@chinmaybhatk?source=post_page---post_responses--34f95510167c----2-----------------------------------)Chinmay Bhat
-
-[Aug 17](https://chinmaybhatk.medium.com/along-with-this-we-should-consider-geo-so-that-website-would-appear-as-suggestion-when-someone-141722961575?source=post_page---post_responses--34f95510167c----2-----------------------------------)Aug 17
-
-
-[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fvote%2Fp%2F141722961575&operation=register&redirect=https%3A%2F%2Fchinmaybhatk.medium.com%2Falong-with-this-we-should-consider-geo-so-that-website-would-appear-as-suggestion-when-someone-141722961575&user=Chinmay+Bhat&userId=95fa394a3c2d&source=---post_responses--141722961575----2-----------------respond_sidebar------------------)--
-
-1 reply
-
-Reply
-
-## More from Afghan Bitani | Local SEO + Web Design Agency
-
-![How I Boosted My Website Traffic by 108% in Just 5 Minutes](https://miro.medium.com/v2/resize:fit:679/format:webp/0*cryeVkHxaVmlRFaa)
-
-[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----0---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----0---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
-
-[A response icon16](/@afghankhanbitani/how-i-boosted-my-website-traffic-by-108-in-just-5-minutes-d5c1c944942f?source=post_page---author_recirc--34f95510167c----0---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd5c1c944942f&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fhow-i-boosted-my-website-traffic-by-108-in-just-5-minutes-d5c1c944942f&source=---author_recirc--34f95510167c----0-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![Copy My Exact Blog Post Formula That Turns Readers Into Customers](https://miro.medium.com/v2/resize:fit:679/format:webp/1*wwUMFUalu3V1Vy13tOwauA.png)
-
-[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----1---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----1---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
-
-[A response icon5](/@afghankhanbitani/copy-my-exact-blog-post-formula-that-turns-readers-into-customers-cb1a65bb11ec?source=post_page---author_recirc--34f95510167c----1---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fcb1a65bb11ec&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fcopy-my-exact-blog-post-formula-that-turns-readers-into-customers-cb1a65bb11ec&source=---author_recirc--34f95510167c----1-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![9 Tips to Rank Your WEBSITE From Page 20 to Page 1 in One Month](https://miro.medium.com/v2/resize:fit:679/format:webp/1*Wnb36TWJwsaS7DK16MBWAQ.png)
-
-[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
-
-[A response icon1](/@afghankhanbitani/9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8?source=post_page---author_recirc--34f95510167c----2---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd18ed65a3cc8&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2F9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8&source=---author_recirc--34f95510167c----2-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![SEO vs AEO: What Most "Experts" Aren't Telling You](https://miro.medium.com/v2/resize:fit:679/format:webp/0*xVLz-wzTpOg6rOhl)
-
-[](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----3---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c----3---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)Afghan Bitani | Local SEO + Web Design Agency
-
-[A response icon4](/@afghankhanbitani/seo-vs-aeo-what-most-experts-arent-telling-you-7dd07dba91ea?source=post_page---author_recirc--34f95510167c----3---------------------2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F7dd07dba91ea&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2Fseo-vs-aeo-what-most-experts-arent-telling-you-7dd07dba91ea&source=---author_recirc--34f95510167c----3-----------------bookmark_preview----2a100a3f_e15e_466d_8d47_1f322d7d551b--------------)[See all from Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---author_recirc--34f95510167c---------------------------------------)
-
-## Recommended from Medium
-
-![12 High-Selling Digital Products You Can Build with ChatGPT](https://miro.medium.com/v2/resize:fit:679/format:webp/1*AF61oVIEC6lUHDMJ1ldsKQ.png)
-
-[](https://medium.com/how-to-profit-ai?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
-![How To Profit AI](https://miro.medium.com/v2/resize:fill:20:20/1*MhopXz6GfyxYDCrmlBxymQ.png)
-
-In
-
-[How To Profit AI](https://medium.com/how-to-profit-ai?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)How To Profit AI
-
-by
-
-[Mohamed Bakry](/@mbakry?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Mohamed Bakry
-
-[A response icon81](/how-to-profit-ai/12-high-selling-digital-products-you-can-build-with-chatgpt-3905e8d315a5?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F3905e8d315a5&operation=register&redirect=https%3A%2F%2Fblog.howtoprofitai.com%2F12-high-selling-digital-products-you-can-build-with-chatgpt-3905e8d315a5&source=---read_next_recirc--34f95510167c----0-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
-![9 Tips to Rank Your WEBSITE From Page 20 to Page 1 in One Month](https://miro.medium.com/v2/resize:fit:679/format:webp/1*Wnb36TWJwsaS7DK16MBWAQ.png)
-
-[](/@afghankhanbitani?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
-![Afghan Bitani | Local SEO + Web Design Agency](https://miro.medium.com/v2/resize:fill:20:20/1*wGOKTooNLrc7wps8WuRweg.png)
-
-[Afghan Bitani | Local SEO + Web Design Agency](/@afghankhanbitani?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Afghan Bitani | Local SEO + Web Design Agency
-
-[A response icon1](/@afghankhanbitani/9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd18ed65a3cc8&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40afghankhanbitani%2F9-tips-to-rank-your-website-from-page-20-to-page-1-in-one-month-d18ed65a3cc8&source=---read_next_recirc--34f95510167c----1-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
-![Identifying the Hero in Your Brand Story (Hint: It's Not You)](https://miro.medium.com/v2/resize:fit:679/format:webp/0*o4HkZSHuiXJxcVto)
-
-[](https://medium.com/strategic-content-marketing?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
-![Strategic Content Marketing](https://miro.medium.com/v2/resize:fill:20:20/1*1iPCCoU6fSd9A_juU1EGbw.png)
-
-In
-
-[Strategic Content Marketing](https://medium.com/strategic-content-marketing?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Strategic Content Marketing
-
-by
-
-[Dan Salva](/@dansalva?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Dan Salva
-
-[](/strategic-content-marketing/identifying-the-hero-in-your-brand-story-hint-its-not-you-6ae8797762b1?source=post_page---read_next_recirc--34f95510167c----0---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F6ae8797762b1&operation=register&redirect=https%3A%2F%2Fmedium.com%2Fstrategic-content-marketing%2Fidentifying-the-hero-in-your-brand-story-hint-its-not-you-6ae8797762b1&source=---read_next_recirc--34f95510167c----0-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
-![14 SEO Steps I Recommend for Your New Website in 2025](https://miro.medium.com/v2/resize:fit:679/format:webp/0*_7fg4P8ahsR56JId)
-
-[](/@makarenko.roman121?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
-![Makarenko Roman](https://miro.medium.com/v2/resize:fill:20:20/1*Bg_8xtFL7Aab6NmiNiq59w.jpeg)
-
-[Makarenko Roman](/@makarenko.roman121?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Makarenko Roman
-
-[A response icon14](/@makarenko.roman121/14-seo-steps-i-recommend-for-your-new-website-in-2025-3cd3c1587c3a?source=post_page---read_next_recirc--34f95510167c----1---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F3cd3c1587c3a&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40makarenko.roman121%2F14-seo-steps-i-recommend-for-your-new-website-in-2025-3cd3c1587c3a&source=---read_next_recirc--34f95510167c----1-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
-![An iPad is being used on a coffee shop](https://miro.medium.com/v2/resize:fit:679/format:webp/0*txJMGOWNUl2HvVoM)
-
-[](/@bberkerceylan?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
-![Berker Ceylan](https://miro.medium.com/v2/resize:fill:20:20/1*oTmUxbLgxXAxhPWNuPFZlw.jpeg)
-
-[Berker Ceylan](/@bberkerceylan?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Berker Ceylan
-
-[A response icon15](/@bberkerceylan/the-definitive-ipados-tips-tricks-list-d85f77c2ac1c?source=post_page---read_next_recirc--34f95510167c----2---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2Fd85f77c2ac1c&operation=register&redirect=https%3A%2F%2Fmedium.com%2F%40bberkerceylan%2Fthe-definitive-ipados-tips-tricks-list-d85f77c2ac1c&source=---read_next_recirc--34f95510167c----2-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)
-![The Ultra-Rich Know What's Coming](https://miro.medium.com/v2/resize:fit:679/format:webp/1*qlgMEv4WryAx9oCNzfQ8WQ.jpeg)
-
-[](https://medium.com/the-investors-handbook?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)
-![Investor's Handbook](https://miro.medium.com/v2/resize:fill:20:20/1*u0wu5PnC9aa0840jj0t6Gw.png)
-
-In
-
-[Investor's Handbook](https://medium.com/the-investors-handbook?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Investor's Handbook
-
-by
-
-[Noel Johnson](/@johnsonanthonyservices?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)Noel Johnson
-
-[A response icon137](/the-investors-handbook/the-ultra-rich-know-whats-coming-98ada61425f8?source=post_page---read_next_recirc--34f95510167c----3---------------------18225917_dc18_46b8_8759_7da777528b20--------------)[](/m/signin?actionUrl=https%3A%2F%2Fmedium.com%2F_%2Fbookmark%2Fp%2F98ada61425f8&operation=register&redirect=https%3A%2F%2Fmedium.com%2Fthe-investors-handbook%2Fthe-ultra-rich-know-whats-coming-98ada61425f8&source=---read_next_recirc--34f95510167c----3-----------------bookmark_preview----18225917_dc18_46b8_8759_7da777528b20--------------)[See more recommendations](/?source=post_page---read_next_recirc--34f95510167c---------------------------------------)[Help](https://help.medium.com/hc/en-us?source=post_page-----34f95510167c---------------------------------------)Help
-
-[Status](https://medium.statuspage.io/?source=post_page-----34f95510167c---------------------------------------)Status
-
-[About](/about?autoplay=1&source=post_page-----34f95510167c---------------------------------------)About
-
-[Careers](/jobs-at-medium/work-at-medium-959d1a85284e?source=post_page-----34f95510167c---------------------------------------)Careers
-
-[Press](mailto:pressinquiries@medium.com)Press
-
-[Blog](https://blog.medium.com/?source=post_page-----34f95510167c---------------------------------------)Blog
-
-[Privacy](https://policy.medium.com/medium-privacy-policy-f03bf92035c9?source=post_page-----34f95510167c---------------------------------------)Privacy
-
-[Rules](https://policy.medium.com/medium-rules-30e5502c4eb4?source=post_page-----34f95510167c---------------------------------------)Rules
-
-[Terms](https://policy.medium.com/medium-terms-of-service-9db0094a1e0f?source=post_page-----34f95510167c---------------------------------------)Terms
-
-[Text to speech](https://speechify.com/medium?source=post_page-----34f95510167c---------------------------------------)Text to speech`;
-
-	if (!query) {
-		return c.json({ success: false, error: "Query is required" }, 400);
-	}
+const generateVectorEmbeddings = async (obj) => {
+	const {
+		id,
+		name,
+		state,
+		latitude,
+		longitude,
+		wikipedia_content,
+		unsplash_images,
+		images,
+	} = obj;
+	const joinedText = [
+		name,
+		state,
+		`lat:${latitude}, long:${longitude}`,
+		JSON.stringify(wikipedia_content),
+		unsplash_images?.join(", "),
+		images?.join(", "),
+	].join("\n");
 
 	// Generate embedding for the search query
-	const markdownEmbedding = await createEmbeddingRecord(
-		markdown,
-		`unique_id_${Math.random() + Date.now()}`,
-		query
+	const { vector: embeddingVector } = await createEmbeddingRecord(
+		joinedText,
+		`unique_id_${Math.random() + Date.now()}`
 	);
-	const markdownVector = Array.from(markdownEmbedding.vector);
 
-	const queryEmbeddingData = await embedder(query, {
-		pooling: "mean",
-		normalize: true,
-	});
-	const queryVector = Array.from(queryEmbeddingData.data);
+	// same time update supabase using obj.id
+	const { error } = await supabase
+		.from("locations")
+		.update({
+			vectorEmbedding: embeddingVector,
+		})
+		.eq("id", id);
 
-	let results = [];
-	const similarity = cosineSimilarity(queryVector, markdownVector);
+	if (error) {
+		console.error("❌ Error updating supabase:", error);
+		return {
+			id,
+			error: error.message,
+			success: false,
+		};
+	}
+	return {
+		id,
+		vectorEmbedding: embeddingVector,
+		success: true,
+	};
+};
 
-	results.push({
-		similarity,
-		content: markdownEmbedding.content,
-	});
-
-	// Sort by similarity (highest first) and limit results
-	results.sort((a, b) => b.similarity - a.similarity);
-	const topResults = results.slice(0, limit);
-
+// Create an API endpoint (example shown with ExpressJS)
+app.post("/generate-embeddings", async (c) => {
 	return c.json({
 		success: true,
-		query,
-		results: topResults,
-		matchedContent:
-			similarity > 0.7
-				? markdownEmbedding.content.slice(0, 500) + "..."
-				: "No significant match",
+		embeddings: filteredEmbeddings,
+		timestamp: new Date().toISOString(),
 	});
+});
+
+app.post("/perform-search", async (c) => {
+	const { query, num = 10 } = await c.req.json();
+	if (!query) {
+		return c.json({ error: "Query text is required" }, 400);
+	}
+	try {
+		// Generate embedding for the search query
+		const embeddingResult = await embedder(query, {
+			pooling: "mean",
+			normalize: true,
+		});
+		const queryVector = Array.from(embeddingResult.data);
+
+		const { data: results, error } = await supabase.rpc("match_locations", {
+			query_embedding: queryVector,
+			match_threshold: 0.2,
+			match_count: num,
+		});
+		return c.json(
+			{
+				data: results,
+			},
+			200
+		);
+	} catch (err) {
+		console.error(err);
+		return c.json({ error: "Server error" }, 500);
+	}
 });
 
 export default app;

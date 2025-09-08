@@ -21,13 +21,14 @@ const AVAILABLE_MODELS = [
 ];
 
 const ollamaClient = new ChatOllama({
-	model: "deepseek-r1:1.5b", // Using one of your available models
+	model: "granite3.3:2b", // Using one of your available models
 	baseURL: "http://localhost:11434",
 });
 
 const genai = new GoogleGenAI({
 	apiKey: process.env.GOOGLE_GENAI_API_KEY,
 });
+
 const getRandomInt = (min, max) =>
 	Math.floor(Math.random() * (max - min + 1)) + min;
 function get_useragent() {
@@ -290,7 +291,7 @@ Please provide a comprehensive answer to the question using the search results a
 		}
 
 		// Generate final response
-		const finalResponse = await ollama.chat({
+		const finalResponse = await ollamaClient.generate({
 			model: modelName,
 			messages: [
 				{
@@ -301,12 +302,21 @@ Please provide a comprehensive answer to the question using the search results a
 					role: "user",
 					content: finalPrompt,
 				},
+				{
+					role: "tool",
+					content: "google_search",
+					tool_call_id: "google_search",
+					tool_choice: "auto",
+					tool_input: {
+						query: prompt,
+					},
+				},
 			],
 			stream: false,
 		});
 
 		return {
-			response: finalResponse.message.content,
+			response: finalResponse.llmOutput,
 			searchResults: searchResults,
 			model: modelName,
 			searchesPerformed: searchResults.length > 0,
@@ -333,3 +343,5 @@ serve({
 	fetch: app.fetch,
 	port: 3000,
 });
+
+
