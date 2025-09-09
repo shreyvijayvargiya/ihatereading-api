@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore, storage } from "./firebase.js";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { chromium } from "playwright";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
@@ -23,6 +23,11 @@ import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import { logger } from "hono/logger";
 import { env, pipeline as hgpipeline } from "@huggingface/transformers";
+import UserAgents from "user-agents";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import remarkStringify from "remark-stringify";
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -46,8 +51,9 @@ function get_useragent() {
 
 const ollama = new ChatOllama({
 	// model: "gemma:2b",
-	model: "granite3.3:2b",
+	model: "gemma3:270m",
 	baseURL: "http://localhost:11434",
+	temperature: 0.5,
 });
 
 // Load environment variables
@@ -692,9 +698,6 @@ export const customLogger = (message, ...rest) => {
 	console.log(message, ...rest);
 };
 app.use(logger(customLogger));
-
-// --- Anti-bot utilities: randomized headers/timing and session reuse ---
-import UserAgents from "user-agents";
 
 const sessionStore = new Map(); // key: domain, value: { cookies: [], updatedAt: number }
 
@@ -2940,6 +2943,64 @@ const dataExtractionFromHtml = (html, options) => {
 	return data;
 };
 
+function chunkMarkdownByHeaders(markdown, maxChunkSize = 1000) {
+	// Parse markdown into AST
+	const tree = unified().use(remarkParse).parse(markdown);
+
+	// Accumulate chunk nodes and metadata
+	const chunks = [];
+	let currentChunk = [];
+	let currentSize = 0;
+
+	function pushChunk() {
+		if (currentChunk.length > 0) {
+			const chunkRoot = { type: "root", children: currentChunk };
+			const chunkMarkdown = unified().use(remarkStringify).stringify(chunkRoot);
+			chunks.push(chunkMarkdown.trim());
+			currentChunk = [];
+			currentSize = 0;
+		}
+	}
+
+	// Walk through top-level nodes grouping by size (approximate char length)
+	for (const node of tree.children) {
+		const nodeText = unified()
+			.use(remarkStringify)
+			.stringify({ type: "root", children: [node] });
+		const nodeLength = nodeText.length;
+
+		if (currentSize + nodeLength > maxChunkSize) {
+			pushChunk();
+		}
+
+		currentChunk.push(node);
+		currentSize += nodeLength;
+	}
+
+	// Push leftover chunk
+	pushChunk();
+
+	return chunks;
+}
+
+async function createMarkdownEmbeddingRecords(markdown, idPrefix = "chunk") {
+	const chunks = chunkMarkdownByHeaders(markdown, 1000); // 1000 chars per chunk
+
+	const embeddingRecords = [];
+	for (let i = 0; i < chunks.length; i++) {
+		const chunk = chunks[i];
+		const id = `${idPrefix}-${i}`;
+
+		const embeddingRecord = await createEmbeddingRecord(chunk, id, {
+			chunkIndex: i,
+			totalChunks: chunks.length,
+		});
+		embeddingRecords.push(embeddingRecord);
+	}
+
+	return embeddingRecords;
+}
+
 // New Puppeteer-based URL scraping endpoint
 app.post("/scrap-url-puppeteer", async (c) => {
 	customLogger("Scraping URL with Puppeteer", await c.req.header());
@@ -2954,6 +3015,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		extractMetadata = true,
 		includeCache = false,
 		useProxy = false,
+		aiSummary = false,
 	} = await c.req.json();
 
 	const isValidUrl = isValidURL(url);
@@ -3033,6 +3095,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		const chromium = (await import("@sparticuz/chromium")).default;
 
 		const maxAttempts = useProxy ? 3 : 1;
+		let lastError;
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			let selectedProxy = null;
@@ -3675,8 +3738,43 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					removeEmptyKeys(scrapedData?.content);
 				}
 
+				let summary;
+				if (aiSummary) {
+					let MAX_TOKENS_LIMIT = 3000;
+					const splitter = RecursiveCharacterTextSplitter.fromLanguage(
+						"markdown",
+						{
+							separators: "\n\n",
+							chunkSize: 1024,
+							chunkOverlap: 128,
+						}
+					);
+					const chunkInput = await splitter.splitText(markdown);
+					const slicedChunkInput = chunkInput.slice(0, MAX_TOKENS_LIMIT);
+					const chunkedMarkdown = slicedChunkInput.join("\n\n");
+					const aiResponse = await genai.models.generateContent({
+						model: "gemini-1.5-flash",
+						contents: [
+							{
+								role: "user",
+								parts: [
+									{
+										text: `Summarize the following markdown: ${chunkedMarkdown};
+										The length or token count for the summary depend on the content but always lies between
+										100 to 1000 tokens
+										
+										`,
+									},
+								],
+							},
+						],
+					});
+					summary = aiResponse.candidates[0].content.parts[0].text;
+				}
+
 				return c.json({
 					success: true,
+					summary: summary,
 					data: scrapedData,
 					url: url,
 					markdown: markdown,
@@ -3714,6 +3812,317 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		if (browser) {
 			await browser.close();
 		}
+	}
+});
+
+app.post("/scrap-url-llm", async (c) => {
+	try {
+		const { url, prompt } = await c.req.json();
+		const xfProto = c.req.header("x-forwarded-proto") || "http";
+		const xfHost = c.req.header("x-forwarded-host") || c.req.header("host");
+		const fallbackHost = `127.0.0.1:${process.env.PORT || "3000"}`;
+		const baseUrl = `${xfProto}://${xfHost || fallbackHost}`;
+
+		const response = await axios.post(
+			`${baseUrl}/scrap-url-puppeteer`,
+			{ url },
+			{ headers: { "Content-Type": "application/json" }, timeout: 60000 }
+		);
+
+		const markdown =
+			response.data?.markdown || response.data?.data?.markdown || "";
+
+		const splitter = RecursiveCharacterTextSplitter.fromLanguage("markdown", {
+			separators: "\n\n",
+			chunkSize: 1024,
+			chunkOverlap: 128,
+		});
+
+		const chunkInput = await splitter.splitText(markdown);
+		const MAX_TOKENS_LIMIT = 1000;
+
+		const slicedChunkInput = chunkInput.slice(0, MAX_TOKENS_LIMIT);
+		const chunkedMarkdown = slicedChunkInput.join("\n\n");
+
+		const systemPrompt = `You are a helpful assistant that improves markdown readability while preserving every word exactly as in the input.
+Given below is the chunked markdown content scraped from url: 
+${chunkedMarkdown}
+Instructions:
+- Create the complete markdown for the user
+- Make sure the formatting, syntax is correct 
+- Format the output strictly as markdown ready for LLM consumption.
+		`;
+
+		const contents = [
+			{
+				role: "model",
+				parts: [
+					{
+						text: systemPrompt,
+					},
+				],
+			},
+		];
+
+		if (prompt && String(prompt).trim().length > 0) {
+			contents.push({
+				role: "user",
+				parts: [
+					{
+						text: String(prompt),
+					},
+				],
+			});
+		}
+
+		const llmResponse = await genai.models.generateContent({
+			model: "gemini-1.5-flash",
+			contents,
+		});
+
+		const llmMarkdown = llmResponse.candidates[0].content.parts[0].text;
+		const tokenCount = llmResponse.candidates[0].tokenCount;
+		const promptTokenCount = llmResponse.usageMetadata.promptTokenCount;
+		const candidateTokenCount = llmResponse.usageMetadata.candidatesTokenCount;
+		return c.json({
+			success: true,
+			response: llmMarkdown,
+			chunkedMarkdown: chunkedMarkdown,
+			tokenCount: tokenCount,
+			candidateTokenCount: candidateTokenCount,
+			promptTokenCount: promptTokenCount,
+		});
+	} catch (error) {
+		console.log("Error in LLM scraping", error);
+		return c.json({ success: false, error: error.message }, 500);
+	}
+});
+
+const searchFnDecl = {
+	name: "google_search",
+	description:
+		"Search Google and return results with title, link, description.",
+	parameters: {
+		type: Type.OBJECT,
+		properties: {
+			query: { type: Type.STRING, description: "Search query" },
+			num: { type: Type.NUMBER, description: "Number of results" },
+			language: { type: Type.STRING, description: "Language code" },
+			country: { type: Type.STRING, description: "Country code" },
+		},
+		required: ["query"],
+	},
+};
+
+const scrapFnDecl = {
+	name: "scrap_url",
+	description: "Scrape a URL and return chunkedMarkdown.",
+	parameters: {
+		type: Type.OBJECT,
+		properties: {
+			url: { type: Type.STRING, description: "URL to scrape" },
+		},
+		required: ["url"],
+	},
+};
+
+const scrapMetadataDecl = {
+	name: "scrap_metadata",
+	description: "Scrape metadata from a URL.",
+	parameters: {
+		type: Type.OBJECT,
+		properties: {
+			url: {
+				type: Type.STRING,
+				description: "URL to scrape metadata from",
+			},
+		},
+	},
+};
+const crawlUrlFnDecl = {
+	name: "crawl_url",
+	description: "Crawl a URL and return chunkedMarkdown.",
+	parameters: {
+		type: Type.OBJECT,
+		properties: {
+			url: { type: Type.STRING, description: "URL to crawl" },
+		},
+		required: ["url"],
+	},
+};
+// One endpoint: LLM answers, and can call google-search and scrap-url-puppeteer as needed
+app.post("/ai-answer", async (c) => {
+	try {
+		const { prompt, numResults = 5 } = await c.req.json();
+		if (!prompt || String(prompt).trim().length === 0) {
+			return c.json({ success: false, error: "prompt is required" }, 400);
+		}
+
+		const xfProto = c.req.header("x-forwarded-proto") || "http";
+		const xfHost = c.req.header("x-forwarded-host") || c.req.header("host");
+		const fallbackHost = `127.0.0.1:${process.env.PORT || "3000"}`;
+		const baseUrl = `${xfProto}://${xfHost || fallbackHost}`;
+
+		let response = await genai.models.generateContent({
+			model: "gemini-1.5-flash",
+			contents: [
+				{
+					role: "user",
+					parts: [
+						{
+							text: `You are a highly precise and helpful assistant. Follow these instructions strictly:
+
+1. To provide exact answers based on source content, **always prioritize using scrap_url** to fetch the full page content in markdown format before answering.
+
+2. Use google_search only for finding relevant URLs or data sources. Your search queries must be clear, context-rich, and optimized for precise, high-quality results.
+
+3. Use scrap_metadata strictly for obtaining webpage metadata like titles, descriptions, or authors as necessary.
+
+4. Use crawl_url only when explicitly instructed or if you need to gather all links from a webpage.
+
+5. Do not answer the user queries directly without first attempting to collect supporting information from the appropriate tools.
+
+6. When combining information, rely on the scrapped URL content primarily to build accurate and comprehensive responses.
+
+7. Keep all queries and tool calls concise but meaningful and aligned with the user’s prompt.
+
+8. Strictly use tools provided to you and do not answer without using google search tool
+
+User prompt: ${prompt}`,
+						},
+					],
+				},
+			],
+			config: {
+				tools: [
+					{
+						functionDeclarations: [
+							searchFnDecl,
+							scrapFnDecl,
+							scrapMetadataDecl,
+							crawlUrlFnDecl,
+						],
+					},
+				],
+			},
+		});
+
+
+		const toolCalls =
+			response.candidates?.[0]?.content?.parts?.filter((p) => p.functionCall) ||
+			[];
+		const conversation = [
+			{ role: "user", parts: [{ text: prompt }] },
+			{ role: "model", parts: response.candidates?.[0]?.content?.parts || [] },
+		];
+
+		const toolArtifacts = {
+			searchResults: [],
+			scraps: [],
+			metadata: [],
+			crawlUrls: [],
+		};
+
+		for (const callPart of toolCalls) {
+			const { name, args } = callPart.functionCall;
+			let resultPayload;
+			if (name === "google_search") {
+				const searchReq = {
+					query: args?.query || prompt,
+					num: Number(args?.num ?? numResults),
+					language: args?.language || "en",
+					country: args?.country || "in",
+				};
+				const searchRes = await axios.post(
+					`${baseUrl}/google-search`,
+					searchReq,
+					{
+						headers: { "Content-Type": "application/json" },
+					}
+				);
+				resultPayload =
+					searchRes.data?.results?.map((r) => ({
+						title: r.title,
+						link: r.link,
+						description: r.description,
+					})) || [];
+				toolArtifacts.searchResults.push(...resultPayload);
+			} else if (name === "scrap_url") {
+				const scrapRes = await axios.post(
+					`${baseUrl}/scrap-url-puppeteer`,
+					{ url: args?.url },
+					{
+						headers: { "Content-Type": "application/json" },
+						timeout: 60000,
+					}
+				);
+				resultPayload = {
+					url: args?.url,
+					chunkedMarkdown:
+						scrapRes.data?.markdown || scrapRes.data?.data?.markdown,
+				};
+				toolArtifacts.scraps.push(resultPayload);
+			} else if (name === "scrap_metadata") {
+				const scrapMetadataRes = await axios.post(
+					`${baseUrl}/take-metadata`,
+					{ url: args?.url },
+					{ headers: { "Content-Type": "application/json" } }
+				);
+				resultPayload = {
+					url: args?.url,
+					metadata: scrapMetadataRes.data?.metadata,
+				};
+				toolArtifacts.metadata.push(resultPayload);
+			} else if (name === "crawl_url") {
+				const crawlUrlRes = await axios.post(
+					`${baseUrl}/crawl-url`,
+					{ url: args?.url },
+					{ headers: { "Content-Type": "application/json" } }
+				);
+				resultPayload = {
+					url: args?.url,
+					crawlUrls: crawlUrlRes.data?.crawledUrls,
+				};
+				toolArtifacts.crawlUrls.push(resultPayload);
+			}
+
+			conversation.push({
+				role: "user",
+				parts: [
+					{ text: `Function ${name} result: ${JSON.stringify(resultPayload)}` },
+				],
+			});
+			conversation.push({
+				role: "model",
+				parts: [
+					{
+						text: `You are a helpful assistant. Answer the user's prompt. 
+							User prompt: ${prompt}
+
+							The answer should be precise to the user query, provide citiations, links and metadata and 
+							single page markdown content fetched and added below 
+							Strictly follow the instructions and use the tools provided.
+							
+							Function ${name} result: ${JSON.stringify(resultPayload)}`,
+					},
+				],
+			});
+			response = await genai.models.generateContent({
+				model: "gemini-1.5-flash",
+				contents: conversation,
+			});
+		}
+
+		const finalText = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+		return c.json({
+			success: true,
+			response: finalText,
+			tools: toolArtifacts,
+			usageMetadata: response.usageMetadata.totalTokenCount,
+		});
+	} catch (error) {
+		console.error("/ai-answer error:", error);
+		return c.json({ success: false, error: error.message }, 500);
 	}
 });
 
