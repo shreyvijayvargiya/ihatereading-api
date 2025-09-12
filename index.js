@@ -686,9 +686,7 @@ const randomDelay = async (minMs = 150, maxMs = 650) => {
 // Try to resolve Chrome/Chromium path dynamically for puppeteer-core in prod
 const getChromeExecutablePath = () => {
 	const candidates = [
-		process.env.PUPPETEER_EXECUTABLE_PATH,
-		process.env.CHROME_PATH,
-		process.env.GOOGLE_CHROME_BIN,
+		...chromium.executablePath(),
 		"/usr/bin/google-chrome",
 		"/usr/bin/google-chrome-stable",
 		"/usr/bin/chromium",
