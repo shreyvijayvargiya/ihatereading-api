@@ -1259,6 +1259,7 @@ app.post("/ddg-search", async (c) => {
 	let browser;
 	const results = [];
 	try {
+		import("puppeteer-extra-plugin-stealth/evasions/chrome.app/index.js");
 		const selectedProxy = proxyManager.getNextProxy();
 		const puppeteerExtra = (await import("puppeteer-extra")).default;
 		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
