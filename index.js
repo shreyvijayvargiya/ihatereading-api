@@ -1266,6 +1266,7 @@ app.post("/ddg-search", async (c) => {
 	let browser;
 	try {
 		const selectedProxy = proxyManager.getNextProxy();
+		const executablePath = getChromeExecutablePath();
 		browser = await puppeteer.launch({
 			args: [
 				`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
@@ -1276,8 +1277,7 @@ app.post("/ddg-search", async (c) => {
 				"--single-process",
 			],
 			headless: true,
-			executablePath:
-				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			executablePath: executablePath || undefined,
 		});
 
 		const page = await browser.newPage();
