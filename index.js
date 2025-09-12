@@ -13,6 +13,7 @@ import { ChatOllama } from "@langchain/ollama";
 import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
+import fs from "fs";
 import axios from "axios";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
@@ -682,6 +683,24 @@ const randomDelay = async (minMs = 150, maxMs = 650) => {
 	return new Promise((resolve) => setTimeout(resolve, jitter));
 };
 
+// Try to resolve Chrome/Chromium path dynamically for puppeteer-core in prod
+const getChromeExecutablePath = () => {
+	const candidates = [
+		process.env.PUPPETEER_EXECUTABLE_PATH,
+		process.env.CHROME_PATH,
+		process.env.GOOGLE_CHROME_BIN,
+		"/usr/bin/google-chrome",
+		"/usr/bin/google-chrome-stable",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+	];
+	for (const p of candidates) {
+		if (p && fs.existsSync(p)) return p;
+	}
+	return null;
+};
+
 const commonViewports = [
 	{ width: 1920, height: 1080 },
 	{ width: 1366, height: 768 },
@@ -1156,9 +1175,9 @@ app.post("/bing-search", async (c) => {
 			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
 		);
 
+		const executablePath = getChromeExecutablePath();
 		const browser = await puppeteer.launch({
-			executablePath:
-				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			executablePath: executablePath || undefined,
 			headless: "new",
 			args: launchArgs,
 		});
@@ -1398,7 +1417,7 @@ app.post("/google-search", async (c) => {
 		await page.goto(
 			`https://www.google.com/search?q=${encodeURIComponent(
 				query
-			)}&results=${num}&hl=${language}&gl=${country}`,
+			)}&hl=${language}&gl=${country}&num=${num}&pws=0`,
 			{
 				waitUntil: "domcontentloaded",
 				timeout: timeout,
