@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import fs from "fs";
-import { firestore } from "./firebase.js";
+import { firestore } from "../firebase.js";
 import { serve } from "@hono/node-server";
 import dotenv from "dotenv";
 

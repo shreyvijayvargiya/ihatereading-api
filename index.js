@@ -3,8 +3,9 @@ import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore, storage } from "./firebase.js";
 import { GoogleGenAI, Type } from "@google/genai";
-import { chromium } from "playwright";
 import dotenv from "dotenv";
+import puppeteer from "puppeteer-core";
+import chromium from "@sparticuz/chromium";
 import { createClient } from "@supabase/supabase-js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
@@ -28,6 +29,7 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
 import remarkStringify from "remark-stringify";
+import { reactRenderer } from "@hono/react-renderer";
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -340,101 +342,136 @@ class ProxyManager {
 	constructor() {
 		this.proxies = [
 			{
-				host: "23.95.150.145",
-				port: 6114,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-185.150.85.170",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "198.23.239.134",
-				port: 6540,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-45.154.194.148",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "45.38.107.97",
-				port: 6014,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-104.244.83.140",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "107.172.163.27",
-				port: 6543,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-58.97.241.46",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "64.137.96.74",
-				port: 6641,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-103.250.82.245",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "45.43.186.39",
-				port: 6257,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-83.229.13.167",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "154.203.43.247",
-				port: 5536,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-80.240.120.78",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "216.10.27.159",
-				port: 6837,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-121.91.189.75",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "136.0.207.84",
-				port: 6661,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-176.119.9.105",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
 			},
 			{
-				host: "142.147.128.93",
-				port: 6593,
-				username: "jpjjloxo",
-				password: "vy6njj7uds7x",
-				country: "US",
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-185.125.193.152",
+				password: "l5birkm39b9q",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-119.13.224.187",
+				password: "l5birkm39b9q",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-154.30.98.10",
+				password: "l5birkm39b9q",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-209.242.213.180",
+				password: "l5birkm39b9q",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-176.53.216.91",
+				password: "l5birkm39b9q",
+				lastUsed: 0,
+				failCount: 0,
+				isHealthy: true,
+			},
+			{
+				host: "brd.superproxy.io",
+				port: 33335,
+				username: "brd-customer-hl_ba1a3411-zone-freemium-ip-62.241.59.134",
+				password: "l5birkm39b9q",
 				lastUsed: 0,
 				failCount: 0,
 				isHealthy: true,
@@ -639,49 +676,46 @@ class ProxyManager {
 const proxyManager = new ProxyManager();
 
 // Utility function to create browser context with proxy
-const createBrowserContextWithProxy = async (browser, options = {}) => {
-	const proxy = proxyManager.getNextProxy();
+const createBrowserContextWithProxy = async () => {
+	const puppeteer = (await import("puppeteer-core")).default;
+	const launchArgs = [
+		"--no-sandbox",
+		"--disable-setuid-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-gpu",
+		"--no-zygote",
+		"--single-process",
+	];
+	const selectedProxy = proxyManager.getNextProxy();
+	launchArgs.push(
+		`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+	);
 
-	const contextOptions = {
-		userAgent:
-			options.userAgent ||
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		viewport: options.viewport || { width: 1920, height: 1080 },
-		extraHTTPHeaders: options.extraHTTPHeaders || {
-			dnt: "1",
-			"upgrade-insecure-requests": "1",
-			accept:
-				"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-			"sec-fetch-site": "none",
-			"sec-fetch-mode": "navigate",
-			"sec-fetch-user": "?1",
-			"sec-fetch-dest": "document",
-			"accept-language": "en-US,en;q=0.9",
-		},
-		proxy: {
-			server: `http://${proxy.host}:${proxy.port}`,
-			username: proxy.username,
-			password: proxy.password,
-		},
-	};
+	const browser = await puppeteer.launch({
+		executablePath:
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		headless: "new",
+		args: launchArgs,
+	});
+	const page = await browser.newPage();
+	await page.setUserAgent(
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+			"AppleWebKit/537.36 (KHTML, like Gecko) " +
+			"Chrome/123.0.0.0 Safari/537.36"
+	);
 
-	const context = await browser.newContext(contextOptions);
+	await page.setExtraHTTPHeaders({
+		"Accept-Language": "en-US,en;q=0.9",
+	});
 
-	// Store proxy info in context for later reference
-	context.proxyInfo = proxy;
-
-	return context;
-};
-
-// Utility function to handle proxy success/failure
-const handleProxyResult = (context, success) => {
-	if (context.proxyInfo) {
-		if (success) {
-			proxyManager.markProxySuccess(context.proxyInfo.host);
-		} else {
-			proxyManager.markProxyFailed(context.proxyInfo.host);
-		}
+	// Authenticate proxy if credentials exist
+	if (selectedProxy.username && selectedProxy.password) {
+		await page.authenticate({
+			username: selectedProxy.username,
+			password: selectedProxy.password,
+		});
 	}
+	return page;
 };
 
 const genai = new GoogleGenAI({
@@ -1179,211 +1213,6 @@ app.post("/scrap-google-maps", async (c) => {
 	}
 });
 
-// get top places and maps and locations from LLM by enhancing the system prompt
-// if didn't get location from LLM then try using locations supabase database for detailed
-app.post("/ai-travel-agent", async (c) => {
-	try {
-		const { prompt } = await c.req.json();
-
-		if (!prompt) {
-			return c.json(
-				{
-					success: false,
-					error: "Travel prompt is required",
-				},
-				400
-			);
-		}
-
-		const generateItineraryPrompt = (prompt) => {
-			return `You are a travel itinerary expert. Generate a detailed travel itinerary based on the following requirements:
-
-	${prompt}
-
-	Please follow these guidelines:
-	1. Analyze the prompt to determine the start and end destinations, number of days, and any specific requirements
-	2. For each location mentioned in the itinerary, create:
-	   a. A specific and optimized Google image search query that will return the best possible images. Follow these rules for image queries:
-	      - Include the full name of the location
-	      - Add descriptive terms like "landmark", "tourist spot", "famous", "beautiful", "scenic", "aerial view" where appropriate
-	      - Include specific features or attractions of the location
-	      - Use terms that will yield high-quality, professional photos
-	      - Avoid generic terms that might return irrelevant results
-	      - Format as: ![Location Name](query: "specific search query")
-	   
-	   b. A Google Maps location query for places that need coordinates. Follow these rules for location queries:
-	      - Always include the full name of the place
-	      - Always include the city/area name
-	      - Always include the country
-	      - For restaurants: include "restaurant" and street name if available
-	      - For hotels: include "hotel" and street name if available
-	      - For attractions: include specific identifiers (e.g., "temple", "museum", "park")
-	      - For meeting points: include nearby landmarks
-	      - Format as: [Location Name](location: "specific location query")
-	      - Use this format for ALL places that need coordinates: restaurants, hotels, attractions, meeting points, etc.
-	      - Be as specific as possible to ensure accurate coordinates
-
-	3. Format the response in Markdown with the following structure:
-
-	# Travel Itinerary
-
-	## Overview
-	- Brief summary of the trip
-	- Total duration
-	- Main highlights
-
-	## Day-by-Day Breakdown
-
-	### Day 1: [Location Name]
-	![Location Name](query: "location name landmark scenic view")
-	
-	#### Morning
-	- Activity 1 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
-	- Activity 2 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
-	
-	#### Afternoon
-	- Lunch at [Restaurant Name](location: "Restaurant Name, Street Name, City, Country restaurant")
-	- Activity 1 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
-	
-	#### Evening
-	- Dinner at [Restaurant Name](location: "Restaurant Name, Street Name, City, Country restaurant")
-	- Activity 1 (Time) at [Place Name](location: "Place Name, Street Name, City, Country")
-	
-	#### Accommodation
-	- [Hotel Name](location: "Hotel Name, Street Name, City, Country hotel")
-	- Estimated cost
-	
-	#### Local Cuisine
-	- Restaurant recommendations with location queries
-	- Must-try dishes
-	
-	#### Transportation
-	- How to get there
-	- Estimated cost
-
-	[Repeat for each day]
-
-	## Budget Breakdown
-	- Accommodation
-	- Transportation
-	- Activities
-	- Food
-	- Miscellaneous
-
-	## Travel Tips
-	- Best time to visit
-	- Local customs and etiquette
-	- Safety considerations
-	- Packing suggestions
-
-	Make sure to:
-	1. Include specific details about each location and activity
-	2. Provide accurate time estimates
-	3. Include practical information like costs and transportation options
-	4. Format all content in proper Markdown
-	5. For each location:
-	   - Create an optimized image search query that will return the best possible images
-	   - Add a location query for places that need coordinates
-	6. Use the formats:
-	   - ![Location Name](query: "specific search query") for images
-	   - [Location Name](location: "specific location query") for Google Maps coordinates
-
-	Example of good queries:
-	- Image query for Eiffel Tower: "Eiffel Tower Paris landmark aerial view sunset"
-	- Location query for Eiffel Tower: "Eiffel Tower, Champ de Mars, 75007 Paris, France"
-	
-	- Image query for Tokyo Skytree: "Tokyo Skytree Japan modern architecture night view"
-	- Location query for Tokyo Skytree: "Tokyo Skytree, 1 Chome-1-2 Oshiage, Sumida City, Tokyo, Japan"
-	
-	- Image query for Grand Canyon: "Grand Canyon Arizona USA scenic landscape aerial view"
-	- Location query for Grand Canyon: "Grand Canyon National Park, Arizona, United States"
-	
-	- Image query for Sensō-ji Temple: "Sensō-ji Temple Tokyo Asakusa district famous pagoda"
-	- Location query for Sensō-ji Temple: "Sensō-ji Temple, 2 Chome-3-1 Asakusa, Taito City, Tokyo, Japan"
-	
-	- Image query for Le Jules Verne: "Le Jules Verne Restaurant Eiffel Tower Paris fine dining"
-	- Location query for Le Jules Verne: "Le Jules Verne Restaurant, Eiffel Tower, 75007 Paris, France"
-	
-	- Image query for Park Hyatt Tokyo: "Park Hyatt Tokyo hotel luxury rooms city view"
-	- Location query for Park Hyatt Tokyo: "Park Hyatt Tokyo, 3-7-1-2 Nishishinjuku, Shinjuku City, Tokyo, Japan"`;
-		};
-		// User prompt with the travel requirements from user input
-		const userPrompt = `Create a detailed travel itinerary based on this request:
-
-${prompt}
-
-Please provide a comprehensive itinerary following the structure specified in the system prompt.`;
-
-		const initialItineraryResult = await genai.models.generateContent({
-			model: "gemini-1.5-flash",
-			contents: [
-				{ role: "model", parts: [{ text: generateItineraryPrompt(prompt) }] },
-				{ role: "user", parts: [{ text: userPrompt }] },
-			],
-			config: {
-				tools: [
-					{
-						googleSearch: true,
-						googleSearchRetrieval: true,
-					},
-				],
-			},
-		});
-
-		const itinerary =
-			initialItineraryResult.candidates[0].content.parts[0].text;
-		const thought =
-			initialItineraryResult.candidates[0].content.parts[0].thought;
-
-		return c.json({
-			itinerary: itinerary,
-			thought: thought,
-		});
-	} catch (error) {
-		console.error("AI Travel Agent Error:", error);
-		return c.json(
-			{
-				success: false,
-				error: error.message,
-			},
-			500
-		);
-	}
-});
-
-app.post("/find-latest-jobs", async (c) => {
-	const { query } = await c.req.json();
-	const urlEncodedQuery = encodeURIComponent(query);
-
-	const apiUrl = `https://jsearch.p.rapidapi.com/search?query=${urlEncodedQuery}&page=1&num_pages=1&date_posted=all`;
-
-	const response = await fetch(apiUrl, {
-		method: "GET",
-		headers: {
-			"x-rapidapi-host": "jsearch.p.rapidapi.com",
-			"x-rapidapi-key": "eIy5QzLhLAmshwdt2uWvSf1qt2FKp1WsxBfjsnW4MYd6YpicwO",
-		},
-	});
-
-	if (!response.ok) {
-		return c.json(
-			{
-				success: false,
-				error: `API error: ${response.status} ${response.statusText}`,
-			},
-			500
-		);
-	}
-
-	const data = await response.json();
-	return c.json({
-		success: true,
-		data,
-	});
-});
-
-// reading markdown using machine learning models to extract data using
-
 // Enhanced Bing Search endpoint using Axios
 app.post("/bing-search", async (c) => {
 	const {
@@ -1398,88 +1227,89 @@ app.post("/bing-search", async (c) => {
 		return c.json({ error: "Query parameter is required" }, 400);
 	}
 
-	const results = [];
 	try {
-		console.log(`🔍 Starting Bing search for: "${query}"`);
+		const puppeteer = (await import("puppeteer-core")).default;
+		const launchArgs = [
+			"--no-sandbox",
+			"--disable-setuid-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-gpu",
+			"--no-zygote",
+			"--single-process",
+		];
+		const selectedProxy = proxyManager.getNextProxy();
+		launchArgs.push(
+			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+		);
 
-		const response = await axios.get(`https://www.bing.com/search`, {
-			headers: {
-				"User-Agent": get_useragent(),
-				Accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-				"Accept-Language": `${language}-${country},${language};q=0.9`,
-				"Accept-Encoding": "gzip, deflate",
-				Referer: "https://www.bing.com/",
-				DNT: "1",
-				"Upgrade-Insecure-Requests": "1",
-			},
-			params: {
-				q: encodeURIComponent(query),
-				first: 1, // Start position (Bing uses 'first' instead of 'start')
-				count: Math.min(num, 10), // Bing's count parameter, max 10 per page
-				ln: language,
-				cc: country.toUpperCase(),
-			},
-			timeout: timeout,
-			// httpsAgent: new https.Agent({
-			// 	rejectUnauthorized: true,
-			// }),
+		const browser = await puppeteer.launch({
+			executablePath:
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			headless: "new",
+			args: launchArgs,
+		});
+		const page = await browser.newPage();
+		await page.setUserAgent(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+				"AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/123.0.0.0 Safari/537.36"
+		);
+
+		await page.setExtraHTTPHeaders({
+			"Accept-Language": "en-US,en;q=0.9",
+		});
+
+		// Authenticate proxy if credentials exist
+		if (selectedProxy.username && selectedProxy.password) {
+			await page.authenticate({
+				username: selectedProxy.username,
+				password: selectedProxy.password,
+			});
+		}
+
+		await page.goto(
+			`https://www.bing.com/search?q=${encodeURIComponent(
+				query
+			)}&setLang=${language}&count=${num}&pws=0`,
+			{
+				waitUntil: "domcontentloaded",
+				timeout: timeout,
+			}
+		);
+		const response = await page.evaluate(() => {
+			return {
+				html: document.documentElement.outerHTML,
+			};
+		});
+
+		let bingResults = [];
+		const $ = load(response.html);
+		$("li.b_algo").each((i, el) => {
+			const linkTag = $(el).find("h2 a");
+			const href = linkTag.attr("href") || "";
+			const title = linkTag.text().trim();
+			const description = $(el).find(".b_caption p").text().trim();
+
+			if (href && title) {
+				bingResults.push({ title, link: href, description });
+			}
 		});
 
 		// Use response.data directly - axios already handles UTF-8
-		const dom = new JSDOM(response.data);
+		const dom = new JSDOM(response.html, {
+			contentType: "text/html",
+			includeNodeLocations: false,
+			storageQuota: 10000000,
+		});
 		const document = dom.window.document;
-
-		// Get Bing search results using correct selectors
-		const result_block = document.querySelectorAll("li.b_algo,");
-
-		for (const result of result_block) {
-			// Try multiple title selectors for Bing
-			const title_tag = result.querySelector("h2 a, .b_title a, a[href]");
-			const description_tag = result.querySelector(
-				".b_caption p, .b_snippet, .b_caption"
-			);
-
-			if (title_tag && description_tag) {
-				const link = title_tag.href;
-				const title = (title_tag.textContent || "").trim();
-				const description = (description_tag.textContent || "").trim();
-
-				// Clean Bing redirect URLs
-				let cleanLink = link;
-				try {
-					if (link.includes("bing.com/ck/")) {
-						const urlMatch = link.match(/u=([^&]+)/);
-						if (urlMatch) {
-							cleanLink = decodeURIComponent(urlMatch[1]);
-						}
-					}
-				} catch (urlError) {
-					console.log("URL cleaning error:", urlError.message);
-				}
-
-				results.push({
-					title,
-					description,
-					link: cleanLink,
-				});
-			}
-		}
-
-		console.log(`🎯 Total Bing results collected: ${results.length}`);
+		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
+			document.body
+		);
 
 		return c.json({
-			success: true,
 			query,
-			results: results.slice(0, num),
-			totalFound: results.length,
-			engine: "bing",
-			parameters: {
-				language,
-				country,
-				num,
-				timeout,
-			},
+			results: bingResults,
+			markdown: markdown,
 			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
@@ -1493,6 +1323,69 @@ app.post("/bing-search", async (c) => {
 			},
 			500
 		);
+	}
+});
+
+app.post("/ddg-search", async (c) => {
+	const { query } = await c.req.json();
+	const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+
+	let browser;
+	try {
+		const selectedProxy = proxyManager.getNextProxy();
+		browser = await puppeteer.launch({
+			args: [
+				`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+				"--no-sandbox",
+				"--disable-setuid-sandbox",
+				"--disable-gpu",
+				"--no-zygote",
+				"--single-process",
+			],
+			headless: true,
+			executablePath:
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		});
+
+		const page = await browser.newPage();
+
+		// Fake a real browser
+		await page.setUserAgent(
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+		);
+		// Authenticate proxy if credentials exist
+		if (selectedProxy.username && selectedProxy.password) {
+			await page.authenticate({
+				username: selectedProxy.username,
+				password: selectedProxy.password,
+			});
+		}
+
+		await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+		const html = await page.content();
+		const $ = load(html);
+
+		const results = [];
+
+		$("div.result").each((i, el) => {
+			const linkTag = $(el).find(".result__a");
+			const href = linkTag.attr("href") || "";
+			const title = linkTag.text().trim();
+			const description = $(el).find(".result__snippet").text().trim();
+
+			const url = decodeURIComponent(href.split("uddg=")[1].split("&rut")[0]);
+			if (href && title) {
+				results.push({ title, link: url, description });
+			}
+		});
+
+		return c.json({ query, results, timestamp: new Date().toISOString() });
+	} catch (err) {
+		console.error("DuckDuckGo scraper error:", err.message);
+		return c.json({ error: err.message }, 500);
+	} finally {
+		if (browser) await browser.close();
 	}
 });
 
@@ -1516,74 +1409,101 @@ function cleanGoogleUrl(url) {
 	}
 }
 
+function parseGoogleResults(html) {
+	const results = [];
+	const $ = load(html);
+
+	$("div#search > div#rso").each((i, el) => {
+		const linkTag = $(el).find("a[href]").first();
+		const href = linkTag.attr("href") || "";
+		const title = $(el).find("h3").first().text().trim();
+		const description = $(el).find("div[style*='line']").first().text().trim();
+
+		console.log(href, title);
+		if (href && title) {
+			const link = cleanGoogleUrl(href);
+			if (link.startsWith("http")) {
+				results.push({ title, link, description });
+			}
+		}
+	});
+
+	return results;
+}
 app.post("/google-search", async (c) => {
 	const {
 		query,
 		num = 10,
 		language = "en",
-		country = "in",
+		country = "us",
+		timeout = 30000,
 	} = await c.req.json();
 
-	const results = [];
 	try {
-		const response = await axios.get(`https://www.google.com/search`, {
-			headers: {
-				"User-Agent": get_useragent(),
-				Accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.9",
-				"Accept-Charset": "utf-8", // Explicitly request UTF-8
-				"Accept-Encoding": "gzip, deflate",
-			},
-
-			params: {
-				q: encodeURIComponent(query),
-				results: num,
-				hl: language,
-				gl: country,
-				safe: "active",
-			},
-			withCredentials: true,
-			httpsAgent: new https.Agent({
-				rejectUnauthorized: true,
-			}),
+		const puppeteer = (await import("puppeteer-core")).default;
+		const launchArgs = [
+			"--no-sandbox",
+			"--disable-setuid-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-gpu",
+			"--no-zygote",
+			"--single-process",
+		];
+		const selectedProxy = proxyManager.getNextProxy();
+		launchArgs.push(
+			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+		);
+		const browser = await puppeteer.launch({
+			executablePath:
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			headless: "new",
+			args: launchArgs,
 		});
 
+		const page = await browser.newPage();
+
+		await page.setUserAgent(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+				"AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/123.0.0.0 Safari/537.36"
+		);
+
+		await page.setExtraHTTPHeaders({
+			"Accept-Language": "en-US,en;q=0.9",
+		});
+
+		// Authenticate proxy if credentials exist
+		if (selectedProxy.username && selectedProxy.password) {
+			await page.authenticate({
+				username: selectedProxy.username,
+				password: selectedProxy.password,
+			});
+		}
+
+		await page.goto(
+			`https://www.google.com/search?q=${encodeURIComponent(
+				query
+			)}&results=${num}&hl=${language}&gl=${country}`,
+			{
+				waitUntil: "domcontentloaded",
+				timeout: timeout,
+			}
+		);
+		const response = await page.evaluate(() => {
+			return {
+				html: document.documentElement.outerHTML,
+			};
+		});
+
+		const results = parseGoogleResults(response.html);
+
 		// Use response.data directly - axios already handles UTF-8
-		const dom = new JSDOM(response.data, {
+		const dom = new JSDOM(response.html, {
 			contentType: "text/html",
 			includeNodeLocations: false,
 			storageQuota: 10000000,
 		});
 		const document = dom.window.document;
-
-		const result_block = document.querySelectorAll("div.ezO2md");
-
-		for (const result of result_block) {
-			const link_tag = result.querySelector("a[href]");
-			const title_tag = link_tag ? link_tag.querySelector("span.CVA68e") : null;
-			const description_tag = result.querySelector("span.FrIlee");
-
-			if (link_tag && title_tag && description_tag) {
-				const link = decodeURIComponent(
-					link_tag.href.split("&")[0].replace("/url?q=", "")
-				);
-
-				const title = (title_tag.textContent || "").trim().normalize("NFC");
-				const description = (description_tag.textContent || "")
-					.trim()
-					.normalize("NFC");
-
-				if (link.startsWith("http") || link.startsWith("https")) {
-					results.push({
-						title,
-						description,
-						link: cleanGoogleUrl(link),
-					});
-				}
-			}
-		}
-
 		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
 			document.body
 		);
@@ -1591,462 +1511,12 @@ app.post("/google-search", async (c) => {
 		return c.json({
 			query,
 			results,
+			searchUrl: response.config.url,
 			markdown: markdown,
 		});
 	} catch (error) {
 		console.error("Google search error:", error);
 		return c.json({ error: error.message }, 500);
-	}
-});
-
-// scrap URL
-app.post("/scrap-url", async (c) => {
-	// Start performance monitoring for this operation
-	const operationId = performanceMonitor.startOperation("scrap-url");
-	const startTime = performance.now();
-	const startCpuUsage = process.cpuUsage();
-	const startMemoryUsage = process.memoryUsage();
-
-	const {
-		url,
-		selectors = {}, // Custom selectors for specific elements
-		waitForSelector = null, // Wait for specific element to load
-		timeout = 30000,
-		includeSemanticContent = true,
-		includeImages = true,
-		includeLinks = true,
-		extractMetadata = true,
-		useProxy = false, // New option to enable/disable proxy (default: false)
-	} = await c.req.json();
-
-	if (!url) {
-		return c.json({ error: "URL is required" }, 400);
-	}
-
-	let browser;
-	let context;
-	let scrapedData = {};
-
-	try {
-		// Launch browser with anti-detection settings
-		browser = await chromium.launch({
-			headless: true,
-			args: [
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-dev-shm-usage",
-				"--disable-gpu",
-				"--disable-web-security",
-				"--disable-features=VizDisplayCompositor",
-			],
-		});
-
-		// Use proxy management system only if explicitly enabled
-		if (useProxy) {
-			console.log("🔒 Using enhanced proxy system with anti-detection...");
-			context = await createBrowserContextWithProxy(
-				browser,
-				{
-					viewport: { width: 1920, height: 1080 },
-					extraHTTPHeaders: {
-						dnt: "1",
-						"upgrade-insecure-requests": "1",
-						accept:
-							"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-						"sec-fetch-site": "none",
-						"sec-fetch-mode": "navigate",
-						"sec-fetch-user": "?1",
-						"sec-fetch-dest": "document",
-						"accept-language": "en-US,en;q=0.9",
-					},
-				},
-				url
-			); // Pass target URL for domain-aware proxy selection
-		} else {
-			context = await browser.newContext({
-				userAgent:
-					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-				viewport: { width: 1920, height: 1080 },
-				extraHTTPHeaders: {
-					dnt: "1",
-					"upgrade-insecure-requests": "1",
-					accept:
-						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-					"sec-fetch-site": "none",
-					"sec-fetch-mode": "navigate",
-					"sec-fetch-user": "?1",
-					"sec-fetch-dest": "document",
-					"accept-language": "en-US,en;q=0.9",
-				},
-			});
-		}
-
-		const page = await context.newPage();
-
-		// Enhanced resource blocking for faster loading
-		let blockedResources = { images: 0, fonts: 0, stylesheets: 0, media: 0 };
-
-		await page.route("**/*", (route) => {
-			const request = route.request();
-			const type = request.resourceType();
-			const url = request.url().toLowerCase();
-
-			// Enhanced resource blocking when includeImages is false
-			if (!includeImages) {
-				// Block all image-related resources
-				if (type === "image") {
-					blockedResources.images++;
-					return route.abort();
-				}
-
-				// Block image URLs by file extension
-				const imageExtensions = [
-					".jpg",
-					".jpeg",
-					".png",
-					".gif",
-					".bmp",
-					".webp",
-					".svg",
-					".ico",
-					".tiff",
-					".tif",
-					".heic",
-					".heif",
-					".avif",
-				];
-				const hasImageExtension = imageExtensions.some((ext) =>
-					url.includes(ext)
-				);
-				if (hasImageExtension) {
-					blockedResources.images++;
-					return route.abort();
-				}
-
-				// Block common image CDN and hosting services
-				const imageServices = [
-					"cdn",
-					"images",
-					"img",
-					"photo",
-					"pic",
-					"media",
-					"assets",
-				];
-				const hasImageService = imageServices.some((service) =>
-					url.includes(service)
-				);
-				if (
-					hasImageService &&
-					(url.includes(".jpg") || url.includes(".png") || url.includes(".gif"))
-				) {
-					blockedResources.images++;
-					return route.abort();
-				}
-
-				// Block data URLs (base64 encoded images)
-				if (url.startsWith("data:image/")) {
-					blockedResources.images++;
-					return route.abort();
-				}
-			}
-
-			// Always block fonts and stylesheets for faster loading
-			if (["font", "stylesheet"].includes(type)) {
-				if (type === "font") blockedResources.fonts++;
-				if (type === "stylesheet") blockedResources.stylesheets++;
-				return route.abort();
-			}
-
-			// Block media files (videos, audio) for faster loading
-			if (["media"].includes(type)) {
-				blockedResources.media++;
-				return route.abort();
-			}
-
-			return route.continue();
-		});
-
-		// Navigate to URL
-		await page.goto(url, {
-			waitUntil: "domcontentloaded",
-			timeout: timeout,
-		});
-
-		// Wait for specific selector if provided
-		if (waitForSelector) {
-			try {
-				await page.waitForSelector(waitForSelector, { timeout: 10000 });
-			} catch (error) {
-				console.warn(`Selector ${waitForSelector} not found within timeout`);
-			}
-		}
-
-		// Wait a bit for dynamic content to load
-		await page.waitForTimeout(2000);
-
-		// Extract page content
-		scrapedData = await page.evaluate(
-			(options) => {
-				const data = {
-					url: window.location.href,
-					title: document.title,
-					timestamp: new Date().toISOString(),
-					content: {},
-					metadata: {},
-					links: [],
-					images: [],
-				};
-
-				["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
-					data.content[tag] = Array.from(document.querySelectorAll(tag)).map(
-						(h) => h.textContent.trim()
-					);
-				});
-
-				// Extract metadata
-				if (options.extractMetadata) {
-					// Meta tags
-					const metaTags = document.querySelectorAll("meta");
-					metaTags.forEach((meta) => {
-						const name =
-							meta.getAttribute("name") || meta.getAttribute("property");
-						const content = meta.getAttribute("content");
-						if (name && content) {
-							data.metadata[name] = content;
-						}
-					});
-
-					// Open Graph tags
-					const ogTags = document.querySelectorAll('meta[property^="og:"]');
-					ogTags.forEach((meta) => {
-						const property = meta.getAttribute("property");
-						const content = meta.getAttribute("content");
-						if (property && content) {
-							data.metadata[property] = content;
-						}
-					});
-
-					// Twitter Card tags
-					const twitterTags = document.querySelectorAll(
-						'meta[name^="twitter:"]'
-					);
-					twitterTags.forEach((meta) => {
-						const name = meta.getAttribute("name");
-						const content = meta.getAttribute("content");
-						if (name && content) {
-							data.metadata[name] = content;
-						}
-					});
-				}
-
-				// Extract links
-				const links = document.querySelectorAll("a");
-				const rawLinks = Array.from(links).map((link) => ({
-					text: link.textContent.trim(),
-					href: link.href,
-					title: link.getAttribute("title") || "",
-				}));
-
-				// Remove duplicate links based on text, href, or title
-				const seenLinks = new Set();
-				data.links = rawLinks.filter((link) => {
-					const key = `${link.text}|${link.href}|${link.title}`;
-					if (seenLinks.has(key)) return false;
-					seenLinks.add(key);
-					return true;
-				});
-
-				if (options.includeSemanticContent) {
-					// Extract semantic content with optimized methods
-					const extractSemanticContent = (
-						selector,
-						processor = (el) => el.textContent.trim()
-					) => {
-						const elements = document.querySelectorAll(selector);
-						return elements.length > 0
-							? Array.from(elements).map(processor)
-							: [];
-					};
-
-					const extractTableContent = (table) => {
-						const rows = Array.from(table.querySelectorAll("tr"));
-						return rows
-							.map((row) => {
-								const cells = Array.from(row.querySelectorAll("td, th")).map(
-									(cell) => cell.textContent.trim()
-								);
-								return cells.filter((cell) => cell.length > 0);
-							})
-							.filter((row) => row.length > 0);
-					};
-
-					const extractListContent = (list) => {
-						return Array.from(list.querySelectorAll("li"))
-							.map((li) => li.textContent.trim())
-							.filter((item) => item.length > 0);
-					};
-
-					// Add semantic content to data.content structure
-					const rawSemanticContent = {
-						paragraphs: extractSemanticContent("p"),
-						divs: extractSemanticContent("div", (el) =>
-							el.textContent.trim().substring(0, 200)
-						),
-						tables: extractSemanticContent("table", extractTableContent),
-						blockquotes: extractSemanticContent("blockquote"),
-						preformatted: extractSemanticContent("pre"),
-						unorderedLists: extractSemanticContent("ul", extractListContent),
-						orderedLists: extractSemanticContent("ol", extractListContent),
-						codeBlocks: extractSemanticContent("code"),
-						articleSections: extractSemanticContent("article"),
-						sectionContent: extractSemanticContent("section"),
-						asideContent: extractSemanticContent("aside"),
-						mainContent: extractSemanticContent("main"),
-						headerContent: extractSemanticContent("header"),
-						footerContent: extractSemanticContent("footer"),
-						navContent: extractSemanticContent("aside"),
-						formContent: extractSemanticContent("form"),
-						fieldsetContent: extractSemanticContent("fieldset"),
-						labelContent: extractSemanticContent("label"),
-						spanContent: extractSemanticContent("span", (el) =>
-							el.textContent.trim().substring(0, 100)
-						),
-						strongContent: extractSemanticContent("strong"),
-						emContent: extractSemanticContent("em"),
-						markContent: extractSemanticContent("mark"),
-						smallContent: extractSemanticContent("small"),
-						citeContent: extractSemanticContent("cite"),
-						timeContent: extractSemanticContent("time"),
-						addressContent: extractSemanticContent("address"),
-						detailsContent: extractSemanticContent("details"),
-						summaryContent: extractSemanticContent("summary"),
-						figureContent: extractSemanticContent("figure"),
-						figcaptionContent: extractSemanticContent("figcaption"),
-						dlContent: extractSemanticContent("dl", (el) => {
-							const dts = Array.from(el.querySelectorAll("dt")).map((dt) =>
-								dt.textContent.trim()
-							);
-							const dds = Array.from(el.querySelectorAll("dd")).map((dd) =>
-								dd.textContent.trim()
-							);
-							return { terms: dts, definitions: dds };
-						}),
-					};
-
-					// Remove duplicates from semantic content
-					const removeDuplicates = (array) => {
-						if (!Array.isArray(array)) return array;
-						const seen = new Set();
-						return array.filter((item) => {
-							if (typeof item === "string") {
-								const normalized = item.toLowerCase().trim();
-								if (seen.has(normalized)) return false;
-								seen.add(normalized);
-								return true;
-							} else if (typeof item === "object" && item !== null) {
-								// Handle complex objects like tables and definition lists
-								const key = JSON.stringify(item);
-								if (seen.has(key)) return false;
-								seen.add(key);
-								return true;
-							}
-							return true;
-						});
-					};
-
-					// Apply duplicate removal to all semantic content
-					data.content.semanticContent = Object.fromEntries(
-						Object.entries(rawSemanticContent).map(([key, value]) => [
-							key,
-							removeDuplicates(value),
-						])
-					);
-				}
-
-				// Extract images
-				if (options.includeImages) {
-					const images = document.querySelectorAll("img[src]");
-					data.images = Array.from(images).map((img) => ({
-						src: img.src,
-						alt: img.alt || "",
-						title: img.title || "",
-						width: img.naturalWidth || img.width,
-						height: img.naturalHeight || img.height,
-					}));
-				}
-
-				// Extract custom selectors if provided
-				if (options.selectors && Object.keys(options.selectors).length > 0) {
-					data.customSelectors = {};
-					for (const [key, selector] of Object.entries(options.selectors)) {
-						try {
-							const elements = document.querySelectorAll(selector);
-							if (elements.length === 1) {
-								data.customSelectors[key] = elements[0].textContent.trim();
-							} else if (elements.length > 1) {
-								data.customSelectors[key] = Array.from(elements).map((el) =>
-									el.textContent.trim()
-								);
-							}
-						} catch (error) {
-							data.customSelectors[key] = null;
-						}
-					}
-				}
-
-				return data;
-			},
-			{
-				extractMetadata,
-				includeImages,
-				includeLinks,
-				includeSemanticContent,
-				selectors,
-			}
-		);
-
-		await page.close();
-		await context.close();
-
-		// Mark proxy as successful if used
-		if (useProxy && context.proxyInfo) {
-			handleProxyResult(context, true);
-			console.log(
-				`✅ Proxy ${context.proxyInfo.host} marked as successful for ${url}`
-			);
-		}
-
-		return c.json({
-			success: true,
-			data: scrapedData,
-			url: url,
-			timestamp: new Date().toISOString(),
-		});
-	} catch (error) {
-		console.error("❌ Web scraping error:", error);
-
-		// Mark proxy as failed if used
-		if (useProxy && context && context.proxyInfo) {
-			handleProxyResult(context, false);
-			console.log(
-				`❌ Proxy ${context.proxyInfo.host} marked as failed for ${url}`
-			);
-		}
-
-		return c.json(
-			{
-				success: false,
-				error: "Failed to scrape URL",
-				details: error.message,
-				url: url,
-			},
-			500
-		);
-	} finally {
-		if (browser) {
-			await browser.close();
-		}
 	}
 });
 
@@ -2337,285 +1807,6 @@ app.post("/scrap-images", async (c) => {
 				platform: platform,
 				query: query,
 				url: targetUrl,
-			},
-			500
-		);
-	}
-});
-
-// Reddit Post JSON API - Automatically converts Reddit post URLs to JSON format
-app.post("/reddit-post-to-json", async (c) => {
-	try {
-		const { url } = await c.req.json();
-
-		if (!url) {
-			return c.json({ error: "URL is required" }, 400);
-		}
-
-		// Validate and parse Reddit URL
-		let redditUrl;
-		try {
-			const parsedUrl = new URL(url);
-
-			// Check if it's a Reddit domain
-			if (
-				!parsedUrl.hostname.includes("reddit.com") &&
-				!parsedUrl.hostname.includes("redd.it") &&
-				!parsedUrl.hostname.includes("old.reddit.com")
-			) {
-				return c.json(
-					{
-						success: false,
-						error:
-							"URL must be from Reddit domain (reddit.com, redd.it, old.reddit.com)",
-						providedUrl: url,
-						expectedDomains: ["reddit.com", "redd.it", "old.reddit.com"],
-					},
-					400
-				);
-			}
-
-			// Check if it's a post URL (contains /r/ and /comments/)
-			if (
-				!parsedUrl.pathname.includes("/r/") ||
-				!parsedUrl.pathname.includes("/comments/")
-			) {
-				return c.json(
-					{
-						success: false,
-						error:
-							"URL must be a Reddit post (should contain /r/ and /comments/)",
-						providedUrl: url,
-						pathname: parsedUrl.pathname,
-						examples: [
-							"https://www.reddit.com/r/programming/comments/abc123/title_of_post/",
-							"https://old.reddit.com/r/technology/comments/xyz789/another_post_title/",
-						],
-					},
-					400
-				);
-			}
-
-			// Convert to JSON format
-			// Remove trailing slash and append .json
-			const cleanPath = parsedUrl.pathname.replace(/\/$/, "");
-			redditUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}${cleanPath}.json`;
-		} catch (error) {
-			return c.json(
-				{
-					success: false,
-					error: "Invalid URL format",
-					details: error.message,
-					providedUrl: url,
-				},
-				400
-			);
-		}
-
-		console.log(`🔗 Converting Reddit URL to JSON: ${redditUrl}`);
-
-		// Fetch the JSON response from Reddit
-		const response = await fetch(redditUrl, {
-			headers: {
-				"User-Agent":
-					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-				Accept: "application/json",
-				"Accept-Language": "en-US,en;q=0.9",
-				DNT: "1",
-				Connection: "keep-alive",
-				"Upgrade-Insecure-Requests": "1",
-			},
-			timeout: 30000,
-		});
-
-		if (!response.ok) {
-			return c.json(
-				{
-					success: false,
-					error: `Reddit API returned ${response.status}: ${response.statusText}`,
-					statusCode: response.status,
-					statusText: response.statusText,
-					url: redditUrl,
-				},
-				response.status
-			);
-		}
-
-		const redditData = await response.json();
-
-		// Extract and format the post data
-		if (!redditData || !Array.isArray(redditData) || redditData.length === 0) {
-			return c.json(
-				{
-					success: false,
-					error: "Invalid response from Reddit API",
-					response: redditData,
-				},
-				500
-			);
-		}
-
-		// Reddit returns an array where [0] is the post and [1] is the comments
-		const postData = redditData[0]?.data?.children?.[0]?.data;
-		const commentsData = redditData[1]?.data?.children || [];
-
-		if (!postData) {
-			return c.json(
-				{
-					success: false,
-					error: "Could not extract post data from Reddit response",
-					response: redditData,
-				},
-				500
-			);
-		}
-
-		// Format the response
-		const formattedPost = {
-			id: postData.id,
-			title: postData.title,
-			author: postData.author,
-			subreddit: postData.subreddit,
-			url: postData.url,
-			permalink: `https://reddit.com${postData.permalink}`,
-			score: postData.score,
-			upvoteRatio: postData.upvote_ratio,
-			numComments: postData.num_comments,
-			created: new Date(postData.created_utc * 1000).toISOString(),
-			createdUtc: postData.created_utc,
-			isVideo: postData.is_video,
-			isSelf: postData.is_self,
-			isRedditMediaDomain: postData.is_reddit_media_domain,
-			domain: postData.domain,
-			over18: postData.over_18,
-			spoiler: postData.spoiler,
-			locked: postData.locked,
-			stickied: postData.stickied,
-			archived: postData.archived,
-			clicked: postData.clicked,
-			hidden: postData.hidden,
-			saved: postData.saved,
-			edited: postData.edited
-				? new Date(postData.edited * 1000).toISOString()
-				: false,
-			content: {
-				selftext: postData.selftext || null,
-				selftextHtml: postData.selftext_html || null,
-				thumbnail: postData.thumbnail,
-				preview: postData.preview,
-				media: postData.media,
-				secureMedia: postData.secure_media,
-				mediaEmbed: postData.media_embed,
-				secureMediaEmbed: postData.secure_media_embed,
-				galleryData: postData.gallery_data,
-				images: postData.images,
-				video: postData.video,
-				audio: postData.audio,
-			},
-			metadata: {
-				subredditType: postData.subreddit_type,
-				subredditSubscribers: postData.subreddit_subscribers,
-				subredditId: postData.subreddit_id,
-				authorFullname: postData.author_fullname,
-				authorFlairText: postData.author_flair_text,
-				authorFlairCssClass: postData.author_flair_css_class,
-				authorFlairType: postData.author_flair_type,
-				authorPatreonFlair: postData.author_patreon_flair,
-				authorPremium: postData.author_premium,
-				canModPost: postData.can_mod_post,
-				canGild: postData.can_gild,
-				spoiler: postData.spoiler,
-				locked: postData.locked,
-				hideScore: postData.hide_score,
-				quarantine: postData.quarantine,
-				linkFlairText: postData.link_flair_text,
-				linkFlairCssClass: postData.link_flair_css_class,
-				linkFlairType: postData.link_flair_type,
-				whitelistStatus: postData.whitelist_status,
-				contestMode: postData.contest_mode,
-				viewCount: postData.view_count,
-				visited: postData.visited,
-				gilded: postData.gilded,
-				topAwardedType: postData.top_awarded_type,
-				hideFromRobots: postData.hide_from_robots,
-				isRobotIndexable: postData.is_robot_indexable,
-				isRedditMediaDomain: postData.is_reddit_media_domain,
-				isMedia: postData.is_media,
-				isVideo: postData.is_video,
-				isSelf: postData.is_self,
-				isOc: postData.is_oc,
-				isGallery: postData.is_gallery,
-				isCrosspostable: postData.is_crosspostable,
-				isRedditMediaDomain: postData.is_reddit_media_domain,
-				isVideo: postData.is_video,
-				isSelf: postData.is_self,
-				isOc: postData.is_oc,
-				isGallery: postData.is_gallery,
-				isCrosspostable: postData.is_crosspostable,
-			},
-		};
-
-		// Format comments
-		const formattedComments = commentsData.map((comment) => {
-			const commentData = comment.data;
-			return {
-				id: commentData.id,
-				author: commentData.author,
-				body: commentData.body,
-				bodyHtml: commentData.body_html,
-				score: commentData.score,
-				created: new Date(commentData.created_utc * 1000).toISOString(),
-				createdUtc: commentData.created_utc,
-				permalink: `https://reddit.com${commentData.permalink}`,
-				parentId: commentData.parent_id,
-				linkId: commentData.link_id,
-				subreddit: commentData.subreddit,
-				subredditId: commentData.subreddit_id,
-				authorFullname: commentData.author_fullname,
-				authorFlairText: commentData.author_flair_text,
-				authorFlairCssClass: commentData.author_flair_css_class,
-				authorFlairType: commentData.author_flair_type,
-				authorPatreonFlair: commentData.author_patreon_flair,
-				authorPremium: commentData.author_premium,
-				canGild: commentData.can_gild,
-				gilded: commentData.gilded,
-				edited: commentData.edited
-					? new Date(commentData.edited * 1000).toISOString()
-					: false,
-				scoreHidden: commentData.score_hidden,
-				controversiality: commentData.controversiality,
-				distinguished: commentData.distinguished,
-				stickied: commentData.stickied,
-				archived: commentData.archived,
-				locked: commentData.locked,
-				quarantine: commentData.quarantine,
-				spoiler: commentData.spoiler,
-				hideScore: commentData.hide_score,
-				upvoteRatio: commentData.upvote_ratio,
-				replies: commentData.replies?.data?.children || [],
-				depth: commentData.depth,
-				repliesCount: commentData.replies?.data?.children?.length || 0,
-			};
-		});
-
-		return c.json({
-			success: true,
-			originalUrl: url,
-			jsonUrl: redditUrl,
-			post: formattedPost,
-			comments: formattedComments,
-			totalComments: formattedComments.length,
-			timestamp: new Date().toISOString(),
-			note: "Data retrieved directly from Reddit's JSON API for better reliability",
-		});
-	} catch (error) {
-		console.error("❌ Reddit post API error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to fetch Reddit post data",
-				details: error.message,
-				url: url,
 			},
 			500
 		);
@@ -3939,6 +3130,7 @@ const scrapMetadataDecl = {
 		},
 	},
 };
+
 const crawlUrlFnDecl = {
 	name: "crawl_url",
 	description: "Crawl a URL and return chunkedMarkdown.",
@@ -3950,6 +3142,7 @@ const crawlUrlFnDecl = {
 		required: ["url"],
 	},
 };
+
 // One endpoint: LLM answers, and can call google-search and scrap-url-puppeteer as needed
 app.post("/ai-answer", async (c) => {
 	try {
@@ -4007,7 +3200,6 @@ User prompt: ${prompt}`,
 			},
 		});
 
-
 		const toolCalls =
 			response.candidates?.[0]?.content?.parts?.filter((p) => p.functionCall) ||
 			[];
@@ -4034,7 +3226,7 @@ User prompt: ${prompt}`,
 					country: args?.country || "in",
 				};
 				const searchRes = await axios.post(
-					`${baseUrl}/google-search`,
+					`${baseUrl}/ddg-search`,
 					searchReq,
 					{
 						headers: { "Content-Type": "application/json" },
@@ -4126,70 +3318,166 @@ User prompt: ${prompt}`,
 	}
 });
 
-app.post("/simple-scrap", async (c) => {
-	const {
-		url,
-		useProxy = true,
-		skipTlsVerification = true,
-	} = await c.req.json();
+// Local LLM flow without tool-calling: generate queries → search → optional scrape → answer
+app.post("/ai-answer-ollama", async (c) => {
 	try {
-		const proxy = useProxy ? proxyManager.getNextProxy() : null;
-		const agentOpts = { maxRedirections: 10 };
-		const dispatcher = proxy
-			? new UndiciProxyAgent({
-					uri: `http://${proxy.host}:${proxy.port}`,
-					token: proxy.username
-						? `Basic ${Buffer.from(
-								`${proxy.username}:${proxy.password ?? ""}`
-						  ).toString("base64")}`
-						: undefined,
-					requestTls: { rejectUnauthorized: !skipTlsVerification },
-					...agentOpts,
-			  })
-			: new UndiciAgent({
-					connect: { rejectUnauthorized: !skipTlsVerification },
-					...agentOpts,
-			  });
+		const {
+			prompt,
+			model = "gemma3:270m",
+			numResults = 5,
+			scrapeTopK = 1,
+			temperature = 0.3,
+		} = await c.req.json();
 
-		const randomUA = new UserAgents().toString();
-		const start = Date.now();
-		const res = await undiciFetch(url.trim(), {
-			dispatcher,
-			headers: {
-				"User-Agent": randomUA,
-				Accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.9",
-				"Accept-Encoding": "gzip, deflate, br",
-			},
-			redirect: "follow",
-		});
-		const html = await res.text();
-		const latency = Date.now() - start;
-		if (useProxy && proxy) {
-			proxyManager.recordProxyResult(proxy.host, res.ok, latency);
+		if (!prompt || String(prompt).trim().length === 0) {
+			return c.json({ success: false, error: "prompt is required" }, 400);
 		}
 
-		const dom = new JSDOM(html);
-		const document = dom.window.document;
-		const { markdown } = extractSemanticContentWithFormattedMarkdown(
-			document.body
-		);
+		const xfProto = c.req.header("x-forwarded-proto") || "http";
+		const xfHost = c.req.header("x-forwarded-host") || c.req.header("host");
+		const fallbackHost = `127.0.0.1:${process.env.PORT || "3000"}`;
+		const baseUrl = `${xfProto}://${xfHost || fallbackHost}`;
 
+		const ollama = new ChatOllama({ model, temperature });
+
+		// Step 1: Ask LLM for search queries
+		const queryGenPrompt = `You are assisting with web research. Based on the user's prompt below, generate 3–5 highly targeted Google search queries. Output your answer as a JSON array of strings, with each string being a single search query. Do not include any explanations or extra text, only output the JSON array.\n\nUser prompt:\n${prompt}`;
+		const queryGen = await ollama.invoke(queryGenPrompt);
+		let queries = [];
+		let queryText =
+			typeof queryGen?.content === "string"
+				? queryGen.content
+				: Array.isArray(queryGen?.content)
+				? queryGen.content
+						.map((p) => (typeof p === "string" ? p : JSON.stringify(p)))
+						.join("\n")
+				: String(queryGen || "");
+		const jsonMatch = queryText.match(/\[[\s\S]*\]/);
+		if (jsonMatch) {
+			try {
+				const arr = JSON.parse(jsonMatch[0]);
+				if (Array.isArray(arr)) {
+					queries = arr
+						.map((q) => String(q).trim())
+						.filter((q) => q.length > 0);
+				}
+			} catch {}
+		}
+		if (!Array.isArray(queries) || queries.length === 0) {
+			queries = (queryText || "")
+				.split("\n")
+				.map((q) => q.replace(/^[\-\*\d\.\)]\s*/, "").trim())
+				.filter((q) => q.length > 0);
+		}
+		if (queries.length === 0) queries = [String(prompt)];
+
+		// Step 2: Google search for each query
+		const searchPromises = queries.slice(0, 4).map(async (q) => {
+			try {
+				const searchRes = await axios.post(
+					`${baseUrl}/ddg-search`,
+					{ query: q, num: numResults, language: "en", country: "in" },
+					{ headers: { "Content-Type": "application/json" } }
+				);
+
+				const rows = searchRes.data?.results || [];
+
+				for (const r of rows) {
+					return {
+						title: r.title,
+						link: r.link,
+						description: r.description,
+					};
+				}
+			} catch {
+				return null;
+			}
+		});
+		const searchResults = [];
+		(await Promise.allSettled(searchPromises)).filter((r) => {
+			if (r.status === "fulfilled" && r.value) {
+				searchResults.push(r.value);
+			}
+		});
+
+		// Step 3: Ask LLM which URLs to scrape (optional)
+		let urlsToScrape = [];
+		const chooserPrompt = `Given these search results, pick up to ${scrapeTopK} URLs that are most likely to contain authoritative, detailed content for answering the user's prompt. Respond with a JSON array of URLs only.\n\nSearch results:\n${JSON.stringify(
+			searchResults,
+			null,
+			2
+		)}\n\nUser prompt:\n${prompt}`;
+		const chooseRes = await ollama.invoke(chooserPrompt);
+		const chooseText =
+			typeof chooseRes?.content === "string"
+				? chooseRes.content
+				: JSON.stringify(chooseRes?.content ?? "");
+		const match = chooseText.match(/\[[\s\S]*\]/);
+		if (match) {
+			urlsToScrape = JSON.parse(match[0]);
+		}
+		if (!Array.isArray(urlsToScrape)) urlsToScrape = [];
+		if (urlsToScrape.length === 0) {
+			urlsToScrape = allResults
+				.slice(1, scrapeTopK)
+				.map((r) => r.link)
+				.filter(Boolean);
+		}
+
+		// Step 4: Scrape selected URLs for chunked markdown
+		const scrapsPromises = urlsToScrape.map(async (url) => {
+			const scrapRes = await axios.post(
+				`${baseUrl}/scrap-url-puppeteer`,
+				{ url },
+				{ headers: { "Content-Type": "application/json" }, timeout: 60000 }
+			);
+			return {
+				url,
+				chunkedMarkdown:
+					scrapRes.data?.markdown || scrapRes.data?.data?.markdown || "",
+			};
+		});
+
+		const scrapsResults = [];
+		(await Promise.allSettled(scrapsPromises)).filter((r) => {
+			if (r.status === "fulfilled" && r.value) {
+				scrapsResults.push(r.value);
+			}
+		});
+
+		// Step 5: Final answer synthesis
+		const finalPrompt = `You are a precise assistant. Answer the user's prompt using the evidence below.\n\n
+If you use specific facts, cite the URL in parentheses. Keep it concise and accurate.\n\n
+User prompt:\n${prompt}
+\n\nSearch results (title, link, description):\n${JSON.stringify(
+			searchResults,
+			null,
+			2
+		)}\n\nScraped markdown (url + markdown chunks):\n${JSON.stringify(
+			scrapsResults.map(({ url, markdown }) => ({
+				url,
+				markdown,
+			})),
+			null,
+			2
+		)}`;
+		const finalRes = await ollama.invoke(finalPrompt);
+		const finalText =
+			typeof finalRes?.content === "string"
+				? finalRes.content
+				: JSON.stringify(finalRes?.content ?? "");
+
+		const totalTokens = finalRes.usage_metadata.total_tokens;
 		return c.json({
 			success: true,
-			data: {
-				url: url,
-				html: html,
-				metadata: {},
-				title: "",
-			},
-			markdown: markdown,
-			timestamp: new Date().toISOString(),
+			response: finalText,
+			totalTokens: totalTokens,
+			searchResults: searchResults,
+			scrapsResults: scrapsResults,
 		});
 	} catch (error) {
-		console.log(error);
-		return c.json({ error: error.message, success: false }, 500);
+		console.error("/ai-answer-ollama error:", error);
+		return c.json({ success: false, error: error.message }, 500);
 	}
 });
 
@@ -6216,3 +5504,130 @@ app.post("/perform-search", async (c) => {
 });
 
 export default app;
+
+app.post("/image-to-code", async (c) => {
+	const contentType = c.req.header("content-type") || "";
+	let imageUrl;
+	let prompt;
+	let base64Data;
+	let mimeType;
+
+	if (contentType.includes("application/json")) {
+		const body = await c.req.json();
+		imageUrl = body.imageUrl;
+		prompt = body.prompt;
+	} else if (contentType.includes("multipart/form-data")) {
+		try {
+			const formData = await c.req.formData();
+			// Accept either a file (field: image or file) or a URL (field: imageUrl)
+			const fileField = formData.get("image") || formData.get("file");
+			if (
+				fileField &&
+				typeof fileField === "object" &&
+				"arrayBuffer" in fileField
+			) {
+				mimeType = fileField.type || "application/octet-stream";
+				const ab = await fileField.arrayBuffer();
+				base64Data = Buffer.from(ab).toString("base64");
+			}
+			imageUrl = formData.get("imageUrl");
+			prompt = formData.get("prompt");
+		} catch (err) {
+			return c.json(
+				{
+					error:
+						"Invalid multipart/form-data payload. Use proper multipart encoding (-F in curl) or send JSON.",
+					detail:
+						"When Content-Type is multipart/form-data, the body must include correct CRLF and boundary formatting.",
+				},
+				400
+			);
+		}
+	} else if (contentType.includes("application/x-www-form-urlencoded")) {
+		const bodyText = await c.req.text();
+		const params = new URLSearchParams(bodyText);
+		imageUrl = params.get("imageUrl");
+		prompt = params.get("prompt");
+	} else {
+		return c.json(
+			{ error: "Unsupported Content-Type. Use JSON or multipart/form-data." },
+			415
+		);
+	}
+
+	if (!prompt) {
+		return c.json({ error: "Prompt is required" }, 400);
+	}
+
+	// Resolve image content: prefer uploaded file if present, else fetch from URL
+	if (!base64Data) {
+		if (!imageUrl) {
+			return c.json(
+				{ error: "Provide either an image file (field: image) or imageUrl" },
+				400
+			);
+		}
+		const res = await fetch(imageUrl);
+		if (!res.ok) {
+			return c.json({ error: "Failed to fetch image from imageUrl" }, 400);
+		}
+		mimeType = res.headers.get("content-type") || "image/png";
+		const arrayBuffer = await res.arrayBuffer();
+		base64Data = Buffer.from(arrayBuffer).toString("base64");
+	}
+
+	const aiResponse = await genai.models.generateContent({
+		model: "gemini-2.0-flash",
+		contents: [
+			{
+				role: "model",
+				parts: [
+					{
+						text: `You are an expert React developer. Your task is to generate a single, complete React component based on the provided image and user prompt. 
+
+Strict requirements:
+- Output only a single React component, in a string with react code block with language set to \`jsx\`.
+- Use **Tailwind CSS** for all styling.
+- Use **lucide-react** and **react-icons** for any icons (import from these libraries as needed).
+- Do not use any other CSS frameworks or icon libraries.
+- The component should be self-contained and ready to use.
+- Do not include any explanations, comments, or extra text outside the code block.
+- If the image contains text, use placeholder text in English.
+- If the image contains interactive elements, implement them as functional React code.
+- Do not include any import for Tailwind CSS (assume it is globally available).
+- Only output the code block with the component, nothing else.`,
+					},
+				],
+			},
+			{
+				role: "user",
+				parts: [
+					{ text: prompt },
+					{ inlineData: { mimeType, data: base64Data } },
+				],
+			},
+		],
+	});
+	let text = aiResponse?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+	// If wrapped in a code fence, extract inner content
+	const fenceMatch = text.match(/```(?:jsx|tsx|javascript)?\n([\s\S]*?)```/i);
+	if (fenceMatch && fenceMatch[1]) {
+		text = fenceMatch[1];
+	}
+
+	// Convert literal escape sequences to actual characters
+	const code = text
+		.replace(/\\r/g, "")
+		.replace(/\\t/g, "\t")
+		.replace(/\\n/g, "\n");
+
+	// Flat version for detectors that cannot handle newlines
+	const code_flat = code
+		.replace(/\r?\n/g, " ")
+		.replace(/\t/g, " ")
+		.replace(/\s{2,}/g, " ")
+		.trim();
+
+	return c.json({ success: true, code, code_flat });
+});

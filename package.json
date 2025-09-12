@@ -13,6 +13,7 @@
 	"dependencies": {
 		"@google/genai": "^1.10.0",
 		"@hono/node-server": "^1.8.0",
+		"@hono/react-renderer": "^1.0.1",
 		"@huggingface/transformers": "^3.7.2",
 		"@karyam/fetcher": "^1.0.0",
 		"@langchain/core": "^0.3.68",
@@ -49,6 +50,8 @@
 		"puppeteer-core": "^24.17.0",
 		"puppeteer-extra": "^3.3.6",
 		"puppeteer-extra-plugin-stealth": "^2.11.2",
+		"react": "^19.1.1",
+		"react-dom": "^19.1.1",
 		"rehype-stringify": "^10.0.1",
 		"remark": "^15.0.1",
 		"remark-breaks": "^4.0.0",

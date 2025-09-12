@@ -1,6 +1,6 @@
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
-import serviceAccount from "./service-account-file.js";
+import serviceAccount from "./config/service-account-file.js";
 import { getDownloadURL, getStorage } from "firebase-admin/storage";
 
 if (getApps().length === 0) {
