@@ -9,7 +9,7 @@
 	"scripts": {
 		"start": "node index.js",
 		"dev": "nodemon index.js",
-		"build": "npm install && npm install --only=dev && npx tsc",
+		"build": "npm install && npm install --only=dev",
 		"test:load": "node test-load.js",
 		"monitor": "node monitor-resources.js",
 		"test:with-monitor": "concurrently \"npm run monitor\" \"npm run test:load\""
