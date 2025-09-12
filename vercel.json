@@ -4,12 +4,5 @@
 			"source": "/(.*)",
 			"destination": "/index.js"
 		}
-	],
-	"functions": {
-		"api/index.js": {
-			"excludeFiles": "{.next,*.cache,tests,node_modules/.cache,docs,public}/**",
-			"runtime": "nodejs18.x",
-			"handler": "dist/index.js"
-		}
-	}
+	]
 }
