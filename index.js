@@ -1266,6 +1266,7 @@ app.post("/ddg-search", async (c) => {
 		puppeteerExtra.use(StealthPlugin());
 		const chromium = (await import("@sparticuz/chromium")).default;
 		let launchArgs = [...chromium.args, "--disable-web-security"];
+
 		try {
 			const executablePath = await chromium.executablePath();
 			browser = await puppeteerExtra.launch({
@@ -1273,8 +1274,14 @@ app.post("/ddg-search", async (c) => {
 				args: launchArgs,
 				executablePath: executablePath,
 				ignoreDefaultArgs: ["--disable-extensions"],
+				...(selectedProxy
+					? [
+							`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+					  ]
+					: []),
 			});
-		} catch (error) {
+		} catch (chromiumError) {
+			// Fallback to system Chrome
 			browser = await puppeteerExtra.launch({
 				headless: true,
 				executablePath:
