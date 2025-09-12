@@ -20,9 +20,6 @@ import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemant
 import { logger } from "hono/logger";
 import UserAgents from "user-agents";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkStringify from "remark-stringify";
 
 const userAgents = new UserAgent();
 const getRandomInt = (min, max) =>
@@ -686,8 +683,7 @@ const randomDelay = async (minMs = 150, maxMs = 650) => {
 // Try to resolve Chrome/Chromium path dynamically for puppeteer-core in prod
 const getChromeExecutablePath = () => {
 	const candidates = [
-		...chromium.executablePath(),
-		"/usr/bin/google-chrome",
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 		"/usr/bin/google-chrome-stable",
 		"/usr/bin/chromium",
 		"/usr/bin/chromium-browser",
@@ -1173,7 +1169,7 @@ app.post("/bing-search", async (c) => {
 			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
 		);
 
-		const executablePath = getChromeExecutablePath();
+		const executablePath = await chromium.executablePath();
 		const browser = await puppeteer.launch({
 			executablePath: executablePath || undefined,
 			headless: "new",
@@ -1275,7 +1271,7 @@ app.post("/ddg-search", async (c) => {
 				"--single-process",
 			],
 			headless: true,
-			executablePath: executablePath || undefined,
+			executablePath: executablePath,
 		});
 
 		const page = await browser.newPage();
