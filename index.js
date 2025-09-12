@@ -4,7 +4,6 @@ import { cors } from "hono/cors";
 import { firestore, storage } from "./firebase.js";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import puppeteer from "puppeteer-core";
 import chromium from "@sparticuz/chromium";
 import { createClient } from "@supabase/supabase-js";
 import { performance } from "perf_hooks";
@@ -1258,20 +1257,42 @@ app.post("/ddg-search", async (c) => {
 	const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
 	let browser;
+	const results = [];
 	try {
 		const selectedProxy = proxyManager.getNextProxy();
-		browser = await puppeteer.launch({
-			args: [
-				`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-gpu",
-				"--no-zygote",
-				"--single-process",
-			],
-			headless: true,
-			executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-		});
+		const puppeteerExtra = (await import("puppeteer-extra")).default;
+		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
+			.default;
+		puppeteerExtra.use(StealthPlugin());
+		const chromium = (await import("@sparticuz/chromium")).default;
+		let launchArgs = [...chromium.args, "--disable-web-security"];
+		const executablePath = await chromium.executablePath();
+		try {
+			browser = await puppeteerExtra.launch({
+				headless: true,
+				args: launchArgs,
+				executablePath: executablePath,
+				ignoreDefaultArgs: ["--disable-extensions"],
+			});
+		} catch (error) {
+			browser = await puppeteerExtra.launch({
+				headless: true,
+				executablePath:
+					"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				args: [
+					"--no-sandbox",
+					"--disable-setuid-sandbox",
+					"--disable-dev-shm-usage",
+					"--disable-gpu",
+					"--disable-web-security",
+					...(selectedProxy
+						? [
+								`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+						  ]
+						: []),
+				],
+			});
+		}
 
 		const page = await browser.newPage();
 
@@ -1291,8 +1312,6 @@ app.post("/ddg-search", async (c) => {
 
 		const html = await page.content();
 		const $ = load(html);
-
-		const results = [];
 
 		$("div.result").each((i, el) => {
 			const linkTag = $(el).find(".result__a");
