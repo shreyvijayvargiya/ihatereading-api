@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore, storage } from "./firebase.js";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import chromium from "@sparticuz/chromium";
 import { createClient } from "@supabase/supabase-js";
@@ -12,8 +12,8 @@ import { ChatOllama } from "@langchain/ollama";
 import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
-import fs from "fs";
 import axios from "axios";
+import * as esbuild from "esbuild";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import { logger } from "hono/logger";
@@ -21,9 +21,6 @@ import UserAgents from "user-agents";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
 const userAgents = new UserAgent();
-const getRandomInt = (min, max) =>
-	Math.floor(Math.random() * (max - min + 1)) + min;
-
 const ollama = new ChatOllama({
 	// model: "gemma:2b",
 	model: "gemma3:270m",
@@ -677,21 +674,6 @@ const getDomainFromUrl = (rawUrl) => {
 const randomDelay = async (minMs = 150, maxMs = 650) => {
 	const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
 	return new Promise((resolve) => setTimeout(resolve, jitter));
-};
-
-// Try to resolve Chrome/Chromium path dynamically for puppeteer-core in prod
-const getChromeExecutablePath = () => {
-	const candidates = [
-		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-		"/usr/bin/google-chrome-stable",
-		"/usr/bin/chromium",
-		"/usr/bin/chromium-browser",
-		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-	];
-	for (const p of candidates) {
-		if (p && fs.existsSync(p)) return p;
-	}
-	return null;
 };
 
 const commonViewports = [
@@ -4536,5 +4518,118 @@ Strict requirements:
 		.replace(/\s{2,}/g, " ")
 		.trim();
 
-	return c.json({ success: true, code, code_flat });
+	return c.json({
+		success: true,
+		code,
+		code_flat,
+		inputTokens: aiResponse.usageMetadata.promptTokenCount,
+		outputTokens: aiResponse.usageMetadata.candidatesTokenCount,
+	});
+});
+
+// Build React sources into an ESM bundle for frontend preview
+// Input JSON: { files: [{ path, contents }], packageJson: {...}, entry: "src/App.jsx", jsx: "automatic"|"transform" }
+// Output JSON: { success: true, code, warnings }
+app.post("/bundle-esm", async (c) => {
+	try {
+		const {
+			files = [],
+			packageJson = {},
+			entry = "index.jsx",
+			jsx = "automatic",
+		} = await c.req.json();
+		if (!Array.isArray(files) || files.length === 0) {
+			return c.json({ success: false, error: "files array is required" }, 400);
+		}
+
+		const fileMap = new Map(files.map((f) => [f.path, String(f.contents)]));
+		const externals = Object.keys(packageJson.dependencies || {});
+
+		const result = await esbuild.build({
+			bundle: true,
+			format: "esm",
+			target: ["es2020"],
+			platform: "browser",
+			logLevel: "silent",
+			minify: false,
+			treeShaking: true,
+			sourcemap: false,
+			jsx: jsx === "transform" ? "transform" : "automatic",
+			jsxDev: true,
+			external: externals,
+			stdin: {
+				contents: fileMap.get(entry) || "export default () => null",
+				resolveDir: "/",
+				sourcefile: entry,
+				loader: entry.endsWith(".tsx")
+					? "tsx"
+					: entry.endsWith(".ts")
+					? "ts"
+					: entry.endsWith(".jsx")
+					? "jsx"
+					: "js",
+			},
+			plugins: [
+				{
+					name: "virtual-fs",
+					setup(build) {
+						build.onResolve({ filter: /.*/ }, (args) => {
+							if (
+								args.path.startsWith("http://") ||
+								args.path.startsWith("https://")
+							) {
+								return { path: args.path, namespace: "url" };
+							}
+							const importer =
+								args.importer && args.importer.startsWith("file://")
+									? args.importer
+									: "file:///" + entry;
+							const fullPath = new URL(args.path, importer).pathname;
+							if (fileMap.has(fullPath) || fileMap.has(args.path)) {
+								return {
+									path: fileMap.has(fullPath) ? fullPath : args.path,
+									namespace: "mem",
+								};
+							}
+							return null;
+						});
+						build.onLoad({ filter: /.*/, namespace: "mem" }, (args) => {
+							const contents =
+								fileMap.get(args.path) ||
+								fileMap.get(args.path.replace(/^\//, "")) ||
+								"";
+							const loader = args.path.endsWith(".tsx")
+								? "tsx"
+								: args.path.endsWith(".ts")
+								? "ts"
+								: args.path.endsWith(".jsx")
+								? "jsx"
+								: args.path.endsWith(".css")
+								? "css"
+								: "js";
+							return { contents, loader };
+						});
+						build.onLoad({ filter: /.*/, namespace: "url" }, async (args) => {
+							const res = await fetch(args.path);
+							const text = await res.text();
+							return { contents: text, loader: "js" };
+						});
+					},
+				},
+			],
+			write: false,
+		});
+
+		const out = result.outputFiles?.[0]?.text || "";
+		const codeBlob = new Blob([out], { type: "text/javascript" });
+		const url = URL.createObjectURL(codeBlob);
+		return c.json({
+			success: true,
+			code: out,
+			url: url,
+			warnings: result.warnings || [],
+		});
+	} catch (e) {
+		return c.json({ success: false, error: e.message }, 500);
+	}
 });
