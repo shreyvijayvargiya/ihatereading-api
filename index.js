@@ -2,7 +2,6 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore, storage } from "./firebase.js";
-import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import chromium from "@sparticuz/chromium";
 import { createClient } from "@supabase/supabase-js";
@@ -19,6 +18,7 @@ import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemant
 import { logger } from "hono/logger";
 import UserAgents from "user-agents";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { GoogleGenAI } from "@google/genai";
 
 const userAgents = new UserAgent();
 const ollama = new ChatOllama({
@@ -53,13 +53,6 @@ import(
 	"puppeteer-extra-plugin-stealth/evasions/window.outerdimensions/index.js"
 );
 
-// build frontend make API calls calculations, frontend helps to generate the code from image
-// save image into directories/folders with code and preview part
-// add pricing layer of $10, $20, contact us in USD and 100Rs, 200Rs, 500Rs in INR for india
-
-// build feedback collection API layer that collects feedback puts in database for each website or domain
-
-// Load environment variables
 dotenv.config();
 
 // Performance Monitoring Utility
@@ -4391,7 +4384,6 @@ app.post("/scrap-reddit", async (c) => {
 	}
 });
 
-// similar to scrap github redirect to this API
 app.post("/scrap-git", async (c) => {
 	const { url } = await c.req.json();
 	const newUrl = new URL(url);
@@ -4579,109 +4571,171 @@ Strict requirements:
 	});
 });
 
-// Build React sources into an ESM bundle for frontend preview
-// Input JSON: { files: [{ path, contents }], packageJson: {...}, entry: "src/App.jsx", jsx: "automatic"|"transform" }
-// Output JSON: { success: true, code, warnings }
-app.post("/bundle-esm", async (c) => {
-	try {
-		const {
-			files = [],
-			packageJson = {},
-			entry = "index.jsx",
-			jsx = "automatic",
-		} = await c.req.json();
-		if (!Array.isArray(files) || files.length === 0) {
-			return c.json({ success: false, error: "files array is required" }, 400);
-		}
-
-		const fileMap = new Map(files.map((f) => [f.path, String(f.contents)]));
-		const externals = Object.keys(packageJson.dependencies || {});
-
-		const result = await esbuild.build({
-			bundle: true,
-			format: "esm",
-			target: ["es2020"],
-			platform: "browser",
-			logLevel: "silent",
-			minify: false,
-			treeShaking: true,
-			sourcemap: false,
-			jsx: jsx === "transform" ? "transform" : "automatic",
-			jsxDev: true,
-			external: externals,
-			stdin: {
-				contents: fileMap.get(entry) || "export default () => null",
-				resolveDir: "/",
-				sourcefile: entry,
-				loader: entry.endsWith(".tsx")
-					? "tsx"
-					: entry.endsWith(".ts")
-					? "ts"
-					: entry.endsWith(".jsx")
-					? "jsx"
-					: "js",
+const ddgSearchTool = {
+	name: "ddg_search",
+	description:
+		"Perform a DuckDuckGo web search to find relevant information based on a query.",
+	parameters: {
+		type: "object",
+		properties: {
+			query: {
+				type: "string",
+				description: "The search query for DuckDuckGo.",
 			},
-			plugins: [
-				{
-					name: "virtual-fs",
-					setup(build) {
-						build.onResolve({ filter: /.*/ }, (args) => {
-							if (
-								args.path.startsWith("http://") ||
-								args.path.startsWith("https://")
-							) {
-								return { path: args.path, namespace: "url" };
-							}
-							const importer =
-								args.importer && args.importer.startsWith("file://")
-									? args.importer
-									: "file:///" + entry;
-							const fullPath = new URL(args.path, importer).pathname;
-							if (fileMap.has(fullPath) || fileMap.has(args.path)) {
-								return {
-									path: fileMap.has(fullPath) ? fullPath : args.path,
-									namespace: "mem",
-								};
-							}
-							return null;
-						});
-						build.onLoad({ filter: /.*/, namespace: "mem" }, (args) => {
-							const contents =
-								fileMap.get(args.path) ||
-								fileMap.get(args.path.replace(/^\//, "")) ||
-								"";
-							const loader = args.path.endsWith(".tsx")
-								? "tsx"
-								: args.path.endsWith(".ts")
-								? "ts"
-								: args.path.endsWith(".jsx")
-								? "jsx"
-								: args.path.endsWith(".css")
-								? "css"
-								: "js";
-							return { contents, loader };
-						});
-						build.onLoad({ filter: /.*/, namespace: "url" }, async (args) => {
-							const res = await fetch(args.path);
-							const text = await res.text();
-							return { contents: text, loader: "js" };
-						});
+		},
+		required: ["query"],
+	},
+};
+
+const scrapUrlPuppeteerTool = {
+	name: "scrap_url_puppeteer",
+	description:
+		"Scrape content from a given URL using Puppeteer. Can extract semantic content, images, links, and metadata, and take screenshots.",
+	parameters: {
+		type: "object",
+		properties: {
+			url: {
+				type: "string",
+				description: "The URL to scrape.",
+			},
+			includeSemanticContent: {
+				type: "boolean",
+				description:
+					"Whether to extract semantic content (paragraphs, headings, lists, tables). Defaults to true.",
+				default: true,
+			},
+			includeImages: {
+				type: "boolean",
+				description:
+					"Whether to extract image URLs and their attributes. Defaults to true.",
+				default: true,
+			},
+			includeLinks: {
+				type: "boolean",
+				description: "Whether to extract internal links. Defaults to true.",
+				default: true,
+			},
+			extractMetadata: {
+				type: "boolean",
+				description:
+					"Whether to extract meta, Open Graph, and Twitter card tags. Defaults to true.",
+				default: true,
+			},
+			takeScreenshot: {
+				type: "boolean",
+				description:
+					"Whether to take a full-page screenshot of the URL and return its URL. Defaults to false.",
+				default: false,
+			},
+		},
+		required: ["url"],
+	},
+};
+
+app.post("/ai-orchestrator", async (c) => {
+	customLogger("AI Orchestrator endpoint called", await c.req.header());
+	const { query } = await c.req.json();
+
+	if (!query) {
+		return c.json({ error: "query is required" }, 400);
+	}
+
+	try {
+		const llmResponse = genai.models.generateContent({
+			model: "gemini-1.5-flash",
+			config: {
+				tools: [
+					{
+						functionDeclarations: [ddgSearchTool, scrapUrlPuppeteerTool],
 					},
+				],
+			},
+			contents: [
+				{
+					role: "model",
+					parts: [
+						{
+							text: "You are a helpful assistant that can search the web for information and scrape websites.",
+						},
+					],
+				},
+				{
+					role: "user",
+					parts: [{ text: query }],
 				},
 			],
-			write: false,
 		});
 
-		const out = result.outputFiles?.[0]?.text || "";
-		const codeBlob = new Blob([out], { type: "text/javascript" });
-		const url = URL.createObjectURL(codeBlob);
+		console.dir((await llmResponse).functionCalls, { depth: null });
+		let searchResults = [];
+		let scrapResults = [];
+		if ((await llmResponse).functionCalls.length > 0) {
+			const xfProto = c.req.header("x-forwarded-proto") || "http";
+			const xfHost = c.req.header("x-forwarded-host") || c.req.header("host");
+			const fallbackHost = `127.0.0.1:${process.env.PORT || "3000"}`;
+			const baseUrl = `${xfProto}://${xfHost || fallbackHost}`;
+
+			const toolCallPromises = (await llmResponse).functionCalls.map(
+				async (functionCall) => {
+					const { name, args } = functionCall;
+					if (name === "ddg_search") {
+						const searchResult = await axios.post(
+							`${baseUrl}/ddg-search`,
+							{ query: args.query },
+							{ headers: { "Content-Type": "application/json" } }
+						);
+						console.log(searchResult.data.results, "searchResult.data.results");
+						searchResults.push(searchResult.data.results);
+					} else if (name === "scrap_url_puppeteer") {
+						const scrapResult = await axios.post(
+							`${baseUrl}/scrap-url-puppeteer`,
+							{ url: args.url },
+							{ headers: { "Content-Type": "application/json" } }
+						);
+						scrapResults.push(scrapResult.data.markdown);
+					}
+				}
+			);
+			await Promise.all(toolCallPromises);
+		}
+		const finalAnswer = await genai.models.generateContent({
+			model: "gemini-1.5-flash",
+			contents: [
+				{
+					role: "user",
+					parts: [
+						{
+							text: `User Query: ${query}
+
+Here are the search results: ${JSON.stringify(searchResults)}
+Here is the scraped content: ${JSON.stringify(scrapResults)}
+
+Based ONLY on the provided search results and scraped content, answer the user's query comprehensively and concisely. If the information is not sufficient, state that you cannot provide a comprehensive answer with the given data. Do NOT make up information or use your external knowledge.`,
+						},
+					],
+				},
+				{ role: "user", parts: [{ text: query }] },
+			],
+		});
 		return c.json({
 			success: true,
-			code: out,
-			url: url,
-			warnings: result.warnings || [],
+			query: query,
+			finalAnswer: finalAnswer.candidates[0].content.parts[0].text,
+			searchResults: searchResults,
+			scrapResults: scrapResults,
+			totalTokenCount: finalAnswer.usageMetadata.totalTokenCount,
+			timestamp: new Date().toISOString(),
 		});
-	} catch (e) {
-		return c.json({ success: false, error: e.message }, 500);
+	} catch (error) {
+		console.error("❌ AI Orchestrator error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to process AI Orchestrator request",
+				details: error.message,
+				query: query,
+			},
+			500
+		);
 	}
 });

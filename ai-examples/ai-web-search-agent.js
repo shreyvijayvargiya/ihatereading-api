@@ -21,7 +21,7 @@ const AVAILABLE_MODELS = [
 ];
 
 const ollamaClient = new ChatOllama({
-	model: "granite3.3:2b", // Using one of your available models
+	model: "gemma:2b", // Using one of your available models
 	baseURL: "http://localhost:11434",
 });
 
@@ -158,35 +158,14 @@ const bingSearchDeclaration = tool((_) => "", {
 	}),
 });
 
-// const OllamaWithTools = ollama.bindTools([googleSearchDeclaration]);
 
-// Helper function to determine if a prompt needs web search
-const needsWebSearch = (prompt) => {
-	const searchKeywords = [
-		"latest",
-		"current",
-		"today",
-		"recent",
-		"news",
-		"update",
-		"now",
-		"what is",
-		"how to",
-		"where is",
-		"when did",
-		"who is",
-		"why does",
-		"price",
-		"stock",
-		"weather",
-		"forecast",
-		"trending",
-		"popular",
-	];
-
-	const lowerPrompt = prompt.toLowerCase();
-	return searchKeywords.some((keyword) => lowerPrompt.includes(keyword));
-};
+const ddgSearchDeclaration = tool((_) => "", {
+	name: "ddg_search",
+	description: "Search the web for information",
+	schema: z.object({
+		query: z.string().describe("The query to search for"),
+	}),
+});
 
 // Function to generate search queries from user prompt
 const generateSearchQueries = async (prompt, modelName) => {
@@ -244,32 +223,27 @@ export const aiWebSearchAgent = async (
 		// Step 1: Determine if we need web search and generate queries
 		let searchResults = [];
 
-		if (needsWebSearch(prompt)) {
-			console.log("Prompt requires web search, generating queries...");
+		// Generate search queries using the LLM
+		const searchQueries = await generateSearchQueries(prompt, modelName);
 
-			// Generate search queries using the LLM
-			const searchQueries = await generateSearchQueries(prompt, modelName);
-			console.log("Generated search queries:", searchQueries);
+		// Execute searches for each query
+		for (const query of searchQueries) {
+			try {
+				const searchResult = await googleSearchFunction({
+					query: query,
+					num: 5, // Limit results per query
+					language: "en",
+					country: "in",
+				});
 
-			// Execute searches for each query
-			for (const query of searchQueries) {
-				try {
-					const searchResult = await googleSearchFunction({
+				if (searchResult && searchResult.results) {
+					searchResults.push({
 						query: query,
-						num: 5, // Limit results per query
-						language: "en",
-						country: "in",
+						results: searchResult.results,
 					});
-
-					if (searchResult && searchResult.results) {
-						searchResults.push({
-							query: query,
-							results: searchResult.results,
-						});
-					}
-				} catch (searchError) {
-					console.error(`Search error for query "${query}":`, searchError);
 				}
+			} catch (searchError) {
+				console.error(`Search error for query "${query}":`, searchError);
 			}
 		}
 
@@ -343,5 +317,3 @@ serve({
 	fetch: app.fetch,
 	port: 3000,
 });
-
-
