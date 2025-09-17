@@ -29,24 +29,29 @@ const ollama = new ChatOllama({
 });
 
 // Add the Imports before StealthPlugin
-import('puppeteer-extra-plugin-stealth/evasions/chrome.app/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/chrome.csi/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/chrome.loadTimes/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/chrome.runtime/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/defaultArgs/index.js') // pkg warned me this one was missing
-import('puppeteer-extra-plugin-stealth/evasions/iframe.contentWindow/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/media.codecs/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/navigator.hardwareConcurrency/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/navigator.languages/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/navigator.permissions/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/navigator.plugins/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/navigator.vendor/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/navigator.webdriver/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/sourceurl/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/user-agent-override/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/webgl.vendor/index.js')
-import('puppeteer-extra-plugin-stealth/evasions/window.outerdimensions/index.js')
-
+import("puppeteer-extra-plugin-stealth/evasions/chrome.app/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/chrome.csi/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/chrome.loadTimes/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/chrome.runtime/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/defaultArgs/index.js"); // pkg warned me this one was missing
+import("puppeteer-extra-plugin-stealth/evasions/iframe.contentWindow/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/media.codecs/index.js");
+import(
+	"puppeteer-extra-plugin-stealth/evasions/navigator.hardwareConcurrency/index.js"
+);
+import("puppeteer-extra-plugin-stealth/evasions/navigator.languages/index.js");
+import(
+	"puppeteer-extra-plugin-stealth/evasions/navigator.permissions/index.js"
+);
+import("puppeteer-extra-plugin-stealth/evasions/navigator.plugins/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/navigator.vendor/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/navigator.webdriver/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/sourceurl/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/user-agent-override/index.js");
+import("puppeteer-extra-plugin-stealth/evasions/webgl.vendor/index.js");
+import(
+	"puppeteer-extra-plugin-stealth/evasions/window.outerdimensions/index.js"
+);
 
 // build frontend make API calls calculations, frontend helps to generate the code from image
 // save image into directories/folders with code and preview part
@@ -1271,7 +1276,21 @@ app.post("/ddg-search", async (c) => {
 		const puppeteerExtra = (await import("puppeteer-extra")).default;
 		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
 			.default;
+		const UserPreferencesPlugin = (
+			await import("puppeteer-extra-plugin-user-preferences")
+		).default;
 		puppeteerExtra.use(StealthPlugin());
+		puppeteerExtra.use(
+			UserPreferencesPlugin({
+				userPrefs: {
+					webkit: {
+						webprefs: {
+							default_font_size: 22,
+						},
+					},
+				},
+			})
+		);
 		const chromium = (await import("@sparticuz/chromium")).default;
 		let launchArgs = [...chromium.args, "--disable-web-security"];
 
@@ -1953,7 +1972,21 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		const puppeteerExtra = (await import("puppeteer-extra")).default;
 		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
 			.default;
+		const UserPreferencesPlugin = (
+			await import("puppeteer-extra-plugin-user-preferences")
+		).default;
 		puppeteerExtra.use(StealthPlugin());
+		puppeteerExtra.use(
+			UserPreferencesPlugin({
+				userPrefs: {
+					webkit: {
+						webprefs: {
+							default_font_size: 22,
+						},
+					},
+				},
+			})
+		);
 		const chromium = (await import("@sparticuz/chromium")).default;
 
 		const maxAttempts = useProxy ? 3 : 1;
