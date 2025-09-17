@@ -1,5 +1,10 @@
 {
-	
+	"functions": {
+		"index.js": {
+			"runtime": "nodejs20.x",
+			"includeFiles": "node_modules/puppeteer-extra*/**"
+		}
+	},
 	"rewrites": [
 		{
 			"source": "/(.*)",
