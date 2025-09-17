@@ -28,6 +28,12 @@ const ollama = new ChatOllama({
 	temperature: 0.5,
 });
 
+// build frontend make API calls calculations, frontend helps to generate the code from image
+// save image into directories/folders with code and preview part
+// add pricing layer of $10, $20, contact us in USD and 100Rs, 200Rs, 500Rs in INR for india
+
+// build feedback collection API layer that collects feedback puts in database for each website or domain
+
 // Load environment variables
 dotenv.config();
 
@@ -1241,7 +1247,6 @@ app.post("/ddg-search", async (c) => {
 	let browser;
 	const results = [];
 	try {
-		import("puppeteer-extra-plugin-stealth/evasions/chrome.app/index.js");
 		const selectedProxy = proxyManager.getNextProxy();
 		const puppeteerExtra = (await import("puppeteer-extra")).default;
 		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
@@ -1852,6 +1857,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		includeCache = false,
 		useProxy = false,
 		aiSummary = false,
+		takeScreenshot = false,
 	} = await c.req.json();
 
 	const isValidUrl = isValidURL(url);
@@ -2532,6 +2538,32 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					document.body
 				);
 
+				// Optional screenshot capture and upload
+				let screenshotUrl = null;
+				if (takeScreenshot) {
+					try {
+						const screenshotBuffer = await page.screenshot({ fullPage: true });
+						const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(
+							/[^a-zA-Z0-9]/g,
+							""
+						)}.png`;
+						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+						const file = bucket.file(
+							`ihr-website-screenshot/${uniqueFileName}`
+						);
+						await file.save(screenshotBuffer, {
+							metadata: {
+								contentType: "image/png",
+								cacheControl: "public, max-age=3600",
+							},
+						});
+						await file.makePublic();
+						screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+					} catch (ssErr) {
+						console.error("❌ Error taking/uploading screenshot:", ssErr);
+					}
+				}
+
 				await page.close();
 
 				// Record proxy performance
@@ -2614,6 +2646,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					data: scrapedData,
 					url: url,
 					markdown: markdown,
+					screenshot: screenshotUrl,
 					timestamp: new Date().toISOString(),
 				});
 			} catch (attemptError) {
