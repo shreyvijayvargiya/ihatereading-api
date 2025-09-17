@@ -28,6 +28,26 @@ const ollama = new ChatOllama({
 	temperature: 0.5,
 });
 
+// Add the Imports before StealthPlugin
+import('puppeteer-extra-plugin-stealth/evasions/chrome.app/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/chrome.csi/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/chrome.loadTimes/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/chrome.runtime/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/defaultArgs/index.js') // pkg warned me this one was missing
+import('puppeteer-extra-plugin-stealth/evasions/iframe.contentWindow/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/media.codecs/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/navigator.hardwareConcurrency/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/navigator.languages/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/navigator.permissions/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/navigator.plugins/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/navigator.vendor/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/navigator.webdriver/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/sourceurl/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/user-agent-override/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/webgl.vendor/index.js')
+import('puppeteer-extra-plugin-stealth/evasions/window.outerdimensions/index.js')
+
+
 // build frontend make API calls calculations, frontend helps to generate the code from image
 // save image into directories/folders with code and preview part
 // add pricing layer of $10, $20, contact us in USD and 100Rs, 200Rs, 500Rs in INR for india
