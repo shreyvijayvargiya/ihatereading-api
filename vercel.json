@@ -1,18 +1,8 @@
 {
 	"functions": {
 		"index.js": {
-			"runtime": "vercel/node@22.x",
-			"includeFiles": "node_modules/puppeteer-extra*/**"
-		},
-		"api/**.js": {
-			"runtime": "vercel/node@22.x",
+			"runtime": "node@22.x",
 			"includeFiles": "node_modules/puppeteer-extra*/**"
 		}
-	},
-	"rewrites": [
-		{
-			"source": "/(.*)",
-			"destination": "/index.js"
-		}
-	]
+	}
 }
