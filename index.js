@@ -1969,24 +1969,24 @@ app.post("/scrap-url-puppeteer", async (c) => {
 	let scrapedData = {};
 
 	try {
-		const puppeteerExtra = (await import("puppeteer-extra")).default;
-		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
-			.default;
-		const UserPreferencesPlugin = (
-			await import("puppeteer-extra-plugin-user-preferences")
-		).default;
-		puppeteerExtra.use(StealthPlugin());
-		puppeteerExtra.use(
-			UserPreferencesPlugin({
-				userPrefs: {
-					webkit: {
-						webprefs: {
-							default_font_size: 22,
-						},
-					},
-				},
-			})
-		);
+		const puppeteerExtra = (await import("puppeteer-core")).default;
+		// const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
+		// 	.default;
+		// const UserPreferencesPlugin = (
+		// 	await import("puppeteer-extra-plugin-user-preferences")
+		// ).default;
+		// puppeteerExtra.use(StealthPlugin());
+		// puppeteerExtra.use(
+		// 	UserPreferencesPlugin({
+		// 		userPrefs: {
+		// 			webkit: {
+		// 				webprefs: {
+		// 					default_font_size: 22,
+		// 				},
+		// 			},
+		// 		},
+		// 	})
+		// );
 		const chromium = (await import("@sparticuz/chromium")).default;
 
 		const maxAttempts = useProxy ? 3 : 1;
