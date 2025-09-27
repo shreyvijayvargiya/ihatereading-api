@@ -9,6 +9,7 @@
 	"scripts": {
 		"start": "node index.js",
 		"dev": "nodemon index.js",
+		"dev:profiler": "nodemon index.js --firebase_env=profiler",
 		"build": "npm install && npm install --only=dev",
 		"test:load": "node test-load.js",
 		"monitor": "node monitor-resources.js",
@@ -24,6 +25,7 @@
 		"@langchain/ollama": "^0.2.3",
 		"@langchain/textsplitters": "^0.1.0",
 		"@mozilla/readability": "^0.6.0",
+		"@octokit/rest": "^22.0.0",
 		"@sparticuz/chromium": "^138.0.2",
 		"@supabase/supabase-js": "^2.55.0",
 		"axios": "^1.11.0",
@@ -61,6 +63,7 @@
 		"remark-parse": "^11.0.0",
 		"remark-rehype": "^11.1.2",
 		"remark-toc": "^9.0.0",
+		"resend": "^6.1.0",
 		"supabase": "^2.34.3",
 		"tiktoken": "^1.0.22",
 		"turndown": "^7.2.1",

@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import { firestore, storage } from "./firebase.js";
+import { firestore, storage, auth } from "./firebase.js";
 import dotenv from "dotenv";
 import chromium from "@sparticuz/chromium";
 import { createClient } from "@supabase/supabase-js";
@@ -12,13 +12,14 @@ import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
 import axios from "axios";
-import * as esbuild from "esbuild";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import { logger } from "hono/logger";
 import UserAgents from "user-agents";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { GoogleGenAI } from "@google/genai";
+import { Resend } from "resend";
+import { promises as fs } from "fs";
 
 const userAgents = new UserAgent();
 const ollama = new ChatOllama({
@@ -4666,7 +4667,6 @@ app.post("/ai-orchestrator", async (c) => {
 			],
 		});
 
-		console.dir((await llmResponse).functionCalls, { depth: null });
 		let searchResults = [];
 		let scrapResults = [];
 		if ((await llmResponse).functionCalls.length > 0) {
@@ -4734,6 +4734,650 @@ Based ONLY on the provided search results and scraped content, answer the user's
 				error: "Failed to process AI Orchestrator request",
 				details: error.message,
 				query: query,
+			},
+			500
+		);
+	}
+});
+
+const googleSearchFunction = async (query) => {
+	try {
+		const response = await fetch("https://api.firecrawl.dev/v1/search", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				query: query,
+				limit: 5,
+				scrapeOptions: {
+					onlyMainContent: true,
+					timeout: 30000,
+					parsePDF: true,
+					removeBase64Images: true,
+					blockAds: true,
+					storeInCache: true,
+				},
+			}),
+		});
+
+		if (!response.ok) {
+			throw new Error(
+				`Firecrawl API error: ${response.status} ${response.statusText}`
+			);
+		}
+
+		const data = await response.json();
+		return { result: data, success: true };
+	} catch (error) {
+		return { error: error.message, success: false };
+	}
+};
+
+// take github repo as API query and use env.GITHUB_TOKEN with github API to get the repo details
+// then pass it to genai as input prompt to generate the documentation for the repo
+// provide detailed system prompt to genai to generate the documentation for the repo
+// return the documentation as a JSON output
+
+// Helper to parse repo input (either "owner/repo" or full GitHub URL)
+const parseGithubRepoInput = (input) => {
+	if (!input || typeof input !== "string") return null;
+	try {
+		if (input.includes("github.com")) {
+			const u = new URL(input);
+			const parts = u.pathname.replace(/^\//, "").split("/");
+			if (parts.length >= 2) {
+				return { owner: parts[0], repo: parts[1] };
+			}
+		} else if (input.includes("/")) {
+			const [owner, repo] = input.split("/");
+			if (owner && repo) return { owner, repo };
+		}
+		return null;
+	} catch (_e) {
+		return null;
+	}
+};
+
+// Extract JSON from LLM text output (handles ```json fences)
+const extractJsonFromText = (text) => {
+	if (!text) return null;
+	const fenced =
+		text.match(/```json\s*([\s\S]*?)\s*```/i) ||
+		text.match(/```\s*([\s\S]*?)\s*```/i);
+	const candidate = fenced ? fenced[1] : text;
+	const tryParse = (s) => {
+		try {
+			return JSON.parse(s);
+		} catch (_e) {
+			return null;
+		}
+	};
+	const direct = tryParse(candidate);
+	if (direct) return direct;
+	// Heuristic: grab the largest JSON-looking substring between first { and last }
+	const start = candidate.indexOf("{");
+	const end = candidate.lastIndexOf("}");
+	if (start !== -1 && end !== -1 && end > start) {
+		const slice = candidate.slice(start, end + 1);
+		const sliced = tryParse(slice);
+		if (sliced) return sliced;
+	}
+	return null;
+};
+
+// Combine all text parts from the first candidate
+const getGeminiText = (response) => {
+	const parts = response?.candidates?.[0]?.content?.parts || [];
+	return parts
+		.map((p) => (typeof p?.text === "string" ? p.text : ""))
+		.join("\n")
+		.trim();
+};
+
+// Minimal fallback doc if JSON parsing fails
+const buildFallbackDocs = (repoBundle) => {
+	const title = repoBundle?.metadata?.name || repoBundle?.repo || "Project";
+	const description = repoBundle?.metadata?.description || "unknown";
+	const readme = repoBundle?.readme || "";
+	const readmeSnippet = readme ? readme.slice(0, 2000) : "unknown";
+	return {
+		title: title,
+		description: description,
+		chapters: [
+			{
+				title: "Overview",
+				pages: [
+					{
+						title: "Introduction",
+						markdown:
+							description && description !== "unknown"
+								? description
+								: "unknown",
+					},
+				],
+			},
+			{
+				title: "README",
+				pages: [
+					{
+						title: "Root README excerpt",
+						markdown: readmeSnippet,
+					},
+				],
+			},
+		],
+		missing_docs: ["LLM returned non-parseable JSON; using fallback"],
+	};
+};
+
+app.post("/generate-repo-docs", async (c) => {
+	const { repo, url } = await c.req.json();
+	const input = repo || url;
+	if (!input) {
+		return c.json(
+			{ success: false, error: "Provide 'repo' (owner/name) or 'url'" },
+			400
+		);
+	}
+	if (!process.env.GITHUB_TOKEN) {
+		return c.json(
+			{ success: false, error: "GITHUB_TOKEN not configured" },
+			500
+		);
+	}
+
+	const parsed = parseGithubRepoInput(input);
+	if (!parsed) {
+		return c.json(
+			{ success: false, error: "Invalid GitHub repo identifier" },
+			400
+		);
+	}
+
+	const { owner, repo: repoName } = parsed;
+	const ghHeaders = {
+		Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+		Accept: "application/vnd.github+json",
+		"User-Agent": "ihatereading-api",
+	};
+
+	try {
+		// Fetch repo metadata
+		const repoRes = await fetch(
+			`https://api.github.com/repos/${owner}/${repoName}`,
+			{
+				headers: ghHeaders,
+			}
+		);
+		if (!repoRes.ok) {
+			const details = await repoRes.text();
+			return c.json(
+				{
+					success: false,
+					error: "Failed to fetch repo",
+					status: repoRes.status,
+					details,
+				},
+				repoRes.status
+			);
+		}
+		const repoJson = await repoRes.json();
+
+		// Languages
+		const langRes = await fetch(
+			`https://api.github.com/repos/${owner}/${repoName}/languages`,
+			{
+				headers: ghHeaders,
+			}
+		);
+		const languages = langRes.ok ? await langRes.json() : {};
+
+		// README raw text
+		const readmeRes = await fetch(
+			`https://api.github.com/repos/${owner}/${repoName}/readme`,
+			{
+				headers: { ...ghHeaders, Accept: "application/vnd.github.raw" },
+			}
+		);
+		const readme = readmeRes.ok ? await readmeRes.text() : "";
+
+		// Top-level files/directories
+		const contentsRes = await fetch(
+			`https://api.github.com/repos/${owner}/${repoName}/contents?ref=${encodeURIComponent(
+				repoJson.default_branch || "main"
+			)}`,
+			{ headers: ghHeaders }
+		);
+		const contents = contentsRes.ok ? await contentsRes.json() : [];
+		const keyFiles = Array.isArray(contents)
+			? contents.map((e) => ({
+					name: e.name,
+					path: e.path,
+					type: e.type,
+					size: e.size,
+			  }))
+			: [];
+
+		const repoBundle = {
+			repo: `${owner}/${repoName}`,
+			metadata: {
+				name: repoJson.name,
+				full_name: repoJson.full_name,
+				description: repoJson.description,
+				visibility: repoJson.visibility,
+				license: repoJson.license?.spdx_id || repoJson.license?.key || null,
+				default_branch: repoJson.default_branch,
+				homepage: repoJson.homepage,
+				topics: repoJson.topics || [],
+				stargazers_count: repoJson.stargazers_count,
+				forks_count: repoJson.forks_count,
+				open_issues: repoJson.open_issues,
+				archived: repoJson.archived,
+				language: repoJson.language,
+			},
+			languages,
+			readme,
+			key_files: keyFiles,
+		};
+
+		const systemPrompt = `You are an expert technical writer and senior developer. Using ONLY the provided GitHub repository data (metadata, languages, README, key files), produce structured documentation that is easy to read, understand, and grasp.
+
+Strictly output a SINGLE JSON object with this schema (no extra commentary):
+{
+  "title": string,                      // Human-friendly project title
+  "description": string,                // One-paragraph overview and primary use-cases
+  "chapters": [                         // Top-level chapters
+    {
+      "title": string,
+      "pages": [                        // Each page holds Markdown content
+        { "title": string, "markdown": string }
+      ],
+      "subchapters"?: [                 // OPTIONAL second-level chapters (max depth = 2)
+        {
+          "title": string,
+          "pages": [ { "title": string, "markdown": string } ]
+        }
+      ]
+    }
+  ],
+  "missing_docs": [ string ]            // Items that require maintainer input
+}
+
+Authoring rules:
+- MAX DEPTH: Chapters may contain subchapters only one level deep (2 levels total).
+- PAGES: Each chapter and subchapter should include one or more pages. Page content MUST be valid Markdown.
+- CODE SAMPLES: Include fenced code blocks in page Markdown when helpful (derive from README, key files, or plausible usage based on metadata/languages). Mark unknowns explicitly as "unknown".
+- BREVITY & CLARITY: Prefer concise explanations with practical examples. Avoid fluff.
+
+Recommended chapter order (adapt as appropriate):
+1) Overview
+2) Getting Started
+3) Installation & Setup
+4) Usage
+5) API Reference (if applicable)
+6) Architecture
+7) Key Files
+8) Examples
+9) Limitations
+10) FAQ
+
+Return ONLY the JSON object above.`;
+
+		const userPrompt = `Repository data:\n${JSON.stringify(
+			repoBundle,
+			null,
+			2
+		)}\n\nReturn only the JSON.`;
+
+		const aiResponse = await genai.models.generateContent({
+			model: "gemini-1.5-flash",
+			contents: [
+				{ role: "model", parts: [{ text: systemPrompt }] },
+				{ role: "user", parts: [{ text: userPrompt }] },
+			],
+		});
+
+		const rawText = getGeminiText(aiResponse);
+		let docsJson = extractJsonFromText(rawText);
+		if (!docsJson) {
+			docsJson = buildFallbackDocs(repoBundle);
+		}
+
+		return c.json({
+			success: true,
+			repo: `${owner}/${repoName}`,
+			docs: docsJson,
+			raw: rawText,
+			totalTokenCount: aiResponse.usageMetadata?.totalTokenCount,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.error("❌ generate-repo-docs error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to generate repository docs",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
+
+app.post("/generate-repo-changelog", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const {
+		repo,
+		url,
+		from,
+		to,
+		includeCommits = true,
+		includePRs = true,
+	} = body || {};
+	const input = repo || url;
+	if (!input) {
+		return c.json(
+			{ success: false, error: "Provide 'repo' (owner/name) or 'url'" },
+			400
+		);
+	}
+	if (!process.env.GITHUB_TOKEN) {
+		return c.json(
+			{ success: false, error: "GITHUB_TOKEN not configured" },
+			500
+		);
+	}
+
+	const parsed = parseGithubRepoInput(input);
+	if (!parsed) {
+		return c.json(
+			{ success: false, error: "Invalid GitHub repo identifier" },
+			400
+		);
+	}
+
+	const { owner, repo: repoName } = parsed;
+	const ghHeaders = {
+		Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+		Accept: "application/vnd.github+json",
+		"User-Agent": "ihatereading-api",
+	};
+
+	const buildQueryParams = (params) =>
+		Object.entries(params)
+			.filter(([, v]) => v !== undefined && v !== null && v !== "")
+			.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+			.join("&");
+
+	try {
+		// Resolve default branch and repo info
+		const repoRes = await fetch(
+			`https://api.github.com/repos/${owner}/${repoName}`,
+			{ headers: ghHeaders }
+		);
+		if (!repoRes.ok) {
+			const details = await repoRes.text();
+			return c.json(
+				{
+					success: false,
+					error: "Failed to fetch repo",
+					status: repoRes.status,
+					details,
+				},
+				repoRes.status
+			);
+		}
+		const repoJson = await repoRes.json();
+		const defaultBranch = repoJson.default_branch || "main";
+
+		// Time window normalization (ISO dates only for GitHub list endpoints)
+		const since = from && /\d{4}-\d{2}-\d{2}/.test(from) ? from : undefined;
+		const until = to && /\d{4}-\d{2}-\d{2}/.test(to) ? to : undefined;
+
+		// Collect commits
+		let commits = [];
+		if (includeCommits) {
+			const commitQP = buildQueryParams({
+				sha: defaultBranch,
+				since,
+				until,
+				per_page: 100,
+			});
+			const commitsUrl = `https://api.github.com/repos/${owner}/${repoName}/commits${
+				commitQP ? `?${commitQP}` : ""
+			}`;
+			const commitsRes = await fetch(commitsUrl, { headers: ghHeaders });
+			commits = commitsRes.ok ? await commitsRes.json() : [];
+		}
+
+		// Collect PRs (merged and/or closed in the window)
+		let pullRequests = [];
+		if (includePRs) {
+			// Use issues list with state=closed to get PRs with closed dates; filter to PRs
+			const prsQP = buildQueryParams({
+				state: "closed",
+				per_page: 100,
+				sort: "updated",
+				direction: "desc",
+			});
+			const issuesUrl = `https://api.github.com/repos/${owner}/${repoName}/issues${
+				prsQP ? `?${prsQP}` : ""
+			}`;
+			const issuesRes = await fetch(issuesUrl, { headers: ghHeaders });
+			const issues = issuesRes.ok ? await issuesRes.json() : [];
+			const isWithin = (dateStr) => {
+				if (!dateStr) return true;
+				const d = new Date(dateStr).getTime();
+				if (since && d < new Date(since).getTime()) return false;
+				if (until && d > new Date(until).getTime()) return false;
+				return true;
+			};
+			const issuePRs = (issues || []).filter(
+				(i) => i.pull_request && isWithin(i.closed_at || i.updated_at)
+			);
+
+			// Hydrate PR details for those issues
+			pullRequests = [];
+			for (const item of issuePRs) {
+				const prNumber = item.number;
+				const prRes = await fetch(
+					`https://api.github.com/repos/${owner}/${repoName}/pulls/${prNumber}`,
+					{ headers: ghHeaders }
+				);
+				if (!prRes.ok) continue;
+				const pr = await prRes.json();
+				pullRequests.push(pr);
+			}
+		}
+
+		const changelogBundle = {
+			repo: `${owner}/${repoName}`,
+			window: { from: since || null, to: until || null, branch: defaultBranch },
+			counts: {
+				commits: Array.isArray(commits) ? commits.length : 0,
+				prs: Array.isArray(pullRequests) ? pullRequests.length : 0,
+			},
+			commits: (commits || []).map((c) => ({
+				sha: c.sha,
+				message: c.commit?.message,
+				author: c.commit?.author?.name || c.author?.login,
+				date: c.commit?.author?.date,
+				html_url: c.html_url,
+				files_url: c.url,
+			})),
+			pull_requests: (pullRequests || []).map((p) => ({
+				number: p.number,
+				title: p.title,
+				state: p.state,
+				merged: Boolean(p.merged_at),
+				user: p.user?.login,
+				created_at: p.created_at,
+				closed_at: p.closed_at,
+				merged_at: p.merged_at,
+				html_url: p.html_url,
+				base: p.base?.ref,
+				head: p.head?.ref,
+			})),
+		};
+
+		const systemPrompt = `You are an expert release manager and technical writer. Using ONLY the provided commits and pull requests, produce a clear, developer-focused changelog.
+
+Output a SINGLE JSON object:
+{
+  "title": string,                  // e.g., "Changelog for repo@version or date range"
+  "summary": string,                // one-paragraph high-level summary
+  "sections": [                     // categorize by type
+    { "title": "Features", "items": [string] },
+    { "title": "Improvements", "items": [string] },
+    { "title": "Bug Fixes", "items": [string] },
+    { "title": "Documentation", "items": [string] },
+    { "title": "Breaking Changes", "items": [string] }
+  ],
+  "contributors": [string],         // unique authors/usernames
+  "release_notes_markdown": string  // well-formatted Markdown release notes, including bullet points and links when available
+}
+
+Rules:
+- Derive items from commit messages and PR titles/bodies only.
+- Prefer PRs over individual commits if both exist.
+- Include PR numbers and links when known, e.g., "Add X (#123)".
+- Keep it factual, concise, and useful for developers.
+- If information is missing, omit rather than speculate.`;
+
+		const userPrompt = `Repository: ${owner}/${repoName}\nWindow: from=${
+			since || "unknown"
+		} to=${until || "unknown"}\n\nData:\n${JSON.stringify(
+			changelogBundle,
+			null,
+			2
+		)}\n\nReturn only the JSON.`;
+
+		const aiResponse = await genai.models.generateContent({
+			model: "gemini-1.5-flash",
+			contents: [
+				{ role: "model", parts: [{ text: systemPrompt }] },
+				{ role: "user", parts: [{ text: userPrompt }] },
+			],
+		});
+
+		const rawText = getGeminiText(aiResponse);
+		let changelogJson = extractJsonFromText(rawText);
+		if (!changelogJson) {
+			// Fallback: minimal changelog
+			const contributors = Array.from(
+				new Set([
+					...(changelogBundle.commits || [])
+						.map((c) => c.author)
+						.filter(Boolean),
+					...(changelogBundle.pull_requests || [])
+						.map((p) => p.user)
+						.filter(Boolean),
+				])
+			);
+			changelogJson = {
+				title: `Changelog for ${owner}/${repoName}`,
+				summary: "Auto-generated summary unavailable; using fallback.",
+				sections: [
+					{
+						title: "Changes",
+						items: (changelogBundle.commits || [])
+							.slice(0, 20)
+							.map((c) => c.message)
+							.filter(Boolean),
+					},
+				],
+				contributors,
+				release_notes_markdown: `# Changelog\n\n- Fallback generated from commits (${
+					(changelogBundle.commits || []).length
+				}) and PRs (${(changelogBundle.pull_requests || []).length}).`,
+			};
+		}
+
+		return c.json({
+			success: true,
+			repo: `${owner}/${repoName}`,
+			window: { from: since || null, to: until || null },
+			changelog: changelogJson,
+			raw: rawText,
+			totalTokenCount: aiResponse.usageMetadata?.totalTokenCount,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.error("❌ generate-repo-changelog error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to generate changelog",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
+
+app.post("/profiler-users-send-email", async (c) => {
+	try {
+		const usersRef = firestore.collection("profiler-users");
+		const snapshot = await usersRef.get();
+
+		if (snapshot.empty) {
+			return c.json({
+				success: true,
+				emails: [],
+				message: "No users found in profiler-users collection.",
+			});
+		}
+
+		const emails = [];
+		snapshot.forEach((doc) => {
+			const userData = doc.data();
+			if (userData.email) {
+				emails.push(userData.email);
+			}
+		});
+
+		if (emails.length === 0) {
+			return c.json({
+				success: true,
+				emails: [],
+				message: "No emails found in profiler-users collection.",
+			});
+		}
+
+		const resend = new Resend(process.env.RESEND_API_KEY);
+		const emailHtml = await fs.readFile("email.html", "utf-8");
+
+		const sendPromises = emails.map(async (email) => {
+			try {
+				await resend.emails.send({
+					from: "connect@ihatereading.in",
+					to: email,
+					subject: "Exciting Updates from gettemplate.website!",
+					html: emailHtml,
+				});
+				return { email, status: "sent" };
+			} catch (sendError) {
+				console.error(`Failed to send email to ${email}:`, sendError);
+				return { email, status: "failed", error: sendError.message };
+			}
+		});
+
+		const results = await Promise.all(sendPromises);
+
+		return c.json({
+			success: true,
+			message: `Attempted to send emails to ${emails.length} users.`,
+			results,
+		});
+	} catch (error) {
+		console.error("Error in /profiler-users-send-email endpoint:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to process email sending request",
+				details: error.message,
 			},
 			500
 		);
