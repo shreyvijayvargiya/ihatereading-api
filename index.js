@@ -1,13 +1,12 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import { firestore, storage, auth } from "./firebase.js";
+import { firestore, storage } from "./firebase.js";
 import dotenv from "dotenv";
 import chromium from "@sparticuz/chromium";
 import { createClient } from "@supabase/supabase-js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
-import { ChatOllama } from "@langchain/ollama";
 import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
@@ -22,12 +21,6 @@ import { Resend } from "resend";
 import { promises as fs } from "fs";
 
 const userAgents = new UserAgent();
-const ollama = new ChatOllama({
-	// model: "gemma:2b",
-	model: "gemma3:270m",
-	baseURL: "http://localhost:11434",
-	temperature: 0.5,
-});
 
 // Add the Imports before StealthPlugin
 import("puppeteer-extra-plugin-stealth/evasions/chrome.app/index.js");
@@ -685,17 +678,6 @@ export const customLogger = (message, ...rest) => {
 };
 app.use(logger(customLogger));
 
-const sessionStore = new Map(); // key: domain, value: { cookies: [], updatedAt: number }
-
-const getDomainFromUrl = (rawUrl) => {
-	try {
-		const u = new URL(rawUrl);
-		return u.hostname;
-	} catch {
-		return null;
-	}
-};
-
 const randomDelay = async (minMs = 150, maxMs = 650) => {
 	const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
 	return new Promise((resolve) => setTimeout(resolve, jitter));
@@ -763,7 +745,6 @@ app.use(
 
 // Apply performance monitoring middleware
 app.use("*", performanceMiddleware);
-
 app.use("/");
 
 app.get("/", (c) => {
@@ -946,10 +927,135 @@ app.post("/post-to-devto", async (c) => {
 	}
 });
 
+app.post("/scrap-airbnb", async (c) => {
+	const {
+		city,
+		state,
+		country = "India",
+		checkin,
+		checkout,
+		useProxy = false,
+	} = await c.req.json();
+
+	if (!city || !state) {
+		return c.json({ error: "City and state are required" }, 400);
+	}
+
+	// Generate Airbnb search URL
+	const searchQuery = `${city.replaceAll(" ", "-")}--${state.replaceAll(
+		" ",
+		"-"
+	)}`;
+	const airbnbUrl = `https://www.airbnb.com/s/${searchQuery}--${country}/homes`;
+
+	// Add query parameters if provided
+	const urlParams = new URLSearchParams();
+	if (checkin) urlParams.append("checkin", checkin);
+	if (checkout) urlParams.append("checkout", checkout);
+
+	const fullUrl = urlParams.toString()
+		? `${airbnbUrl}?${urlParams.toString()}`
+		: airbnbUrl;
+
+	console.log(`🏠 Scraping Airbnb listings from: ${fullUrl}`);
+
+	let scrapedData = {};
+
+	try {
+		const response = await fetch(`http://localhost:3001/scrap-url`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				url: fullUrl,
+				useProxy: false,
+			}),
+		});
+
+		if (!response.ok) {
+			throw new Error(`HTTP error! status: ${response.status}`);
+		}
+
+		const scrapData = await response.json();
+
+		const allLinks = scrapData.data.links;
+
+		const listings = [];
+		// Process each listing link
+		const elementsToProcess = allLinks.length;
+
+		for (let i = 0; i < elementsToProcess; i++) {
+			const link = allLinks[i];
+
+			try {
+				// Extract listing URL
+				const listingUrl = link.href || link.url || "N/A";
+
+				// Only include links that match the required Airbnb room URL pattern
+				if (
+					typeof listingUrl === "string" &&
+					listingUrl.startsWith("https://www.airbnb.co.in/rooms")
+				) {
+					// Extract title from link text
+					const title = link.text ? link.text : link.title;
+
+					// Create listing data object
+					const listingData = {
+						title: title,
+						url: listingUrl,
+					};
+
+					listings.push(listingData);
+				}
+			} catch (error) {
+				console.warn(`Error processing listing ${i}:`, error);
+				continue;
+			}
+		}
+
+		// Get page info from scrap-url response
+		const pageInfo = {
+			title:
+				scrapData.data?.pageInfo?.title ||
+				scrapData.data?.title ||
+				scrapData.title ||
+				"Airbnb Search Results",
+			url: fullUrl,
+			description:
+				scrapData.data?.pageInfo?.description ||
+				scrapData.data?.description ||
+				scrapData.description ||
+				"",
+		};
+
+		scrapedData = {
+			success: true,
+			url: fullUrl,
+			searchQuery: searchQuery,
+			checkin: checkin || null,
+			checkout: checkout || null,
+			listings: listings,
+			totalListings: listings.length,
+			pageInfo: pageInfo,
+			timestamp: new Date().toISOString(),
+			useProxy: useProxy,
+		};
+	} catch (error) {
+		console.error("❌ Error scraping Airbnb:", error);
+		scrapedData = {
+			success: false,
+			error: error.message,
+			url: fullUrl,
+			timestamp: new Date().toISOString(),
+		};
+	}
+
+	return c.json(scrapedData);
+});
+
 // Google Maps scraping endpoint using headless Chrome
 app.post("/scrap-google-maps", async (c) => {
 	try {
-		const { queries, singleQuery, limit = 10 } = await c.req.json();
+		const { queries, singleQuery } = await c.req.json();
 
 		if (!queries && !singleQuery) {
 			return c.json(
@@ -1259,224 +1365,6 @@ app.post("/bing-search", async (c) => {
 	}
 });
 
-app.post("/ddg-search", async (c) => {
-	const { query } = await c.req.json();
-	const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-
-	let browser;
-	const results = [];
-	try {
-		const selectedProxy = proxyManager.getNextProxy();
-		const puppeteerExtra = (await import("puppeteer-core")).default;
-		const chromium = (await import("@sparticuz/chromium")).default;
-		let launchArgs = [...chromium.args, "--disable-web-security"];
-
-		try {
-			const executablePath = await chromium.executablePath();
-			browser = await puppeteerExtra.launch({
-				headless: true,
-				args: launchArgs,
-				executablePath: executablePath,
-				ignoreDefaultArgs: ["--disable-extensions"],
-				...(selectedProxy
-					? [
-							`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-					  ]
-					: []),
-			});
-		} catch (chromiumError) {
-			// Fallback to system Chrome
-			browser = await puppeteerExtra.launch({
-				headless: true,
-				executablePath:
-					"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-				args: [
-					"--no-sandbox",
-					"--disable-setuid-sandbox",
-					"--disable-dev-shm-usage",
-					"--disable-gpu",
-					"--disable-web-security",
-					...(selectedProxy
-						? [
-								`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-						  ]
-						: []),
-				],
-			});
-		}
-
-		const page = await browser.newPage();
-
-		// Fake a real browser
-		await page.setUserAgent(
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
-		);
-		// Authenticate proxy if credentials exist
-		if (selectedProxy.username && selectedProxy.password) {
-			await page.authenticate({
-				username: selectedProxy.username,
-				password: selectedProxy.password,
-			});
-		}
-
-		await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-		const html = await page.content();
-		const $ = load(html);
-
-		$("div.result").each((i, el) => {
-			const linkTag = $(el).find(".result__a");
-			const href = linkTag.attr("href") || "";
-			const title = linkTag.text().trim();
-			const description = $(el).find(".result__snippet").text().trim();
-
-			const url = decodeURIComponent(href.split("uddg=")[1].split("&rut")[0]);
-			if (href && title) {
-				results.push({ title, link: url, description });
-			}
-		});
-
-		return c.json({ query, results, timestamp: new Date().toISOString() });
-	} catch (err) {
-		console.error("DuckDuckGo scraper error:", err.message);
-		return c.json({ error: err.message }, 500);
-	} finally {
-		if (browser) await browser.close();
-	}
-});
-
-function cleanGoogleUrl(url) {
-	try {
-		// If url starts with "/url?", prepend a fake host to parse
-		if (url.startsWith("/url?")) {
-			url = "https://google.com" + url;
-		}
-		if (!url.includes("https://")) {
-			url = "https://" + url.hostname + url;
-		}
-		const parsedUrl = new URL(url);
-		const realUrl = parsedUrl.searchParams.get("q");
-		if (realUrl) {
-			return realUrl; // cleaned URL
-		}
-		return url; // return original if no 'q' param
-	} catch (e) {
-		return url; // fallback to original url if parsing fails
-	}
-}
-
-function parseGoogleResults(html) {
-	const results = [];
-	const $ = load(html);
-
-	$("div#search > div#rso").each((i, el) => {
-		const linkTag = $(el).find("a[href]").first();
-		const href = linkTag.attr("href") || "";
-		const title = $(el).find("h3").first().text().trim();
-		const description = $(el).find("div[style*='line']").first().text().trim();
-
-		console.log(href, title);
-		if (href && title) {
-			const link = cleanGoogleUrl(href);
-			if (link.startsWith("http")) {
-				results.push({ title, link, description });
-			}
-		}
-	});
-
-	return results;
-}
-
-app.post("/google-search", async (c) => {
-	const {
-		query,
-		num = 10,
-		language = "en",
-		country = "us",
-		timeout = 30000,
-	} = await c.req.json();
-
-	try {
-		const puppeteer = (await import("puppeteer-core")).default;
-		const launchArgs = [
-			"--no-sandbox",
-			"--disable-setuid-sandbox",
-			"--disable-dev-shm-usage",
-			"--disable-gpu",
-			"--no-zygote",
-			"--single-process",
-		];
-		const selectedProxy = proxyManager.getNextProxy();
-		launchArgs.push(
-			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
-		);
-		const browser = await puppeteer.launch({
-			executablePath:
-				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			headless: "new",
-			args: launchArgs,
-		});
-
-		const page = await browser.newPage();
-
-		await page.setUserAgent(
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-				"AppleWebKit/537.36 (KHTML, like Gecko) " +
-				"Chrome/123.0.0.0 Safari/537.36"
-		);
-
-		await page.setExtraHTTPHeaders({
-			"Accept-Language": "en-US,en;q=0.9",
-		});
-
-		// Authenticate proxy if credentials exist
-		if (selectedProxy.username && selectedProxy.password) {
-			await page.authenticate({
-				username: selectedProxy.username,
-				password: selectedProxy.password,
-			});
-		}
-
-		await page.goto(
-			`https://www.google.com/search?q=${encodeURIComponent(
-				query
-			)}&hl=${language}&gl=${country}&num=${num}&pws=0`,
-			{
-				waitUntil: "domcontentloaded",
-				timeout: timeout,
-			}
-		);
-		const response = await page.evaluate(() => {
-			return {
-				html: document.documentElement.outerHTML,
-			};
-		});
-
-		const results = parseGoogleResults(response.html);
-
-		// Use response.data directly - axios already handles UTF-8
-		const dom = new JSDOM(response.html, {
-			contentType: "text/html",
-			includeNodeLocations: false,
-			storageQuota: 10000000,
-		});
-		const document = dom.window.document;
-		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
-			document.body
-		);
-
-		return c.json({
-			query,
-			results,
-			searchUrl: response.config.url,
-			markdown: markdown,
-		});
-	} catch (error) {
-		console.error("Google search error:", error);
-		return c.json({ error: error.message }, 500);
-	}
-});
-
 // Scrap images for the internet
 app.post("/scrap-images", async (c) => {
 	const { query, platform, allowAllPlatforms = false } = await c.req.json();
@@ -1770,19 +1658,223 @@ app.post("/scrap-images", async (c) => {
 	}
 });
 
-const port = 3001;
-console.log(`Server is running on port ${port}`);
+app.post("/ddg-search", async (c) => {
+	const { query } = await c.req.json();
+	const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
-// Start the server
-serve({
-	fetch: app.fetch,
-	port,
+	let browser;
+	const results = [];
+	try {
+		const selectedProxy = proxyManager.getNextProxy();
+		const puppeteerExtra = (await import("puppeteer-core")).default;
+		const chromium = (await import("@sparticuz/chromium")).default;
+		let launchArgs = [...chromium.args, "--disable-web-security"];
+
+		try {
+			const executablePath = await chromium.executablePath();
+			browser = await puppeteerExtra.launch({
+				headless: true,
+				args: launchArgs,
+				executablePath: executablePath,
+				ignoreDefaultArgs: ["--disable-extensions"],
+				...(selectedProxy
+					? [
+							`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+					  ]
+					: []),
+			});
+		} catch (chromiumError) {
+			// Fallback to system Chrome
+			browser = await puppeteerExtra.launch({
+				headless: true,
+				executablePath:
+					"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				args: [
+					"--no-sandbox",
+					"--disable-setuid-sandbox",
+					"--disable-dev-shm-usage",
+					"--disable-gpu",
+					"--disable-web-security",
+					...(selectedProxy
+						? [
+								`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+						  ]
+						: []),
+				],
+			});
+		}
+
+		const page = await browser.newPage();
+
+		// Fake a real browser
+		await page.setUserAgent(
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+		);
+		// Authenticate proxy if credentials exist
+		if (selectedProxy.username && selectedProxy.password) {
+			await page.authenticate({
+				username: selectedProxy.username,
+				password: selectedProxy.password,
+			});
+		}
+
+		await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+		const html = await page.content();
+		const $ = load(html);
+
+		$("div.result").each((i, el) => {
+			const linkTag = $(el).find(".result__a");
+			const href = linkTag.attr("href") || "";
+			const title = linkTag.text().trim();
+			const description = $(el).find(".result__snippet").text().trim();
+
+			const url = decodeURIComponent(href.split("uddg=")[1].split("&rut")[0]);
+			if (href && title) {
+				results.push({ title, link: url, description });
+			}
+		});
+
+		return c.json({ query, results, timestamp: new Date().toISOString() });
+	} catch (err) {
+		console.error("DuckDuckGo scraper error:", err.message);
+		return c.json({ error: err.message }, 500);
+	} finally {
+		if (browser) await browser.close();
+	}
 });
 
-const isDevelopment = process.env.NODE_ENV === "development";
-const origin = isDevelopment
-	? "http://localhost:3001"
-	: "https://ihatereading-ai.vercel.app";
+function cleanGoogleUrl(url) {
+	try {
+		// If url starts with "/url?", prepend a fake host to parse
+		if (url.startsWith("/url?")) {
+			url = "https://google.com" + url;
+		}
+		if (!url.includes("https://")) {
+			url = "https://" + url.hostname + url;
+		}
+		const parsedUrl = new URL(url);
+		const realUrl = parsedUrl.searchParams.get("q");
+		if (realUrl) {
+			return realUrl; // cleaned URL
+		}
+		return url; // return original if no 'q' param
+	} catch (e) {
+		return url; // fallback to original url if parsing fails
+	}
+}
+
+function parseGoogleResults(html) {
+	const results = [];
+	const $ = load(html);
+
+	$("div#search > div#rso").each((i, el) => {
+		const linkTag = $(el).find("a[href]").first();
+		const href = linkTag.attr("href") || "";
+		const title = $(el).find("h3").first().text().trim();
+		const description = $(el).find("div[style*='line']").first().text().trim();
+
+		console.log(href, title);
+		if (href && title) {
+			const link = cleanGoogleUrl(href);
+			if (link.startsWith("http")) {
+				results.push({ title, link, description });
+			}
+		}
+	});
+
+	return results;
+}
+
+app.post("/google-search", async (c) => {
+	const {
+		query,
+		num = 10,
+		language = "en",
+		country = "us",
+		timeout = 30000,
+	} = await c.req.json();
+
+	try {
+		const puppeteer = (await import("puppeteer-core")).default;
+		const launchArgs = [
+			"--no-sandbox",
+			"--disable-setuid-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-gpu",
+			"--no-zygote",
+			"--single-process",
+		];
+		const selectedProxy = proxyManager.getNextProxy();
+		launchArgs.push(
+			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+		);
+		const browser = await puppeteer.launch({
+			executablePath:
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			headless: "new",
+			args: launchArgs,
+		});
+
+		const page = await browser.newPage();
+
+		await page.setUserAgent(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+				"AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/123.0.0.0 Safari/537.36"
+		);
+
+		await page.setExtraHTTPHeaders({
+			"Accept-Language": "en-US,en;q=0.9",
+		});
+
+		// Authenticate proxy if credentials exist
+		if (selectedProxy.username && selectedProxy.password) {
+			await page.authenticate({
+				username: selectedProxy.username,
+				password: selectedProxy.password,
+			});
+		}
+
+		await page.goto(
+			`https://www.google.com/search?q=${encodeURIComponent(
+				query
+			)}&hl=${language}&gl=${country}&num=${num}&pws=0`,
+			{
+				waitUntil: "domcontentloaded",
+				timeout: timeout,
+			}
+		);
+		const response = await page.evaluate(() => {
+			return {
+				html: document.documentElement.outerHTML,
+			};
+		});
+
+		const results = parseGoogleResults(response.html);
+
+		// Use response.data directly - axios already handles UTF-8
+		const dom = new JSDOM(response.html, {
+			contentType: "text/html",
+			includeNodeLocations: false,
+			storageQuota: 10000000,
+		});
+		const document = dom.window.document;
+		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
+			document.body
+		);
+
+		return c.json({
+			query,
+			results,
+			searchUrl: response.config.url,
+			markdown: markdown,
+		});
+	} catch (error) {
+		console.error("Google search error:", error);
+		return c.json({ error: error.message }, 500);
+	}
+});
 
 function isValidURL(urlString) {
 	try {
@@ -4633,153 +4725,6 @@ const scrapUrlPuppeteerTool = {
 	},
 };
 
-app.post("/ai-orchestrator", async (c) => {
-	customLogger("AI Orchestrator endpoint called", await c.req.header());
-	const { query } = await c.req.json();
-
-	if (!query) {
-		return c.json({ error: "query is required" }, 400);
-	}
-
-	try {
-		const llmResponse = genai.models.generateContent({
-			model: "gemini-1.5-flash",
-			config: {
-				tools: [
-					{
-						functionDeclarations: [ddgSearchTool, scrapUrlPuppeteerTool],
-					},
-				],
-			},
-			contents: [
-				{
-					role: "model",
-					parts: [
-						{
-							text: "You are a helpful assistant that can search the web for information and scrape websites.",
-						},
-					],
-				},
-				{
-					role: "user",
-					parts: [{ text: query }],
-				},
-			],
-		});
-
-		let searchResults = [];
-		let scrapResults = [];
-		if ((await llmResponse).functionCalls.length > 0) {
-			const xfProto = c.req.header("x-forwarded-proto") || "http";
-			const xfHost = c.req.header("x-forwarded-host") || c.req.header("host");
-			const fallbackHost = `127.0.0.1:${process.env.PORT || "3000"}`;
-			const baseUrl = `${xfProto}://${xfHost || fallbackHost}`;
-
-			const toolCallPromises = (await llmResponse).functionCalls.map(
-				async (functionCall) => {
-					const { name, args } = functionCall;
-					if (name === "ddg_search") {
-						const searchResult = await axios.post(
-							`${baseUrl}/ddg-search`,
-							{ query: args.query },
-							{ headers: { "Content-Type": "application/json" } }
-						);
-						console.log(searchResult.data.results, "searchResult.data.results");
-						searchResults.push(searchResult.data.results);
-					} else if (name === "scrap_url_puppeteer") {
-						const scrapResult = await axios.post(
-							`${baseUrl}/scrap-url-puppeteer`,
-							{ url: args.url },
-							{ headers: { "Content-Type": "application/json" } }
-						);
-						scrapResults.push(scrapResult.data.markdown);
-					}
-				}
-			);
-			await Promise.all(toolCallPromises);
-		}
-		const finalAnswer = await genai.models.generateContent({
-			model: "gemini-1.5-flash",
-			contents: [
-				{
-					role: "user",
-					parts: [
-						{
-							text: `User Query: ${query}
-
-Here are the search results: ${JSON.stringify(searchResults)}
-Here is the scraped content: ${JSON.stringify(scrapResults)}
-
-Based ONLY on the provided search results and scraped content, answer the user's query comprehensively and concisely. If the information is not sufficient, state that you cannot provide a comprehensive answer with the given data. Do NOT make up information or use your external knowledge.`,
-						},
-					],
-				},
-				{ role: "user", parts: [{ text: query }] },
-			],
-		});
-		return c.json({
-			success: true,
-			query: query,
-			finalAnswer: finalAnswer.candidates[0].content.parts[0].text,
-			searchResults: searchResults,
-			scrapResults: scrapResults,
-			totalTokenCount: finalAnswer.usageMetadata.totalTokenCount,
-			timestamp: new Date().toISOString(),
-		});
-	} catch (error) {
-		console.error("❌ AI Orchestrator error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to process AI Orchestrator request",
-				details: error.message,
-				query: query,
-			},
-			500
-		);
-	}
-});
-
-const googleSearchFunction = async (query) => {
-	try {
-		const response = await fetch("https://api.firecrawl.dev/v1/search", {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				query: query,
-				limit: 5,
-				scrapeOptions: {
-					onlyMainContent: true,
-					timeout: 30000,
-					parsePDF: true,
-					removeBase64Images: true,
-					blockAds: true,
-					storeInCache: true,
-				},
-			}),
-		});
-
-		if (!response.ok) {
-			throw new Error(
-				`Firecrawl API error: ${response.status} ${response.statusText}`
-			);
-		}
-
-		const data = await response.json();
-		return { result: data, success: true };
-	} catch (error) {
-		return { error: error.message, success: false };
-	}
-};
-
-// take github repo as API query and use env.GITHUB_TOKEN with github API to get the repo details
-// then pass it to genai as input prompt to generate the documentation for the repo
-// provide detailed system prompt to genai to generate the documentation for the repo
-// return the documentation as a JSON output
-
 // Helper to parse repo input (either "owner/repo" or full GitHub URL)
 const parseGithubRepoInput = (input) => {
 	if (!input || typeof input !== "string") return null;
@@ -5383,3 +5328,208 @@ app.post("/profiler-users-send-email", async (c) => {
 		);
 	}
 });
+
+// Google News Scraping Endpoint
+app.post("/scrap-google-news", async (c) => {
+	const operationId = performanceMonitor.startOperation("scrap_google_news");
+
+	try {
+		const { city, state, limit = 20 } = await c.req.json();
+
+		if (!city || !state) {
+			performanceMonitor.endOperation(operationId);
+			return c.json(
+				{
+					success: false,
+					error: "City and state are required",
+				},
+				400
+			);
+		}
+
+		// Validate limit parameter
+		const articleLimit = Math.min(Math.max(parseInt(limit) || 20, 1), 50); // Between 1 and 50 articles
+
+		// Construct Google News search URL
+		const searchQuery = encodeURIComponent(`${city} ${state}`);
+		const googleNewsUrl = `https://news.google.com/search?q=${searchQuery}&hl=en&gl=US&ceid=US%3Aen`;
+
+		console.log(`Scraping Google News for: ${city}, ${state}`);
+		console.log(`URL: ${googleNewsUrl}`);
+
+		// Use axios to fetch the page
+		const response = await axios.get(googleNewsUrl, {
+			headers: {
+				"User-Agent": userAgents.toString(),
+				Accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.5",
+				"Accept-Encoding": "gzip, deflate, br",
+				DNT: "1",
+				Connection: "keep-alive",
+				"Upgrade-Insecure-Requests": "1",
+			},
+			timeout: 30000,
+		});
+
+		const $ = load(response.data);
+		const newsArticles = [];
+
+		// Parse Google News articles
+		$("article").each((index, element) => {
+			if (index >= articleLimit) return false; // Limit to specified number of articles
+
+			const $article = $(element);
+
+			// Extract article data
+			const titleElement = $article.find("h3 a, h4 a").first();
+			const title = titleElement.text().trim();
+			const link = titleElement.attr("href");
+
+			const sourceElement = $article.find(
+				'[data-testid="source-name"], .wEwyrc, .NUnG9d'
+			);
+			const source = sourceElement.text().trim();
+
+			const timeElement = $article.find("time, .OSrXXb");
+			const timeText = timeElement.text().trim();
+
+			const snippetElement = $article.find(".GI74Re, .Y3v8qd");
+			const snippet = snippetElement.text().trim();
+
+			// Check for image presence
+			const imageElement = $article.find("img").first();
+			const hasImage = imageElement.length > 0;
+			let imageUrl = null;
+
+			if (hasImage) {
+				const src = imageElement.attr("src");
+				if (src) {
+					// Convert relative URLs to absolute URLs
+					if (src.startsWith("//")) {
+						imageUrl = `https:${src}`;
+					} else if (src.startsWith("/")) {
+						imageUrl = `https://news.google.com${src}`;
+					} else if (src.startsWith("./")) {
+						imageUrl = `https://news.google.com${src.substring(1)}`;
+					} else if (!src.startsWith("http")) {
+						imageUrl = `https://news.google.com/${src}`;
+					} else {
+						imageUrl = src;
+					}
+				}
+			}
+
+			if (title && link) {
+				newsArticles.push({
+					title,
+					link: link.startsWith("./")
+						? `https://news.google.com${link.substring(1)}`
+						: link,
+					source: source || "Unknown",
+					time: timeText || "Unknown",
+					snippet: snippet || "",
+					imageUrl: imageUrl || null,
+					index: index + 1,
+				});
+			}
+		});
+
+		// If no articles found with the above selectors, try alternative selectors
+		if (newsArticles.length === 0) {
+			$(".JtKRv").each((index, element) => {
+				if (index >= articleLimit) return false;
+
+				const $item = $(element);
+				const titleElement = $item.find("h3 a, h4 a").first();
+				const title = titleElement.text().trim();
+				const link = titleElement.attr("href");
+
+				const sourceElement = $item.find(".wEwyrc, .NUnG9d");
+				const source = sourceElement.text().trim();
+
+				const timeElement = $item.find("time, .OSrXXb");
+				const timeText = timeElement.text().trim();
+
+				const snippetElement = $item.find(".GI74Re, .Y3v8qd");
+				const snippet = snippetElement.text().trim();
+
+				// Check for image presence
+				const imageElement = $item.find("img").first();
+				const hasImage = imageElement.length > 0;
+				let imageUrl = null;
+
+				if (hasImage) {
+					const src = imageElement.attr("src");
+					if (src) {
+						// Convert relative URLs to absolute URLs
+						if (src.startsWith("//")) {
+							imageUrl = `https:${src}`;
+						} else if (src.startsWith("/")) {
+							imageUrl = `https://news.google.com${src}`;
+						} else if (src.startsWith("./")) {
+							imageUrl = `https://news.google.com${src.substring(1)}`;
+						} else if (!src.startsWith("http")) {
+							imageUrl = `https://news.google.com/${src}`;
+						} else {
+							imageUrl = src;
+						}
+					}
+				}
+
+				if (title && link) {
+					newsArticles.push({
+						title,
+						link: link.startsWith("./")
+							? `https://news.google.com${link.substring(1)}`
+							: link,
+						source: source || "Unknown",
+						time: timeText || "Unknown",
+						snippet: snippet || "",
+						hasImage,
+						imageUrl: imageUrl || null,
+						index: index + 1,
+					});
+				}
+			});
+		}
+
+		performanceMonitor.endOperation(operationId);
+
+		return c.json({
+			success: true,
+			query: `${city}, ${state}`,
+			limit: articleLimit,
+			totalArticles: newsArticles.length,
+			articles: newsArticles,
+			scrapedAt: new Date().toISOString(),
+			url: googleNewsUrl,
+		});
+	} catch (error) {
+		console.error("Error in /scrap-google-news endpoint:", error);
+		performanceMonitor.endOperation(operationId);
+
+		return c.json(
+			{
+				success: false,
+				error: "Failed to scrape Google News",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
+
+const port = 3001;
+console.log(`Server is running on port ${port}`);
+
+// Start the server
+serve({
+	fetch: app.fetch,
+	port,
+});
+
+const isDevelopment = process.env.NODE_ENV === "development";
+const origin = isDevelopment
+	? "http://localhost:3001"
+	: "https://ihatereading-ai.vercel.app";

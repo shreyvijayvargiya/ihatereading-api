@@ -343,7 +343,7 @@ export const aiWebSearchAgent = async (prompt) => {
 		}
 	}
 
-	console.log(JSON.stringify(functionResults[0]), "functionResults");
+
 	const finalResponse = await genai.models.generateContent({
 		model: "gemini-2.0-flash",
 		contents: [
