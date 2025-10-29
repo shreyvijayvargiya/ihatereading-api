@@ -19,6 +19,8 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { GoogleGenAI } from "@google/genai";
 import { Resend } from "resend";
 import { promises as fs } from "fs";
+import NodeCache from "node-cache";
+import { fetch } from "undici";
 
 const userAgents = new UserAgent();
 
@@ -48,6 +50,214 @@ import(
 );
 
 dotenv.config();
+
+// GitHub Trending Cache
+const trendingCache = new NodeCache({ stdTTL: 60 * 5, checkperiod: 120 }); // default 5 min cache
+
+// GitHub Trending Types
+// Repo type: { name, url, description?, stars?, language?, forks?, avatar?, trendingRank? }
+
+const CATEGORY_MAP = {
+	// categories are flexible — map to language(s) or topics for the GitHub search approach
+	web: ["JavaScript", "TypeScript", "HTML", "CSS"],
+	mobile: ["Kotlin", "Swift", "Dart", "Java"],
+	ai: ["Python", "Jupyter Notebook", "Machine Learning"],
+	infra: ["Dockerfile", "Go", "Rust"],
+	security: ["C", "Assembly", "Go"],
+	data: ["Python", "R", "SQL"],
+	all: [], // empty = no language filter
+};
+
+function cacheKey(prefix, params) {
+	const sorted = Object.keys(params)
+		.sort()
+		.map((k) => `${k}=${params[k] ?? ""}`)
+		.join("&");
+	return `${prefix}:${sorted}`;
+}
+
+// Helper: Use GitHub Search API to approximate trending by stars in recent period
+async function fetchTrendingFromGitHubSearch({
+	language,
+	since = "weekly", // daily|weekly|monthly
+	per_page = 25,
+}) {
+	// compute created after date for time window
+	const now = new Date();
+	let fromDate = new Date(now);
+	if (since === "daily") fromDate.setDate(now.getDate() - 1);
+	else if (since === "weekly") fromDate.setDate(now.getDate() - 7);
+	else fromDate.setMonth(now.getMonth() - 1);
+
+	const created = fromDate.toISOString().slice(0, 10); // YYYY-MM-DD
+	// Build query: repos created after 'created' sorted by stars desc
+	// If language provided, add language filter
+	let q = `created:>${created}`;
+	if (language) q += ` language:${language}`;
+
+	const params = new URLSearchParams({
+		q,
+		sort: "stars",
+		order: "desc",
+		per_page: (per_page ?? 25).toString(),
+	});
+
+	const url = `https://api.github.com/search/repositories?${params.toString()}`;
+
+	const headers = {
+		Accept: "application/vnd.github+json",
+		"User-Agent": "ihatereading-api",
+	};
+	if (process.env.GITHUB_TOKEN) {
+		headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
+	}
+
+	const res = await fetch(url, { headers });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(`GitHub Search API error: ${res.status} ${text}`);
+	}
+	const data = await res.json();
+	const items = data.items ?? [];
+	return items.map((it, idx) => ({
+		name: `${it.owner.login}/${it.name}`,
+		url: it.html_url,
+		description: it.description,
+		stars: it.stargazers_count,
+		forks: it.forks_count,
+		language: it.language,
+		avatar: it.owner.avatar_url,
+		trendingRank: idx + 1,
+	}));
+}
+
+// Helper: Scrape GitHub trending page (language + since)
+async function fetchTrendingFromScrape({
+	language,
+	since = "daily",
+	per_page = 25,
+}) {
+	// Build URL: https://github.com/trending/<language>?since=daily
+	const langPath = language ? `/${encodeURIComponent(language)}` : "";
+	const url = `https://github.com/trending${langPath}?since=${since}`;
+
+	const res = await fetch(url, {
+		headers: {
+			"User-Agent": "hono-trending-bot",
+		},
+	});
+
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(`GitHub trending page fetch failed: ${res.status} ${text}`);
+	}
+
+	const html = await res.text();
+	const $ = load(html);
+
+	const repos = [];
+	$("article.Box-row").each((i, el) => {
+		if (i >= per_page) return;
+		const title = $(el).find("h2 a").text().trim().replace(/\s+/g, " ");
+		// title like "owner / repo"
+		const name = title.replace(/\s/g, "").replace(/\//, "/"); // tidy
+		const urlPath = $(el).find("h2 a").attr("href") ?? "";
+		const urlFull = urlPath ? `https://github.com${urlPath}` : "";
+		const desc = $(el).find("p.col-9").text().trim() || undefined;
+		const lang =
+			$(el).find("span[itemprop=programmingLanguage]").text().trim() ||
+			undefined;
+		// stars displayed relative to repo, but trending page also shows stars
+		const starText =
+			$(el)
+				.find("a[href$='/stargazers']")
+				.first()
+				.text()
+				.trim()
+				.replace(",", "") || "0";
+		const forksText =
+			$(el)
+				.find("a[href$='/network/members']")
+				.first()
+				.text()
+				.trim()
+				.replace(",", "") || "0";
+		const avatar = $(el).find("img.avatar").attr("src") || undefined;
+
+		repos.push({
+			name: name,
+			url: urlFull,
+			description: desc,
+			language: lang,
+			stars: Number(starText) || undefined,
+			forks: Number(forksText) || undefined,
+			avatar,
+			trendingRank: i + 1,
+		});
+	});
+
+	return repos;
+}
+
+// Unified endpoint logic: check cache, decide strategy, return JSON
+async function getTrending(params) {
+	const { category, language, since = "weekly", per_page = 25 } = params;
+	// compute effective language(s)
+	let langToUse;
+	if (language) langToUse = language;
+	else if (category && CATEGORY_MAP[category]) {
+		// pick first language if multiple
+		const langs = CATEGORY_MAP[category];
+		if (langs.length > 0) langToUse = langs[0];
+	}
+
+	const key = cacheKey("trending", {
+		category: category ?? "none",
+		language: langToUse ?? "none",
+		since,
+		per_page: per_page?.toString() ?? "25",
+	});
+
+	const cached = trendingCache.get(key);
+	if (cached) return cached;
+
+	// Try GitHub Search API if token available, else scrape
+	let results = [];
+	try {
+		if (process.env.GITHUB_TOKEN) {
+			// If language not defined and category 'all', we just search without language.
+			results = await fetchTrendingFromGitHubSearch({
+				language: langToUse ?? undefined,
+				since,
+				per_page,
+			});
+		} else {
+			// fallback: scrape the trending page. If langToUse is not a GitHub language slug,
+			// it may still work; else pass empty for all languages.
+			results = await fetchTrendingFromScrape({
+				language: langToUse ?? undefined,
+				since,
+				per_page,
+			});
+		}
+	} catch (err) {
+		// if GitHub search failed, try fallback scrape
+		console.warn("Primary trending strategy failed:", err);
+		try {
+			results = await fetchTrendingFromScrape({
+				language: langToUse ?? undefined,
+				since,
+				per_page,
+			});
+		} catch (err2) {
+			console.error("Both trending strategies failed:", err2);
+			throw err2;
+		}
+	}
+
+	trendingCache.set(key, results, 60 * 5); // cache 5 minutes
+	return results;
+}
 
 // Performance Monitoring Utility
 class PerformanceMonitor {
@@ -750,6 +960,51 @@ app.use("/");
 app.get("/", (c) => {
 	return c.text("Welcome to iHateReading API", 200);
 });
+
+// GitHub Trending endpoint
+// Query params:
+// - category=web|mobile|ai|infra|data|all (maps to languages) OR language=JavaScript
+// - since=daily|weekly|monthly
+// - per_page=number
+app.get("/github-trending", async (c) => {
+	try {
+		const qp = c.req.query();
+		const category = qp.category;
+		const language = qp.language;
+		const since = qp.since || "weekly";
+		const per_page = Math.min(Number(qp.per_page ?? 25), 100);
+
+		// basic validation
+		if (category && !CATEGORY_MAP[category] && category !== "all") {
+			return c.json({ ok: false, error: "unknown category" }, 400);
+		}
+
+		const results = await getTrending({ category, language, since, per_page });
+		return c.json(
+			{
+				ok: true,
+				meta: {
+					source: process.env.GITHUB_TOKEN
+						? "github-search"
+						: "github-trending-scrape",
+					category,
+					language,
+					since,
+					per_page,
+				},
+				data: results,
+			},
+			200
+		);
+	} catch (err) {
+		console.error(err);
+		const errorMessage = err?.message ?? String(err);
+		return c.json({ ok: false, error: errorMessage }, 500);
+	}
+});
+
+// Health check endpoint
+app.get("/health", (c) => c.json({ ok: true, ts: Date.now() }));
 
 app.post("/post-to-devto", async (c) => {
 	try {
