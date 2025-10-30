@@ -5775,6 +5775,183 @@ app.post("/scrap-google-news", async (c) => {
 	}
 });
 
+app.get("/scrap-grokipedia", async (c) => {
+	try {
+		const city = await c.req.query("city");
+		const state = await c.req.query("state");
+
+		if (!city || !state) {
+			return c.json({ error: "City and State parameters are required" }, 400);
+		}
+
+		// Construct Grokipedia URL: page/Kota%2C_Rajasthan format
+		// Format: city and state, separated by %2C_ (comma and underscore)
+		const formattedCity = city.trim().replace(/\s+/g, "_");
+		const formattedState = state.trim().replace(/\s+/g, "_");
+		const url = `https://grokipedia.com/page/${formattedCity}%2C_${formattedState}`;
+
+		console.log("Grokipedia URL:", url);
+
+		// Fetch HTML
+		const response = await axios.get(url, {
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+			},
+		});
+
+		const $ = load(response.data);
+
+		// Extract metadata
+		const title =
+			$("h1").first().text().trim() || $("article h1").first().text().trim();
+		const description = $('meta[name="description"]').attr("content") || "";
+
+		// Find and extract content from article tag
+		const article = $("article").first();
+		let structuredContent = null;
+
+		if (article.length > 0) {
+			// Extract structured content from article tag
+			const content = {
+				headings: [],
+				paragraphs: [],
+				lists: [],
+				images: [],
+				links: [],
+			};
+
+			// Extract headings (h1-h6) in order
+			article.find("h1, h2, h3, h4, h5, h6").each((_, el) => {
+				const heading = {
+					level: el.tagName.toLowerCase(),
+					text: $(el).text().trim(),
+				};
+				if (heading.text) {
+					content.headings.push(heading);
+				}
+			});
+
+			// Extract paragraphs
+			article.find("p").each((_, el) => {
+				const text = $(el).text().trim();
+				if (text) {
+					content.paragraphs.push(text);
+				}
+			});
+
+			// Extract lists (both ul and ol)
+			article.find("ul, ol").each((_, el) => {
+				const listItems = [];
+				$(el)
+					.find("li")
+					.each((_, li) => {
+						const itemText = $(li).text().trim();
+						if (itemText) {
+							listItems.push(itemText);
+						}
+					});
+				if (listItems.length > 0) {
+					content.lists.push({
+						type: el.tagName.toLowerCase(),
+						items: listItems,
+					});
+				}
+			});
+
+			// Extract images
+			article.find("img").each((_, el) => {
+				const imgSrc = $(el).attr("src");
+				const imgAlt = $(el).attr("alt") || "";
+				if (imgSrc) {
+					content.images.push({
+						src: imgSrc.startsWith("http")
+							? imgSrc
+							: `https://grokipedia.com${imgSrc}`,
+						alt: imgAlt,
+					});
+				}
+			});
+
+			// Extract links
+			article.find("a[href]").each((_, el) => {
+				const href = $(el).attr("href");
+				const linkText = $(el).text().trim();
+				if (href && linkText) {
+					content.links.push({
+						text: linkText,
+						href: href.startsWith("http")
+							? href
+							: `https://grokipedia.com${href}`,
+					});
+				}
+			});
+
+			// Get raw HTML of article (trimmed)
+			const articleHtml = article.html();
+
+			// Also extract markdown format using existing utility
+			let markdown = "";
+			try {
+				const dom = new JSDOM(articleHtml);
+				const articleDoc = dom.window.document;
+				const { markdown: articleMarkdown } =
+					extractSemanticContentWithFormattedMarkdown(articleDoc.body);
+				markdown = articleMarkdown || "";
+			} catch (mdError) {
+				console.warn("Failed to generate markdown:", mdError);
+			}
+
+			structuredContent = {
+				html: articleHtml,
+				markdown: markdown,
+				structure: content,
+			};
+		}
+
+		// Extract references section (outside article tag) - fetch all child links from element with id="references"
+		const referencesSection = $("#references");
+		const references = [];
+		if (referencesSection.length > 0) {
+			referencesSection.find("a[href]").each((_, el) => {
+				const href = $(el).attr("href");
+				const linkText = $(el).text().trim();
+				if (href) {
+					references.push({
+						text: linkText || $(el).attr("title") || href,
+						href: href.startsWith("http")
+							? href
+							: `https://grokipedia.com${href}`,
+					});
+				}
+			});
+		}
+
+		const data = {
+			url,
+			title,
+			description,
+			content: structuredContent || {
+				html: "",
+				markdown: "",
+				structure: {
+					headings: [],
+					paragraphs: [],
+					lists: [],
+					images: [],
+					links: [],
+				},
+			},
+			references: references,
+		};
+
+		return c.json(data);
+	} catch (error) {
+		console.error(error.message);
+		return c.json({ error: "Failed to scrape Grokipedia data" }, 500);
+	}
+});
+
 const port = 3001;
 console.log(`Server is running on port ${port}`);
 
