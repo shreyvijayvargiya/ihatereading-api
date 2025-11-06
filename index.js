@@ -21,6 +21,7 @@ import { Resend } from "resend";
 import { promises as fs } from "fs";
 import NodeCache from "node-cache";
 import { fetch } from "undici";
+import { z } from "zod";
 
 const userAgents = new UserAgent();
 
@@ -1305,6 +1306,767 @@ app.post("/scrap-airbnb", async (c) => {
 	}
 
 	return c.json(scrapedData);
+});
+
+// Zod schemas for form generation
+const formFieldSchema = z.object({
+	id: z.string().describe("Unique identifier for the field"),
+	type: z
+		.enum([
+			"text",
+			"email",
+			"number",
+			"tel",
+			"url",
+			"password",
+			"textarea",
+			"select",
+			"checkbox",
+			"radio",
+			"date",
+			"time",
+			"datetime-local",
+			"file",
+			"range",
+			"switch",
+			"card-select",
+			"video-upload",
+			"gallery-upload",
+			"yes-no",
+			"polling",
+			"rating",
+			"signature",
+		])
+		.describe("Type of the form field"),
+	label: z.string().describe("Label for the form field"),
+	name: z.string().describe("Name attribute for the form field"),
+	placeholder: z.string().optional().describe("Placeholder text for the field"),
+	required: z
+		.boolean()
+		.optional()
+		.default(false)
+		.describe("Whether the field is required"),
+	options: z
+		.array(z.string())
+		.optional()
+		.describe("Options for select, radio, or checkbox fields"),
+	value: z
+		.union([z.string(), z.number(), z.boolean(), z.array(z.string())])
+		.optional()
+		.describe("Default or current value for the field"),
+	validation: z
+		.object({
+			min: z
+				.number()
+				.optional()
+				.describe("Minimum value for number/range fields"),
+			max: z
+				.number()
+				.optional()
+				.describe("Maximum value for number/range fields"),
+			step: z.number().optional().describe("Step value for range fields"),
+			minLength: z
+				.number()
+				.optional()
+				.describe("Minimum length for text fields"),
+			maxLength: z
+				.number()
+				.optional()
+				.describe("Maximum length for text fields"),
+			pattern: z.string().optional().describe("Regex pattern for validation"),
+		})
+		.optional()
+		.describe("Validation rules for the field"),
+	helperText: z
+		.string()
+		.optional()
+		.describe("Helper text to display below the field"),
+	yesLabel: z
+		.string()
+		.optional()
+		.describe(
+			"Custom label for 'Yes' option in yes-no fields (default: 'Yes')"
+		),
+	noLabel: z
+		.string()
+		.optional()
+		.describe("Custom label for 'No' option in yes-no fields (default: 'No')"),
+});
+
+const formStepSchema = z.object({
+	id: z.string().describe("Unique identifier for the step"),
+	title: z.string().describe("Title of the form step"),
+	description: z
+		.string()
+		.optional()
+		.describe("Description or subtitle for the step"),
+	fields: z
+		.array(formFieldSchema)
+		.describe("Array of form fields in this step"),
+});
+
+const formOutputSchema = z.object({
+	title: z.string().describe("Title of the form"),
+	description: z
+		.string()
+		.optional()
+		.describe("Overall description of the form"),
+	steps: z.array(formStepSchema).describe("Array of form steps"),
+});
+
+/**
+ * Scrape website content using Firecrawl API
+ * @param {string} url - The URL to scrape
+ * @returns {Promise<{success: boolean, markdown?: string, error?: string}>}
+ */
+async function scrapeWithFirecrawl(url) {
+	try {
+		const firecrawlApiKey = process.env.FIRECRAWL_API_KEY;
+		if (!firecrawlApiKey) {
+			return {
+				success: false,
+				error: "FIRECRAWL_API_KEY environment variable is not set",
+			};
+		}
+
+		// Validate URL format
+		let validUrl;
+		try {
+			validUrl = new URL(url);
+		} catch (e) {
+			return {
+				success: false,
+				error: "Invalid URL format",
+			};
+		}
+
+		// Only allow http/https protocols
+		if (!["http:", "https:"].includes(validUrl.protocol)) {
+			return {
+				success: false,
+				error: "Only http and https URLs are allowed",
+			};
+		}
+
+		// Call Firecrawl API with timeout
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
+
+		try {
+			const response = await fetch("https://api.firecrawl.dev/v0/scrape", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${firecrawlApiKey}`,
+				},
+				body: JSON.stringify({
+					url: url,
+					formats: ["markdown"],
+				}),
+				signal: controller.signal,
+			});
+			clearTimeout(timeoutId);
+
+			if (!response.ok) {
+				const errorData = await response.json().catch(() => ({}));
+				return {
+					success: false,
+					error:
+						errorData.error?.message ||
+						`Firecrawl API returned status ${response.status}`,
+				};
+			}
+
+			const data = await response.json();
+
+			// Extract markdown content from Firecrawl response
+			const markdown =
+				data.data?.markdown || data.markdown || data.content?.markdown || "";
+
+			if (!markdown || markdown.trim().length === 0) {
+				return {
+					success: false,
+					error: "No markdown content found in the scraped page",
+				};
+			}
+
+			return {
+				success: true,
+				markdown: markdown,
+			};
+		} catch (error) {
+			clearTimeout(timeoutId);
+			if (error.name === "AbortError") {
+				return {
+					success: false,
+					error: "Request timeout: Firecrawl API took too long to respond",
+				};
+			}
+			console.error("Firecrawl scraping error:", error);
+			return {
+				success: false,
+				error: error.message || "Failed to scrape URL with Firecrawl",
+			};
+		}
+	} catch (error) {
+		console.error("Firecrawl scraping error:", error);
+		return {
+			success: false,
+			error: error.message || "Failed to scrape URL with Firecrawl",
+		};
+	}
+}
+
+/**
+ * Scrape website content using internal scrap-url-puppeteer endpoint
+ * @param {string} url - The URL to scrape
+ * @param {string} baseUrl - The base URL for the API (e.g., http://localhost:3001)
+ * @returns {Promise<{success: boolean, markdown?: string, error?: string}>}
+ */
+async function scrapeWithOwnEndpoint(url, baseUrl) {
+	try {
+		// Validate URL format
+		let validUrl;
+		try {
+			validUrl = new URL(url);
+		} catch (e) {
+			return {
+				success: false,
+				error: "Invalid URL format",
+			};
+		}
+
+		// Only allow http/https protocols
+		if (!["http:", "https:"].includes(validUrl.protocol)) {
+			return {
+				success: false,
+				error: "Only http and https URLs are allowed",
+			};
+		}
+
+		// Call internal scrap-url-puppeteer endpoint with timeout
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 120000); // 120 second timeout
+
+		try {
+			const response = await fetch(`${baseUrl}/scrap-url-puppeteer`, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					url: url,
+					includeSemanticContent: true,
+					includeImages: false,
+					includeLinks: false,
+					extractMetadata: false,
+					timeout: 60000,
+				}),
+				signal: controller.signal,
+			});
+			clearTimeout(timeoutId);
+
+			if (!response.ok) {
+				const errorData = await response.json().catch(() => ({}));
+				return {
+					success: false,
+					error:
+						errorData.error?.message ||
+						`Internal scraping endpoint returned status ${response.status}`,
+				};
+			}
+
+			const data = await response.json();
+
+			// Extract markdown content from response
+			const markdown = data.markdown || "";
+
+			if (!markdown || markdown.trim().length === 0) {
+				return {
+					success: false,
+					error: "No markdown content found in the scraped page",
+				};
+			}
+
+			return {
+				success: true,
+				markdown: markdown,
+			};
+		} catch (error) {
+			clearTimeout(timeoutId);
+			if (error.name === "AbortError") {
+				return {
+					success: false,
+					error:
+						"Request timeout: Internal scraping endpoint took too long to respond",
+				};
+			}
+			console.error("Internal scraping error:", error);
+			return {
+				success: false,
+				error: error.message || "Failed to scrape URL with internal endpoint",
+			};
+		}
+	} catch (error) {
+		console.error("Internal scraping error:", error);
+		return {
+			success: false,
+			error: error.message || "Failed to scrape URL with internal endpoint",
+		};
+	}
+}
+
+// Generate form from URL endpoint
+app.post("/generate-form-from-url", async (c) => {
+	try {
+		const { url, prompt } = await c.req.json();
+
+		// Validate required fields
+		if (!url || typeof url !== "string") {
+			return c.json({ error: "URL is required" }, 400);
+		}
+
+		if (!prompt || typeof prompt !== "string") {
+			return c.json({ error: "Prompt is required" }, 400);
+		}
+
+		// Scrape the website content using Firecrawl
+		console.log("Scraping URL with Firecrawl:", url);
+		const scrapeResult = await scrapeWithFirecrawl(url);
+
+		if (!scrapeResult.success) {
+			return c.json(
+				{
+					error: "Failed to scrape URL",
+					details: scrapeResult.error,
+				},
+				400
+			);
+		}
+
+		const markdownContent = scrapeResult.markdown;
+
+		// Limit markdown content to avoid token limits (keep first 50000 characters)
+		const truncatedMarkdown =
+			markdownContent.length > 50000
+				? markdownContent.substring(0, 50000) +
+				  "\n\n[Content truncated due to length...]"
+				: markdownContent;
+
+		// System prompt for generating form from website content
+		const systemPrompt = `You are an AI assistant specialized in generating structured form data from website content and natural language descriptions.
+
+CRITICAL ARCHITECTURE RULE - ONE FIELD PER STEP:
+
+═══════════════════════════════════════════════════════════════
+
+- Each step MUST contain exactly ONE field (fields array with one element)
+
+- Each field gets its own step
+
+- The step title should match or describe the field label
+
+- This creates a Typeform-style experience where users see one question at a time
+
+Example:
+
+- Step 1: { id: "step1", title: "What's your name?", fields: [{ id: "name", type: "text", label: "What's your name?", ... }] }
+
+- Step 2: { id: "step2", title: "Email Address", fields: [{ id: "email", type: "email", label: "Email Address", ... }] }
+
+Your task is to analyze the provided website content (in markdown format) and the user's prompt to create an appropriate multi-step form structure.
+
+Consider:
+
+- The website's purpose and content
+
+- The user's specific requirements from the prompt
+
+- What information would be relevant to collect based on the website context
+
+- Create fields that make sense for the website's domain and the user's intent
+
+IMPORTANT: You MUST return ONLY valid JSON that matches this exact schema:
+{
+  "title": string,
+  "description": string (optional),
+  "steps": [
+    {
+      "id": string,
+      "title": string,
+      "description": string (optional),
+      "fields": [
+        {
+          "id": string,
+          "type": string (one of: text, email, number, tel, url, password, textarea, select, checkbox, radio, date, time, datetime-local, file, range, switch, card-select, video-upload, gallery-upload, yes-no, polling, rating, signature),
+          "label": string,
+          "name": string,
+          "placeholder": string (optional),
+          "required": boolean (optional, default: false),
+          "options": string[] (optional, for select/radio/checkbox),
+          "value": string | number | boolean | string[] (optional),
+          "validation": {
+            "min": number (optional),
+            "max": number (optional),
+            "step": number (optional),
+            "minLength": number (optional),
+            "maxLength": number (optional),
+            "pattern": string (optional)
+          } (optional),
+          "helperText": string (optional),
+          "yesLabel": string (optional),
+          "noLabel": string (optional)
+        }
+      ]
+    }
+  ]
+}
+
+Return ONLY the JSON object. Do not include any conversational text, explanations, or markdown code fences.`;
+
+		// Create the prompt with website content and user prompt
+		const content = `Website URL: ${url}
+
+Website Content (Markdown):
+
+═══════════════════════════════════════════════════════════════
+
+${truncatedMarkdown}
+
+═══════════════════════════════════════════════════════════════
+
+User Prompt: "${prompt}"
+
+Based on the website content above and the user's prompt, generate a complete multi-step form structure with appropriate fields. Each step should contain exactly one field.
+
+Consider the website's context, purpose, and the user's requirements when creating the form fields.
+
+Return ONLY the JSON object matching the schema above, with no additional text or formatting.`;
+
+		// Generate form using Gemini AI
+		let attempts = 0;
+		const maxAttempts = 3;
+		let formData = null;
+
+		while (attempts < maxAttempts && !formData) {
+			try {
+				// Add timeout wrapper for Gemini API call
+				const aiResponsePromise = genai.models.generateContent({
+					model: "gemini-2.0-flash",
+					contents: [
+						{
+							role: "user",
+							parts: [
+								{
+									text: `${systemPrompt}\n\n${content}`,
+								},
+							],
+						},
+					],
+				});
+
+				// Add timeout to Gemini API call (90 seconds)
+				const timeoutPromise = new Promise((_, reject) => {
+					setTimeout(() => reject(new Error("Gemini API timeout")), 90000);
+				});
+
+				const aiResponse = await Promise.race([
+					aiResponsePromise,
+					timeoutPromise,
+				]);
+
+				const responseText =
+					aiResponse?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+				// Extract JSON from response (handle code fences if present)
+				let jsonText = responseText.trim();
+				const jsonMatch = jsonText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+				if (jsonMatch) {
+					jsonText = jsonMatch[1].trim();
+				}
+
+				// Try to find JSON object boundaries
+				const firstBrace = jsonText.indexOf("{");
+				const lastBrace = jsonText.lastIndexOf("}");
+				if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+					jsonText = jsonText.substring(firstBrace, lastBrace + 1);
+				}
+
+				// Parse and validate JSON
+				const parsed = JSON.parse(jsonText);
+				formData = formOutputSchema.parse(parsed);
+				break;
+			} catch (parseError) {
+				attempts++;
+				const isTimeout = parseError.message.includes("timeout");
+				console.warn(
+					`Attempt ${attempts} failed to parse/validate form data:`,
+					parseError.message
+				);
+				if (attempts >= maxAttempts) {
+					throw new Error(
+						`Failed to generate valid form structure after ${maxAttempts} attempts: ${parseError.message}`
+					);
+				}
+				// If timeout, wait a bit before retrying
+				if (isTimeout) {
+					await new Promise((resolve) => setTimeout(resolve, 2000));
+				}
+			}
+		}
+
+		if (!formData) {
+			throw new Error("Failed to generate form data");
+		}
+
+		return c.json({
+			...formData,
+			source: {
+				url: url,
+				contentLength: markdownContent.length,
+				truncated: markdownContent.length > 50000,
+			},
+		});
+	} catch (err) {
+		console.error("/generate-form-from-url error", err);
+		return c.json(
+			{
+				error: "Failed to generate form data from URL",
+				message: err.message || "Unknown error",
+			},
+			500
+		);
+	}
+});
+
+// Generate form from URL endpoint using internal LLM scraping
+app.post("/generate-form-from-url-llm", async (c) => {
+	try {
+		const { url, prompt } = await c.req.json();
+
+		// Validate required fields
+		if (!url || typeof url !== "string") {
+			return c.json({ error: "URL is required" }, 400);
+		}
+
+		if (!prompt || typeof prompt !== "string") {
+			return c.json({ error: "Prompt is required" }, 400);
+		}
+
+		// Determine base URL from request headers
+		const xfProto = c.req.header("x-forwarded-proto") || "http";
+		const xfHost = c.req.header("x-forwarded-host") || c.req.header("host");
+		const fallbackHost = `127.0.0.1:${process.env.PORT || "3001"}`;
+		const baseUrl = `${xfProto}://${xfHost || fallbackHost}`;
+
+		// Scrape the website content using internal endpoint
+		console.log("Scraping URL with internal endpoint:", url);
+		const scrapeResult = await scrapeWithOwnEndpoint(url, baseUrl);
+
+		if (!scrapeResult.success) {
+			return c.json(
+				{
+					error: "Failed to scrape URL",
+					details: scrapeResult.error,
+				},
+				400
+			);
+		}
+
+		const markdownContent = scrapeResult.markdown;
+
+		// Limit markdown content to avoid token limits (keep first 50000 characters)
+		const truncatedMarkdown =
+			markdownContent.length > 50000
+				? markdownContent.substring(0, 50000) +
+				  "\n\n[Content truncated due to length...]"
+				: markdownContent;
+
+		// System prompt for generating form from website content
+		const systemPrompt = `You are an AI assistant specialized in generating structured form data from website content and natural language descriptions.
+
+CRITICAL ARCHITECTURE RULE - ONE FIELD PER STEP:
+
+═══════════════════════════════════════════════════════════════
+
+- Each step MUST contain exactly ONE field (fields array with one element)
+
+- Each field gets its own step
+
+- The step title should match or describe the field label
+
+- This creates a Typeform-style experience where users see one question at a time
+
+Example:
+
+- Step 1: { id: "step1", title: "What's your name?", fields: [{ id: "name", type: "text", label: "What's your name?", ... }] }
+
+- Step 2: { id: "step2", title: "Email Address", fields: [{ id: "email", type: "email", label: "Email Address", ... }] }
+
+Your task is to analyze the provided website content (in markdown format) and the user's prompt to create an appropriate multi-step form structure.
+
+Consider:
+
+- The website's purpose and content
+
+- The user's specific requirements from the prompt
+
+- What information would be relevant to collect based on the website context
+
+- Create fields that make sense for the website's domain and the user's intent
+
+IMPORTANT: You MUST return ONLY valid JSON that matches this exact schema:
+{
+  "title": string,
+  "description": string (optional),
+  "steps": [
+    {
+      "id": string,
+      "title": string,
+      "description": string (optional),
+      "fields": [
+        {
+          "id": string,
+          "type": string (one of: text, email, number, tel, url, password, textarea, select, checkbox, radio, date, time, datetime-local, file, range, switch, card-select, video-upload, gallery-upload, yes-no, polling, rating, signature),
+          "label": string,
+          "name": string,
+          "placeholder": string (optional),
+          "required": boolean (optional, default: false),
+          "options": string[] (optional, for select/radio/checkbox),
+          "value": string | number | boolean | string[] (optional),
+          "validation": {
+            "min": number (optional),
+            "max": number (optional),
+            "step": number (optional),
+            "minLength": number (optional),
+            "maxLength": number (optional),
+            "pattern": string (optional)
+          } (optional),
+          "helperText": string (optional),
+          "yesLabel": string (optional),
+          "noLabel": string (optional)
+        }
+      ]
+    }
+  ]
+}
+
+Return ONLY the JSON object. Do not include any conversational text, explanations, or markdown code fences.`;
+
+		// Create the prompt with website content and user prompt
+		const content = `Website URL: ${url}
+
+Website Content (Markdown):
+
+═══════════════════════════════════════════════════════════════
+
+${truncatedMarkdown}
+
+═══════════════════════════════════════════════════════════════
+
+User Prompt: "${prompt}"
+
+Based on the website content above and the user's prompt, generate a complete multi-step form structure with appropriate fields. Each step should contain exactly one field.
+
+Consider the website's context, purpose, and the user's requirements when creating the form fields.
+
+Return ONLY the JSON object matching the schema above, with no additional text or formatting.`;
+
+		// Generate form using Gemini AI
+		let attempts = 0;
+		const maxAttempts = 3;
+		let formData = null;
+
+		while (attempts < maxAttempts && !formData) {
+			try {
+				// Add timeout wrapper for Gemini API call
+				const aiResponsePromise = genai.models.generateContent({
+					model: "gemini-2.0-flash",
+					contents: [
+						{
+							role: "user",
+							parts: [
+								{
+									text: `${systemPrompt}\n\n${content}`,
+								},
+							],
+						},
+					],
+				});
+
+				// Add timeout to Gemini API call (90 seconds)
+				const timeoutPromise = new Promise((_, reject) => {
+					setTimeout(() => reject(new Error("Gemini API timeout")), 90000);
+				});
+
+				const aiResponse = await Promise.race([
+					aiResponsePromise,
+					timeoutPromise,
+				]);
+
+				const responseText =
+					aiResponse?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+				// Extract JSON from response (handle code fences if present)
+				let jsonText = responseText.trim();
+				const jsonMatch = jsonText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+				if (jsonMatch) {
+					jsonText = jsonMatch[1].trim();
+				}
+
+				// Try to find JSON object boundaries
+				const firstBrace = jsonText.indexOf("{");
+				const lastBrace = jsonText.lastIndexOf("}");
+				if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+					jsonText = jsonText.substring(firstBrace, lastBrace + 1);
+				}
+
+				// Parse and validate JSON
+				const parsed = JSON.parse(jsonText);
+				formData = formOutputSchema.parse(parsed);
+				break;
+			} catch (parseError) {
+				attempts++;
+				const isTimeout = parseError.message.includes("timeout");
+				console.warn(
+					`Attempt ${attempts} failed to parse/validate form data:`,
+					parseError.message
+				);
+				if (attempts >= maxAttempts) {
+					throw new Error(
+						`Failed to generate valid form structure after ${maxAttempts} attempts: ${parseError.message}`
+					);
+				}
+				// If timeout, wait a bit before retrying
+				if (isTimeout) {
+					await new Promise((resolve) => setTimeout(resolve, 2000));
+				}
+			}
+		}
+
+		if (!formData) {
+			throw new Error("Failed to generate form data");
+		}
+
+		return c.json({
+			...formData,
+			source: {
+				url: url,
+				contentLength: markdownContent.length,
+				truncated: markdownContent.length > 50000,
+				scraper: "internal-llm",
+			},
+		});
+	} catch (err) {
+		console.error("/generate-form-from-url-llm error", err);
+		return c.json(
+			{
+				error: "Failed to generate form data from URL",
+				message: err.message || "Unknown error",
+			},
+			500
+		);
+	}
 });
 
 // Google Maps scraping endpoint using headless Chrome
@@ -5954,6 +6716,80 @@ app.get("/scrap-grokipedia", async (c) => {
 
 const port = 3001;
 console.log(`Server is running on port ${port}`);
+
+app.post("/get-roadmap", async (c) => {
+	try {
+		const { roadmapId } = await c.req.json();
+		const roadmap = await firestore
+			.collection("Templates")
+			.doc(roadmapId)
+			.get();
+		const roadmapData = roadmap.data();
+
+		const threadsContent = roadmapData.editorThreads || [];
+
+		// For any thread of type 'page', fetch its child content from
+		// Templates/{roadmapId}/childrens/{childId} and merge into the item
+		const newContent = await Promise.all(
+			threadsContent.map(async (item) => {
+				if (item?.type !== "page" || !item?.data?.childId) {
+					return item;
+				}
+
+				try {
+					const childSnap = await firestore
+						.collection("Templates")
+						.doc(roadmapId)
+						.collection("childrens")
+						.doc(item.data.childId)
+						.get();
+					const childData = childSnap.exists ? childSnap.data() : null;
+
+					const mergedItem = {
+						...item,
+						...childData,
+					};
+
+					const passthroughKeys = [
+						"description",
+						"editorThreads",
+						"lastEditedAt",
+						"name",
+						"thumbnailIconName",
+						"title",
+					];
+
+					if (childData && typeof childData === "object") {
+						for (const key of passthroughKeys) {
+							if (childData[key] !== undefined) {
+								mergedItem[key] = childData[key];
+							}
+						}
+					}
+
+					return mergedItem;
+				} catch (e) {
+					// If fetch fails for a child, keep the original item
+					return item;
+				}
+			})
+		);
+
+		await firestore
+			.collection("Templates")
+			.doc(roadmapId)
+			.update({
+				newContent: JSON.stringify(newContent),
+			});
+
+		return c.json({
+			newContent: newContent,
+		});
+	} catch (error) {
+		console.error(error.message);
+		return c.json({ error: "Failed to get roadmap data" }, 500);
+	}
+});
 
 // Start the server
 serve({
