@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import fs from "fs";
-import { firestore } from "../firebase.js";
+import { firestore } from "../config/firebase.js";
 import { serve } from "@hono/node-server";
 import dotenv from "dotenv";
 
@@ -107,7 +107,7 @@ app.get("/universo", async (c) => {
 
 		// Filter successful results
 		const successfulResults = results.filter(
-			(result) => result.status === "success"
+			(result) => result.status === "success",
 		);
 		const failedResults = results.filter((result) => result.status === "error");
 
@@ -222,17 +222,17 @@ app.get("/universo/batch/:page", async (c) => {
 
 		const results = await Promise.all(fetchPromises);
 		const successfulResults = results.filter(
-			(result) => result.status === "success"
+			(result) => result.status === "success",
 		);
 		const failedResults = results.filter((result) => result.status === "error");
 
 		const uniqueSources = successfulResults
 			.filter(
-				(item) => item.status === "success" && item.latestBlogs.length > 0
+				(item) => item.status === "success" && item.latestBlogs.length > 0,
 			)
 			.filter(
 				(item, index, self) =>
-					index === self.findIndex((t) => t.source === item.source)
+					index === self.findIndex((t) => t.source === item.source),
 			);
 
 		if (uniqueSources.length > 0) {

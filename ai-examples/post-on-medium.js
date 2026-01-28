@@ -1,4 +1,3 @@
-import { firestore } from "../firebase.js";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { Hono } from "hono";

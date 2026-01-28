@@ -1,10 +1,9 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import { firestore, storage } from "./firebase.js";
-import dotenv from "dotenv";
+import { firestore, storage } from "./config/firebase.js";
 import chromium from "@sparticuz/chromium";
-import { createClient } from "@supabase/supabase-js";
+import { supabase } from "./config/supabase.js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
 import UserAgent from "user-agents";
@@ -33,24 +32,16 @@ import("puppeteer-extra-plugin-stealth/evasions/chrome.runtime/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/defaultArgs/index.js"); // pkg warned me this one was missing
 import("puppeteer-extra-plugin-stealth/evasions/iframe.contentWindow/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/media.codecs/index.js");
-import(
-	"puppeteer-extra-plugin-stealth/evasions/navigator.hardwareConcurrency/index.js"
-);
+import("puppeteer-extra-plugin-stealth/evasions/navigator.hardwareConcurrency/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/navigator.languages/index.js");
-import(
-	"puppeteer-extra-plugin-stealth/evasions/navigator.permissions/index.js"
-);
+import("puppeteer-extra-plugin-stealth/evasions/navigator.permissions/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/navigator.plugins/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/navigator.vendor/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/navigator.webdriver/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/sourceurl/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/user-agent-override/index.js");
 import("puppeteer-extra-plugin-stealth/evasions/webgl.vendor/index.js");
-import(
-	"puppeteer-extra-plugin-stealth/evasions/window.outerdimensions/index.js"
-);
-
-dotenv.config();
+import("puppeteer-extra-plugin-stealth/evasions/window.outerdimensions/index.js");
 
 // GitHub Trending Cache
 const trendingCache = new NodeCache({ stdTTL: 60 * 5, checkperiod: 120 }); // default 5 min cache
@@ -394,10 +385,10 @@ class PerformanceMonitor {
 			operations: {
 				total: this.metrics.size,
 				completed: Array.from(this.metrics.values()).filter(
-					(m) => m.status === "completed"
+					(m) => m.status === "completed",
 				).length,
 				running: Array.from(this.metrics.values()).filter(
-					(m) => m.status === "running"
+					(m) => m.status === "running",
 				).length,
 			},
 		};
@@ -406,7 +397,7 @@ class PerformanceMonitor {
 	// Get performance summary for a specific operation type
 	getOperationSummary(operationName) {
 		const operations = Array.from(this.metrics.values()).filter(
-			(m) => m.name === operationName && m.status === "completed"
+			(m) => m.name === operationName && m.status === "completed",
 		);
 
 		if (operations.length === 0) return null;
@@ -521,16 +512,16 @@ const performanceMiddleware = async (c, next) => {
 		if (metrics) {
 			console.log(
 				`📊 Performance: ${operationName} completed in ${metrics.duration.toFixed(
-					2
-				)}ms`
+					2,
+				)}ms`,
 			);
 			console.log(
-				`   💻 CPU: ${(metrics.cpuUsage.total / 1000000).toFixed(2)}s`
+				`   💻 CPU: ${(metrics.cpuUsage.total / 1000000).toFixed(2)}s`,
 			);
 			console.log(
 				`   🧠 Memory: ${(metrics.memoryUsage.heapUsed / 1024 / 1024).toFixed(
-					2
-				)} MB`
+					2,
+				)} MB`,
 			);
 		}
 	}
@@ -689,7 +680,7 @@ class ProxyManager {
 
 		// Find healthy proxies that haven't been used recently
 		const availableProxies = this.proxies.filter(
-			(proxy) => proxy.isHealthy && now - proxy.lastUsed > cooldownPeriod
+			(proxy) => proxy.isHealthy && now - proxy.lastUsed > cooldownPeriod,
 		);
 
 		if (availableProxies.length === 0) {
@@ -732,7 +723,7 @@ class ProxyManager {
 			if (proxy.failCount >= 3) {
 				proxy.isHealthy = false;
 				console.warn(
-					`⚠️ Proxy ${proxyHost} marked as unhealthy after ${proxy.failCount} failures`
+					`⚠️ Proxy ${proxyHost} marked as unhealthy after ${proxy.failCount} failures`,
 				);
 			}
 		}
@@ -826,18 +817,21 @@ class ProxyManager {
 
 	// Start periodic health checks
 	startHealthCheck() {
-		this.healthCheckInterval = setInterval(async () => {
-			console.log("🔍 Running proxy health check...");
-			const healthChecks = this.proxies.map((proxy) =>
-				this.checkProxyHealth(proxy)
-			);
-			await Promise.allSettled(healthChecks);
+		this.healthCheckInterval = setInterval(
+			async () => {
+				console.log("🔍 Running proxy health check...");
+				const healthChecks = this.proxies.map((proxy) =>
+					this.checkProxyHealth(proxy),
+				);
+				await Promise.allSettled(healthChecks);
 
-			const healthyCount = this.proxies.filter((p) => p.isHealthy).length;
-			console.log(
-				`✅ Proxy health check complete: ${healthyCount}/${this.proxies.length} proxies healthy`
-			);
-		}, 5 * 60 * 1000); // Check every 5 minutes
+				const healthyCount = this.proxies.filter((p) => p.isHealthy).length;
+				console.log(
+					`✅ Proxy health check complete: ${healthyCount}/${this.proxies.length} proxies healthy`,
+				);
+			},
+			5 * 60 * 1000,
+		); // Check every 5 minutes
 	}
 
 	// Stop health checks
@@ -877,11 +871,6 @@ const proxyManager = new ProxyManager();
 const genai = new GoogleGenAI({
 	apiKey: process.env.GOOGLE_GENAI_API_KEY,
 });
-
-const supabase = createClient(
-	process.env.SUPABASE_URL,
-	process.env.SUPABASE_KEY
-);
 
 const app = new Hono();
 export const customLogger = (message, ...rest) => {
@@ -951,7 +940,7 @@ app.use(
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 		allowHeaders: ["Content-Type", "Authorization"],
 		credentials: true,
-	})
+	}),
 );
 
 // Apply performance monitoring middleware
@@ -995,7 +984,7 @@ app.get("/github-trending", async (c) => {
 				},
 				data: results,
 			},
-			200
+			200,
 		);
 	} catch (err) {
 		console.error(err);
@@ -1048,7 +1037,7 @@ app.post("/post-to-devto", async (c) => {
 					success: false,
 					error: "Post content is required (content or htmlContent field)",
 				},
-				400
+				400,
 			);
 		}
 
@@ -1103,7 +1092,7 @@ app.post("/post-to-devto", async (c) => {
 
 		// Add footer with original publication link
 		const footerText = `\n\n---\n\n*Originally published on [iHateReading](https://ihatereading.in/t/${encodeURIComponent(
-			title.replace(/\s+/g, "-")
+			title.replace(/\s+/g, "-"),
 		)})*`;
 		bodyContent += footerText;
 
@@ -1137,7 +1126,7 @@ app.post("/post-to-devto", async (c) => {
 			console.error("Response status:", devtoResponse.status);
 			console.error(
 				"Response headers:",
-				Object.fromEntries(devtoResponse.headers.entries())
+				Object.fromEntries(devtoResponse.headers.entries()),
 			);
 
 			// Try to parse error for better error messages
@@ -1200,7 +1189,7 @@ app.post("/scrap-airbnb", async (c) => {
 	// Generate Airbnb search URL
 	const searchQuery = `${city.replaceAll(" ", "-")}--${state.replaceAll(
 		" ",
-		"-"
+		"-",
 	)}`;
 	const airbnbUrl = `https://www.airbnb.com/s/${searchQuery}--${country}/homes`;
 
@@ -1385,7 +1374,7 @@ const formFieldSchema = z.object({
 		.string()
 		.optional()
 		.describe(
-			"Custom label for 'Yes' option in yes-no fields (default: 'Yes')"
+			"Custom label for 'Yes' option in yes-no fields (default: 'Yes')",
 		),
 	noLabel: z
 		.string()
@@ -1640,7 +1629,7 @@ app.post("/generate-form-from-url", async (c) => {
 					error: "Failed to scrape URL",
 					details: scrapeResult.error,
 				},
-				400
+				400,
 			);
 		}
 
@@ -1650,7 +1639,7 @@ app.post("/generate-form-from-url", async (c) => {
 		const truncatedMarkdown =
 			markdownContent.length > 50000
 				? markdownContent.substring(0, 50000) +
-				  "\n\n[Content truncated due to length...]"
+					"\n\n[Content truncated due to length...]"
 				: markdownContent;
 
 		// System prompt for generating form from website content
@@ -1801,11 +1790,11 @@ Return ONLY the JSON object matching the schema above, with no additional text o
 				const isTimeout = parseError.message.includes("timeout");
 				console.warn(
 					`Attempt ${attempts} failed to parse/validate form data:`,
-					parseError.message
+					parseError.message,
 				);
 				if (attempts >= maxAttempts) {
 					throw new Error(
-						`Failed to generate valid form structure after ${maxAttempts} attempts: ${parseError.message}`
+						`Failed to generate valid form structure after ${maxAttempts} attempts: ${parseError.message}`,
 					);
 				}
 				// If timeout, wait a bit before retrying
@@ -1834,7 +1823,7 @@ Return ONLY the JSON object matching the schema above, with no additional text o
 				error: "Failed to generate form data from URL",
 				message: err.message || "Unknown error",
 			},
-			500
+			500,
 		);
 	}
 });
@@ -1869,7 +1858,7 @@ app.post("/generate-form-from-url-llm", async (c) => {
 					error: "Failed to scrape URL",
 					details: scrapeResult.error,
 				},
-				400
+				400,
 			);
 		}
 
@@ -1879,7 +1868,7 @@ app.post("/generate-form-from-url-llm", async (c) => {
 		const truncatedMarkdown =
 			markdownContent.length > 50000
 				? markdownContent.substring(0, 50000) +
-				  "\n\n[Content truncated due to length...]"
+					"\n\n[Content truncated due to length...]"
 				: markdownContent;
 
 		// System prompt for generating form from website content
@@ -2030,11 +2019,11 @@ Return ONLY the JSON object matching the schema above, with no additional text o
 				const isTimeout = parseError.message.includes("timeout");
 				console.warn(
 					`Attempt ${attempts} failed to parse/validate form data:`,
-					parseError.message
+					parseError.message,
 				);
 				if (attempts >= maxAttempts) {
 					throw new Error(
-						`Failed to generate valid form structure after ${maxAttempts} attempts: ${parseError.message}`
+						`Failed to generate valid form structure after ${maxAttempts} attempts: ${parseError.message}`,
 					);
 				}
 				// If timeout, wait a bit before retrying
@@ -2064,7 +2053,7 @@ Return ONLY the JSON object matching the schema above, with no additional text o
 				error: "Failed to generate form data from URL",
 				message: err.message || "Unknown error",
 			},
-			500
+			500,
 		);
 	}
 });
@@ -2080,7 +2069,7 @@ app.post("/scrap-google-maps", async (c) => {
 					success: false,
 					error: "Either 'queries' array or 'singleQuery' string is required",
 				},
-				400
+				400,
 			);
 		}
 
@@ -2095,7 +2084,7 @@ app.post("/scrap-google-maps", async (c) => {
 					success: false,
 					error: "At least one valid query is needed",
 				},
-				400
+				400,
 			);
 		}
 
@@ -2140,7 +2129,7 @@ app.post("/scrap-google-maps", async (c) => {
 							{
 								waitUntil: "networkidle",
 								timeout: 30000,
-							}
+							},
 						);
 
 						// Wait a bit for the location to be fully loaded
@@ -2149,16 +2138,16 @@ app.post("/scrap-google-maps", async (c) => {
 						const locationResults = await page.evaluate(() => {
 							// Select the results container with role feed and aria-label with Results for ...
 							const resultsContainer = Array.from(
-								document.querySelectorAll('div[role="feed"]')
+								document.querySelectorAll('div[role="feed"]'),
 							).find((el) =>
-								el.getAttribute("aria-label")?.includes("Results for")
+								el.getAttribute("aria-label")?.includes("Results for"),
 							);
 
 							if (!resultsContainer) return [];
 
 							// Each child div under feed represents a location card
 							const cards = Array.from(
-								resultsContainer.querySelectorAll("div")
+								resultsContainer.querySelectorAll("div"),
 							).slice(0, 10);
 
 							return cards.map((card) => {
@@ -2189,7 +2178,7 @@ app.post("/scrap-google-maps", async (c) => {
 								// Google Maps URL link
 								const url =
 									card.querySelector(
-										'a[href*="https://lh3.googleusercontent.com/gps-cs-s"]'
+										'a[href*="https://lh3.googleusercontent.com/gps-cs-s"]',
 									)?.href || "";
 
 								// Image URL (if exists)
@@ -2217,7 +2206,7 @@ app.post("/scrap-google-maps", async (c) => {
 					} finally {
 						await page.close();
 					}
-				})
+				}),
 			);
 
 			// Close the shared context after all queries are complete
@@ -2233,7 +2222,7 @@ app.post("/scrap-google-maps", async (c) => {
 							error: "Location not found or coordinates not available",
 							data: result,
 						},
-						404
+						404,
 					);
 				}
 				return c.json({
@@ -2264,7 +2253,7 @@ app.post("/scrap-google-maps", async (c) => {
 				error: "Failed to fetch location data",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -2295,7 +2284,7 @@ app.post("/bing-search", async (c) => {
 		];
 		const selectedProxy = proxyManager.getNextProxy();
 		launchArgs.push(
-			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
 		);
 
 		const executablePath = await chromium.executablePath();
@@ -2308,7 +2297,7 @@ app.post("/bing-search", async (c) => {
 		await page.setUserAgent(
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
 				"AppleWebKit/537.36 (KHTML, like Gecko) " +
-				"Chrome/123.0.0.0 Safari/537.36"
+				"Chrome/123.0.0.0 Safari/537.36",
 		);
 
 		await page.setExtraHTTPHeaders({
@@ -2325,12 +2314,12 @@ app.post("/bing-search", async (c) => {
 
 		await page.goto(
 			`https://www.bing.com/search?q=${encodeURIComponent(
-				query
+				query,
 			)}&setLang=${language}&count=${num}&pws=0`,
 			{
 				waitUntil: "domcontentloaded",
 				timeout: timeout,
-			}
+			},
 		);
 		const response = await page.evaluate(() => {
 			return {
@@ -2359,7 +2348,7 @@ app.post("/bing-search", async (c) => {
 		});
 		const document = dom.window.document;
 		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
-			document.body
+			document.body,
 		);
 
 		return c.json({
@@ -2377,7 +2366,7 @@ app.post("/bing-search", async (c) => {
 				query,
 				engine: "bing",
 			},
-			500
+			500,
 		);
 	}
 });
@@ -2398,7 +2387,7 @@ app.post("/scrap-images", async (c) => {
 				error: `Platform is required. Choose from: 'google', 'unsplash', 'getty', 'istock', 'shutterstock', 'adobe', 'pexels', 'pixabay', 'freepik', 'pinterest', 'flickr', 'fivehundredpx', 'deviantart', 'behance', 'artstation', 'reuters', 'apimages', 'custom'. 
 					Or use allowAllPlatforms as true boolean value`,
 			},
-			400
+			400,
 		);
 	}
 
@@ -2406,7 +2395,7 @@ app.post("/scrap-images", async (c) => {
 	const platforms = {
 		google: {
 			url: `https://www.google.com/search?q=${encodeURIComponent(
-				query
+				query,
 			)}&tbm=isch`,
 			name: "Google Images",
 		},
@@ -2440,13 +2429,13 @@ app.post("/scrap-images", async (c) => {
 		},
 		freepik: {
 			url: `https://www.freepik.com/search?format=search&query=${encodeURIComponent(
-				query
+				query,
 			)}`,
 			name: "Freepik",
 		},
 		pinterest: {
 			url: `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(
-				query
+				query,
 			)}`,
 			name: "Pinterest",
 		},
@@ -2464,7 +2453,7 @@ app.post("/scrap-images", async (c) => {
 		},
 		behance: {
 			url: `https://www.behance.net/search/projects?search=${encodeURIComponent(
-				query
+				query,
 			)}`,
 			name: "Behance",
 		},
@@ -2563,7 +2552,7 @@ app.post("/scrap-images", async (c) => {
 			// Calculate total statistics
 			const totalImages = results.reduce(
 				(sum, result) => sum + result.imageCount,
-				0
+				0,
 			);
 			const successfulPlatforms = results.filter((r) => r.success).length;
 			const failedPlatforms = results.filter((r) => !r.success).length;
@@ -2588,7 +2577,7 @@ app.post("/scrap-images", async (c) => {
 					details: error.message,
 					query: query,
 				},
-				500
+				500,
 			);
 		}
 	}
@@ -2599,10 +2588,10 @@ app.post("/scrap-images", async (c) => {
 			{
 				success: false,
 				error: `Unsupported platform. Supported platforms: ${Object.keys(
-					platforms
+					platforms,
 				).join(", ")}`,
 			},
-			400
+			400,
 		);
 	}
 
@@ -2621,7 +2610,7 @@ app.post("/scrap-images", async (c) => {
 					success: false,
 					error: "For custom platform, query must be a valid URL",
 				},
-				400
+				400,
 			);
 		}
 	} else {
@@ -2670,7 +2659,7 @@ app.post("/scrap-images", async (c) => {
 				query: query,
 				url: targetUrl,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -2697,7 +2686,7 @@ app.post("/ddg-search", async (c) => {
 				...(selectedProxy
 					? [
 							`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-					  ]
+						]
 					: []),
 			});
 		} catch (chromiumError) {
@@ -2715,7 +2704,7 @@ app.post("/ddg-search", async (c) => {
 					...(selectedProxy
 						? [
 								`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-						  ]
+							]
 						: []),
 				],
 			});
@@ -2725,7 +2714,7 @@ app.post("/ddg-search", async (c) => {
 
 		// Fake a real browser
 		await page.setUserAgent(
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
 		);
 		// Authenticate proxy if credentials exist
 		if (selectedProxy.username && selectedProxy.password) {
@@ -2824,7 +2813,7 @@ app.post("/google-search", async (c) => {
 		];
 		const selectedProxy = proxyManager.getNextProxy();
 		launchArgs.push(
-			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
 		);
 		const browser = await puppeteer.launch({
 			executablePath:
@@ -2838,7 +2827,7 @@ app.post("/google-search", async (c) => {
 		await page.setUserAgent(
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
 				"AppleWebKit/537.36 (KHTML, like Gecko) " +
-				"Chrome/123.0.0.0 Safari/537.36"
+				"Chrome/123.0.0.0 Safari/537.36",
 		);
 
 		await page.setExtraHTTPHeaders({
@@ -2855,12 +2844,12 @@ app.post("/google-search", async (c) => {
 
 		await page.goto(
 			`https://www.google.com/search?q=${encodeURIComponent(
-				query
+				query,
 			)}&hl=${language}&gl=${country}&num=${num}&pws=0`,
 			{
 				waitUntil: "domcontentloaded",
 				timeout: timeout,
-			}
+			},
 		);
 		const response = await page.evaluate(() => {
 			return {
@@ -2878,7 +2867,7 @@ app.post("/google-search", async (c) => {
 		});
 		const document = dom.window.document;
 		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
-			document.body
+			document.body,
 		);
 
 		return c.json({
@@ -3032,7 +3021,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 					success: false,
 					error: "Internal server error",
 				},
-				500
+				500,
 			);
 		}
 	}
@@ -3070,7 +3059,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				if (useProxy) {
 					selectedProxy = proxyManager.getNextProxy();
 					launchArgs.push(
-						`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`
+						`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
 					);
 				}
 
@@ -3097,7 +3086,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 							...(useProxy && selectedProxy
 								? [
 										`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-								  ]
+									]
 								: []),
 						],
 					});
@@ -3195,7 +3184,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 						".avif",
 					];
 					const hasImageExtension = imageExtensions.some((ext) =>
-						url.includes(ext)
+						url.includes(ext),
 					);
 					if (hasImageExtension) {
 						blockedResources.images++;
@@ -3214,7 +3203,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 						"assets",
 					];
 					const hasImageService = imageServices.some((service) =>
-						url.includes(service)
+						url.includes(service),
 					);
 					if (
 						hasImageService &&
@@ -3301,7 +3290,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 						await page.waitForSelector(waitForSelector, { timeout: 10000 });
 					} catch (error) {
 						console.warn(
-							`Selector ${waitForSelector} not found within timeout`
+							`Selector ${waitForSelector} not found within timeout`,
 						);
 					}
 				}
@@ -3374,7 +3363,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 							[("h1", "h2", "h3", "h4", "h5", "h6")].forEach((tag) => {
 								data.content[tag] = Array.from(
-									document.querySelectorAll(tag)
+									document.querySelectorAll(tag),
 								).map((h) => h.textContent.trim());
 							});
 
@@ -3393,7 +3382,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 								// Open Graph tags
 								const ogTags = document.querySelectorAll(
-									'meta[property^="og:"]'
+									'meta[property^="og:"]',
 								);
 								ogTags.forEach((meta) => {
 									const property = meta.getAttribute("property");
@@ -3405,7 +3394,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 
 								// Twitter Card tags
 								const twitterTags = document.querySelectorAll(
-									'meta[name^="twitter:"]'
+									'meta[name^="twitter:"]',
 								);
 								twitterTags.forEach((meta) => {
 									const name = meta.getAttribute("name");
@@ -3460,7 +3449,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 								// Extract semantic content with optimized methods - prioritizing important content
 								const extractSemanticContent = (
 									selector,
-									processor = (el) => el.textContent.trim()
+									processor = (el) => el.textContent.trim(),
 								) => {
 									const elements = document.querySelectorAll(selector);
 									return elements.length > 0
@@ -3473,7 +3462,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 									return rows
 										.map((row) => {
 											const cells = Array.from(
-												row.querySelectorAll("td, th")
+												row.querySelectorAll("td, th"),
 											).map((cell) => cell.textContent.trim());
 											return cells.filter((cell) => cell.length > 0);
 										})
@@ -3502,11 +3491,11 @@ app.post("/scrap-url-puppeteer", async (c) => {
 									tables: extractSemanticContent("table", extractTableContent),
 									unorderedLists: extractSemanticContent(
 										"ul",
-										extractListContent
+										extractListContent,
 									),
 									orderedLists: extractSemanticContent(
 										"ol",
-										extractListContent
+										extractListContent,
 									),
 								};
 
@@ -3536,7 +3525,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 									Object.entries(rawSemanticContent).map(([key, value]) => [
 										key,
 										removeDuplicates(value),
-									])
+									]),
 								);
 							}
 
@@ -3569,7 +3558,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 							) {
 								data.customSelectors = {};
 								for (const [key, selector] of Object.entries(
-									options.selectors
+									options.selectors,
 								)) {
 									try {
 										const elements = document.querySelectorAll(selector);
@@ -3578,7 +3567,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 												elements[0].textContent.trim();
 										} else if (elements.length > 1) {
 											data.customSelectors[key] = Array.from(elements).map(
-												(el) => el.textContent.trim()
+												(el) => el.textContent.trim(),
 											);
 										}
 									} catch (error) {
@@ -3595,7 +3584,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 							includeLinks,
 							includeSemanticContent,
 							selectors,
-						}
+						},
 					);
 				}
 
@@ -3657,7 +3646,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				});
 
 				const { markdown } = extractSemanticContentWithFormattedMarkdown(
-					document.body
+					document.body,
 				);
 
 				// Optional screenshot capture and upload
@@ -3667,11 +3656,11 @@ app.post("/scrap-url-puppeteer", async (c) => {
 						const screenshotBuffer = await page.screenshot({ fullPage: true });
 						const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(
 							/[^a-zA-Z0-9]/g,
-							""
+							"",
 						)}.png`;
 						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
 						const file = bucket.file(
-							`ihr-website-screenshot/${uniqueFileName}`
+							`ihr-website-screenshot/${uniqueFileName}`,
 						);
 						await file.save(screenshotBuffer, {
 							metadata: {
@@ -3737,7 +3726,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 							separators: "\n\n",
 							chunkSize: 1024,
 							chunkOverlap: 128,
-						}
+						},
 					);
 					const chunkInput = await splitter.splitText(markdown);
 					const slicedChunkInput = chunkInput.slice(0, MAX_TOKENS_LIMIT);
@@ -3797,7 +3786,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 				details: "Unable to scrap, check URL",
 				url: url,
 			},
-			500
+			500,
 		);
 	} finally {
 		if (browser) {
@@ -3824,7 +3813,7 @@ app.post("/take-screenshot", async (c) => {
 					success: false,
 					error: "URL is required",
 				},
-				400
+				400,
 			);
 		}
 
@@ -3837,7 +3826,7 @@ app.post("/take-screenshot", async (c) => {
 					success: false,
 					error: "Invalid URL format",
 				},
-				400
+				400,
 			);
 		}
 
@@ -4031,7 +4020,7 @@ app.post("/take-screenshot", async (c) => {
 			});
 
 			const { markdown } = extractSemanticContentWithFormattedMarkdown(
-				document.body
+				document.body,
 			);
 
 			// Extract page content
@@ -4080,7 +4069,7 @@ app.post("/take-screenshot", async (c) => {
 			// Generate a unique filename for Supabase storage
 			const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(
 				/[^a-zA-Z0-9]/g,
-				""
+				"",
 			)}.png`;
 
 			// Upload to Firebase storage
@@ -4110,7 +4099,7 @@ app.post("/take-screenshot", async (c) => {
 						screenshot: screenshotUrl,
 						timestamp: new Date().toISOString(),
 					},
-					200
+					200,
 				);
 			} catch (firebaseError) {
 				console.error("❌ Error uploading to Firebase storage:", firebaseError);
@@ -4121,7 +4110,7 @@ app.post("/take-screenshot", async (c) => {
 						error: "Failed to upload screenshot to Firebase storage",
 						details: firebaseError.message,
 					},
-					500
+					500,
 				);
 			}
 		} catch (captureError) {
@@ -4133,7 +4122,7 @@ app.post("/take-screenshot", async (c) => {
 					error: "Failed to capture screenshot",
 					details: captureError.message,
 				},
-				500
+				500,
 			);
 		}
 	} catch (error) {
@@ -4144,7 +4133,7 @@ app.post("/take-screenshot", async (c) => {
 				error: "Internal server error",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -4159,7 +4148,7 @@ app.post("/take-metadata", async (c) => {
 					success: false,
 					error: "URL is required",
 				},
-				400
+				400,
 			);
 		}
 
@@ -4172,7 +4161,7 @@ app.post("/take-metadata", async (c) => {
 					success: false,
 					error: "Invalid URL format",
 				},
-				400
+				400,
 			);
 		}
 
@@ -4364,7 +4353,7 @@ app.post("/take-metadata", async (c) => {
 							status: 404,
 							timestamp: new Date().toISOString(),
 						},
-						200
+						200,
 					);
 				}
 
@@ -4378,7 +4367,7 @@ app.post("/take-metadata", async (c) => {
 							status: status,
 							timestamp: new Date().toISOString(),
 						},
-						200
+						200,
 					);
 				}
 
@@ -4392,7 +4381,7 @@ app.post("/take-metadata", async (c) => {
 							status: status,
 							timestamp: new Date().toISOString(),
 						},
-						200
+						200,
 					);
 				}
 			}
@@ -4411,7 +4400,7 @@ app.post("/take-metadata", async (c) => {
 						error: fetchError.code,
 						timestamp: new Date().toISOString(),
 					},
-					200
+					200,
 				);
 			}
 
@@ -4424,7 +4413,7 @@ app.post("/take-metadata", async (c) => {
 						message: "Request timeout - the server took too long to respond",
 						timestamp: new Date().toISOString(),
 					},
-					200
+					200,
 				);
 			}
 
@@ -4437,7 +4426,7 @@ app.post("/take-metadata", async (c) => {
 					error: fetchError.message,
 					timestamp: new Date().toISOString(),
 				},
-				200
+				200,
 			);
 		}
 	} catch (error) {
@@ -4448,7 +4437,7 @@ app.post("/take-metadata", async (c) => {
 				error: "Internal server error",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -4468,7 +4457,7 @@ app.post("/crawl-take-screenshots", async (c) => {
 					success: false,
 					error: "URL is required",
 				},
-				400
+				400,
 			);
 		}
 
@@ -4482,7 +4471,7 @@ app.post("/crawl-take-screenshots", async (c) => {
 					success: false,
 					error: "Invalid URL format",
 				},
-				400
+				400,
 			);
 		}
 
@@ -4565,7 +4554,7 @@ app.post("/crawl-take-screenshots", async (c) => {
 							await page.waitForSelector(waitForSelector, { timeout: 10000 });
 						} catch (error) {
 							console.warn(
-								`Selector ${waitForSelector} not found within timeout`
+								`Selector ${waitForSelector} not found within timeout`,
 							);
 						}
 					}
@@ -4649,7 +4638,7 @@ app.post("/crawl-take-screenshots", async (c) => {
 								// Skip URLs with excluded extensions
 								const pathname = url.pathname.toLowerCase();
 								const hasExcludedExtension = excludedExtensions.some((ext) =>
-									pathname.endsWith(ext)
+									pathname.endsWith(ext),
 								);
 								if (hasExcludedExtension) return;
 
@@ -4720,7 +4709,7 @@ app.post("/crawl-take-screenshots", async (c) => {
 							error: error.message,
 						};
 					}
-				}
+				},
 			);
 
 			// Wait for all screenshots to complete
@@ -4748,7 +4737,7 @@ app.post("/crawl-take-screenshots", async (c) => {
 					error: "Failed to crawl and take screenshots",
 					details: captureError.message,
 				},
-				500
+				500,
 			);
 		}
 	} catch (error) {
@@ -4759,7 +4748,7 @@ app.post("/crawl-take-screenshots", async (c) => {
 				error: "Internal server error",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -4780,7 +4769,7 @@ app.post("/crawl-url", async (c) => {
 					success: false,
 					error: "URL is required",
 				},
-				400
+				400,
 			);
 		}
 
@@ -4794,7 +4783,7 @@ app.post("/crawl-url", async (c) => {
 					success: false,
 					error: "Invalid URL format",
 				},
-				400
+				400,
 			);
 		}
 
@@ -4877,7 +4866,7 @@ app.post("/crawl-url", async (c) => {
 							await page.waitForSelector(waitForSelector, { timeout: 10000 });
 						} catch (error) {
 							console.warn(
-								`Selector ${waitForSelector} not found within timeout`
+								`Selector ${waitForSelector} not found within timeout`,
 							);
 						}
 					}
@@ -5020,7 +5009,7 @@ app.post("/crawl-url", async (c) => {
 					error: "Failed to crawl and take screenshots",
 					details: captureError.message,
 				},
-				500
+				500,
 			);
 		}
 	} catch (error) {
@@ -5031,7 +5020,7 @@ app.post("/crawl-url", async (c) => {
 				error: "Internal server error",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -5083,7 +5072,7 @@ const parseRedditData = (data, url) => {
 			markdown += `**Author:** u/${postData.author}\n`;
 			markdown += `**Subreddit:** r/${postData.subreddit}\n`;
 			markdown += `**Score:** ${postData.score} (${Math.round(
-				postData.upvoteRatio * 100
+				postData.upvoteRatio * 100,
 			)}% upvoted)\n`;
 			markdown += `**Comments:** ${postData.numComments}\n`;
 			markdown += `**Posted:** ${postData.created}\n`;
@@ -5132,18 +5121,18 @@ const parseRedditData = (data, url) => {
 	markdown += `- **Subreddit:** r/${posts[0]?.subreddit || "Unknown"}\n`;
 	markdown += `- **Total Score:** ${posts.reduce(
 		(sum, post) => sum + post.score,
-		0
+		0,
 	)}\n`;
 	markdown += `- **Total Comments:** ${posts.reduce(
 		(sum, post) => sum + post.numComments,
-		0
+		0,
 	)}\n`;
 	markdown += `- **Average Score:** ${Math.round(
-		posts.reduce((sum, post) => sum + post.score, 0) / posts.length
+		posts.reduce((sum, post) => sum + post.score, 0) / posts.length,
 	)}\n`;
 	markdown += `- **Average Upvote Ratio:** ${Math.round(
 		(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) / posts.length) *
-			100
+			100,
 	)}%\n`;
 
 	return { markdown, posts };
@@ -5466,7 +5455,7 @@ app.post("/scrap-reddit", async (c) => {
 							url: url,
 							status: "blocked",
 						},
-						503
+						503,
 					);
 				}
 			}
@@ -5478,7 +5467,7 @@ app.post("/scrap-reddit", async (c) => {
 					details: fetchError.message,
 					url: url,
 				},
-				500
+				500,
 			);
 		}
 	} catch (error) {
@@ -5489,7 +5478,7 @@ app.post("/scrap-reddit", async (c) => {
 				error: "Internal server error",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -5503,7 +5492,7 @@ app.post("/scrap-git", async (c) => {
 				success: false,
 				error: "URL is required and must be a github URL",
 			},
-			400
+			400,
 		);
 	}
 	try {
@@ -5522,7 +5511,7 @@ app.post("/scrap-git", async (c) => {
 		const dom = new JSDOM(article.html());
 		const content = dom.window.document;
 		const { markdown } = extractSemanticContentWithFormattedMarkdown(
-			content.body
+			content.body,
 		);
 		return c.json({
 			success: true,
@@ -5541,7 +5530,7 @@ app.post("/scrap-git", async (c) => {
 				success: false,
 				error: "Internal server error",
 			},
-			500
+			500,
 		);
 	}
 });
@@ -5583,7 +5572,7 @@ app.post("/image-to-code", async (c) => {
 					detail:
 						"When Content-Type is multipart/form-data, the body must include correct CRLF and boundary formatting.",
 				},
-				400
+				400,
 			);
 		}
 	} else if (contentType.includes("application/x-www-form-urlencoded")) {
@@ -5594,7 +5583,7 @@ app.post("/image-to-code", async (c) => {
 	} else {
 		return c.json(
 			{ error: "Unsupported Content-Type. Use JSON or multipart/form-data." },
-			415
+			415,
 		);
 	}
 
@@ -5607,7 +5596,7 @@ app.post("/image-to-code", async (c) => {
 		if (!imageUrl) {
 			return c.json(
 				{ error: "Provide either an image file (field: image) or imageUrl" },
-				400
+				400,
 			);
 		}
 		const res = await fetch(imageUrl);
@@ -5840,13 +5829,13 @@ app.post("/generate-repo-docs", async (c) => {
 	if (!input) {
 		return c.json(
 			{ success: false, error: "Provide 'repo' (owner/name) or 'url'" },
-			400
+			400,
 		);
 	}
 	if (!process.env.GITHUB_TOKEN) {
 		return c.json(
 			{ success: false, error: "GITHUB_TOKEN not configured" },
-			500
+			500,
 		);
 	}
 
@@ -5854,7 +5843,7 @@ app.post("/generate-repo-docs", async (c) => {
 	if (!parsed) {
 		return c.json(
 			{ success: false, error: "Invalid GitHub repo identifier" },
-			400
+			400,
 		);
 	}
 
@@ -5871,7 +5860,7 @@ app.post("/generate-repo-docs", async (c) => {
 			`https://api.github.com/repos/${owner}/${repoName}`,
 			{
 				headers: ghHeaders,
-			}
+			},
 		);
 		if (!repoRes.ok) {
 			const details = await repoRes.text();
@@ -5882,7 +5871,7 @@ app.post("/generate-repo-docs", async (c) => {
 					status: repoRes.status,
 					details,
 				},
-				repoRes.status
+				repoRes.status,
 			);
 		}
 		const repoJson = await repoRes.json();
@@ -5892,7 +5881,7 @@ app.post("/generate-repo-docs", async (c) => {
 			`https://api.github.com/repos/${owner}/${repoName}/languages`,
 			{
 				headers: ghHeaders,
-			}
+			},
 		);
 		const languages = langRes.ok ? await langRes.json() : {};
 
@@ -5901,16 +5890,16 @@ app.post("/generate-repo-docs", async (c) => {
 			`https://api.github.com/repos/${owner}/${repoName}/readme`,
 			{
 				headers: { ...ghHeaders, Accept: "application/vnd.github.raw" },
-			}
+			},
 		);
 		const readme = readmeRes.ok ? await readmeRes.text() : "";
 
 		// Top-level files/directories
 		const contentsRes = await fetch(
 			`https://api.github.com/repos/${owner}/${repoName}/contents?ref=${encodeURIComponent(
-				repoJson.default_branch || "main"
+				repoJson.default_branch || "main",
 			)}`,
-			{ headers: ghHeaders }
+			{ headers: ghHeaders },
 		);
 		const contents = contentsRes.ok ? await contentsRes.json() : [];
 		const keyFiles = Array.isArray(contents)
@@ -5919,7 +5908,7 @@ app.post("/generate-repo-docs", async (c) => {
 					path: e.path,
 					type: e.type,
 					size: e.size,
-			  }))
+				}))
 			: [];
 
 		const repoBundle = {
@@ -5990,7 +5979,7 @@ Return ONLY the JSON object above.`;
 		const userPrompt = `Repository data:\n${JSON.stringify(
 			repoBundle,
 			null,
-			2
+			2,
 		)}\n\nReturn only the JSON.`;
 
 		const aiResponse = await genai.models.generateContent({
@@ -6023,7 +6012,7 @@ Return ONLY the JSON object above.`;
 				error: "Failed to generate repository docs",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -6042,13 +6031,13 @@ app.post("/generate-repo-changelog", async (c) => {
 	if (!input) {
 		return c.json(
 			{ success: false, error: "Provide 'repo' (owner/name) or 'url'" },
-			400
+			400,
 		);
 	}
 	if (!process.env.GITHUB_TOKEN) {
 		return c.json(
 			{ success: false, error: "GITHUB_TOKEN not configured" },
-			500
+			500,
 		);
 	}
 
@@ -6056,7 +6045,7 @@ app.post("/generate-repo-changelog", async (c) => {
 	if (!parsed) {
 		return c.json(
 			{ success: false, error: "Invalid GitHub repo identifier" },
-			400
+			400,
 		);
 	}
 
@@ -6077,7 +6066,7 @@ app.post("/generate-repo-changelog", async (c) => {
 		// Resolve default branch and repo info
 		const repoRes = await fetch(
 			`https://api.github.com/repos/${owner}/${repoName}`,
-			{ headers: ghHeaders }
+			{ headers: ghHeaders },
 		);
 		if (!repoRes.ok) {
 			const details = await repoRes.text();
@@ -6088,7 +6077,7 @@ app.post("/generate-repo-changelog", async (c) => {
 					status: repoRes.status,
 					details,
 				},
-				repoRes.status
+				repoRes.status,
 			);
 		}
 		const repoJson = await repoRes.json();
@@ -6137,7 +6126,7 @@ app.post("/generate-repo-changelog", async (c) => {
 				return true;
 			};
 			const issuePRs = (issues || []).filter(
-				(i) => i.pull_request && isWithin(i.closed_at || i.updated_at)
+				(i) => i.pull_request && isWithin(i.closed_at || i.updated_at),
 			);
 
 			// Hydrate PR details for those issues
@@ -6146,7 +6135,7 @@ app.post("/generate-repo-changelog", async (c) => {
 				const prNumber = item.number;
 				const prRes = await fetch(
 					`https://api.github.com/repos/${owner}/${repoName}/pulls/${prNumber}`,
-					{ headers: ghHeaders }
+					{ headers: ghHeaders },
 				);
 				if (!prRes.ok) continue;
 				const pr = await prRes.json();
@@ -6213,7 +6202,7 @@ Rules:
 		} to=${until || "unknown"}\n\nData:\n${JSON.stringify(
 			changelogBundle,
 			null,
-			2
+			2,
 		)}\n\nReturn only the JSON.`;
 
 		const aiResponse = await genai.models.generateContent({
@@ -6236,7 +6225,7 @@ Rules:
 					...(changelogBundle.pull_requests || [])
 						.map((p) => p.user)
 						.filter(Boolean),
-				])
+				]),
 			);
 			changelogJson = {
 				title: `Changelog for ${owner}/${repoName}`,
@@ -6274,7 +6263,7 @@ Rules:
 				error: "Failed to generate changelog",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -6341,7 +6330,7 @@ app.post("/profiler-users-send-email", async (c) => {
 				error: "Failed to process email sending request",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -6360,7 +6349,7 @@ app.post("/scrap-google-news", async (c) => {
 					success: false,
 					error: "City and state are required",
 				},
-				400
+				400,
 			);
 		}
 
@@ -6404,7 +6393,7 @@ app.post("/scrap-google-news", async (c) => {
 			const link = titleElement.attr("href");
 
 			const sourceElement = $article.find(
-				'[data-testid="source-name"], .wEwyrc, .NUnG9d'
+				'[data-testid="source-name"], .wEwyrc, .NUnG9d',
 			);
 			const source = sourceElement.text().trim();
 
@@ -6532,7 +6521,7 @@ app.post("/scrap-google-news", async (c) => {
 				error: "Failed to scrape Google News",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
@@ -6772,7 +6761,7 @@ app.post("/get-roadmap", async (c) => {
 					// If fetch fails for a child, keep the original item
 					return item;
 				}
-			})
+			}),
 		);
 
 		await firestore
