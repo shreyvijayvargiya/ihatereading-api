@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import cosineSimilarity from "../utils/cosineSimilarity.js";
+import { templates } from "./templates.js";
 
 dotenv.config();
 
@@ -10,7 +12,84 @@ const openai = new OpenAI({
 	apiKey: process.env.OPENROUTER_API_KEY,
 });
 
-// add more examples for each product/website/tool 
+// Cache for template embeddings
+let templateEmbeddingsCache = null;
+
+async function getEmbedding(text) {
+	try {
+		const response = await openai.embeddings.create({
+			model: "openai/text-embedding-3-small",
+			input: text,
+		});
+		return response.data[0].embedding;
+	} catch (error) {
+		console.error("Embedding API error:", error);
+		return null;
+	}
+}
+
+async function getTemplateEmbeddings() {
+	if (templateEmbeddingsCache) return templateEmbeddingsCache;
+
+	const embeddings = {};
+	for (const [key, template] of Object.entries(templates)) {
+		const text = `${template.category} ${template.keywords.join(" ")}`;
+		const embedding = await getEmbedding(text);
+		if (embedding) {
+			embeddings[key] = embedding;
+		}
+	}
+	templateEmbeddingsCache = embeddings;
+	return embeddings;
+}
+
+async function findRelevantTemplate(prompt) {
+	const promptEmbedding = await getEmbedding(prompt);
+	if (!promptEmbedding) return null;
+
+	const templateEmbeddings = await getTemplateEmbeddings();
+	let bestMatchKey = null;
+	let maxSimilarity = -1;
+
+	for (const [key, embedding] of Object.entries(templateEmbeddings)) {
+		const similarity = cosineSimilarity(promptEmbedding, embedding);
+		if (similarity > maxSimilarity) {
+			maxSimilarity = similarity;
+			bestMatchKey = key;
+		}
+	}
+
+	// Only return if similarity is decent
+	return maxSimilarity > 0.3
+		? { key: bestMatchKey, template: templates[bestMatchKey] }
+		: null;
+}
+
+async function getDynamicSystemPrompt(prompt) {
+	const match = await findRelevantTemplate(prompt);
+	if (!match) return { prompt: systemPrompt, templateName: "None" };
+
+	const { key, template } = match;
+
+	const dynamicExample = `
+### DYNAMIC RELEVANT EXAMPLE (Template: ${key})
+The following code is a high-quality example of the type of interface requested. Use it as a reference for quality, structure, and Tailwind patterns.
+\`\`\`html
+${template.code}
+\`\`\`
+`;
+
+	// Inject before the Technical Output Format section
+	return {
+		prompt: systemPrompt.replace(
+			"## [T] TECHNICAL OUTPUT FORMAT (STRICT)",
+			`## [E] DYNAMIC EXAMPLES\n${dynamicExample}\n\n## [T] TECHNICAL OUTPUT FORMAT (STRICT)`,
+		),
+		templateName: key,
+	};
+}
+
+// add more examples for each product/website/tool
 const systemPrompt = `
 # Simba: World-Class UI/UX Designer & Frontend Engineer
 
@@ -474,6 +553,10 @@ app.post("/ai-designer", async (c) => {
 		themeInfo = {},
 	} = await c.req.json();
 
+	// Step 0: Get dynamic system prompt with relevant examples
+	const { prompt: dynamicSystemPrompt, templateName } =
+		await getDynamicSystemPrompt(prompt);
+
 	// Step 1: Generate HTML
 	const response = await openai.chat.completions.create({
 		model: "openai/gpt-4o-mini",
@@ -481,7 +564,7 @@ app.post("/ai-designer", async (c) => {
 		messages: [
 			{
 				role: "system",
-				content: systemPrompt,
+				content: dynamicSystemPrompt,
 			},
 			{
 				role: "user",
@@ -547,6 +630,7 @@ app.post("/ai-designer", async (c) => {
 AI DESIGNER REPORT:
 ------------------
 Validation: ${validationResult.valid ? "PASSED ✓" : "FAILED ✗"}
+Dynamic Example: ${templateName}
 VQE Score: ${vqeResult.scores?.average || "N/A"}/10 (Passes: ${vqeResult.vqePasses || 0})
 Issues Found: ${validationResult.issues?.length || 0}
 Improvements Made: ${vqeResult.improvementsMade?.length || 0}
@@ -572,8 +656,15 @@ app.post("/ai-designer-autofix", async (c) => {
 		attempts: 0,
 	};
 
+	let finalTemplateName = "None";
+
 	while (!validationResult.valid && attempts < maxAttempts) {
 		attempts++;
+
+		// Step 0: Get dynamic system prompt for each attempt (though prompt stays same)
+		const { prompt: dynamicSystemPrompt, templateName } =
+			await getDynamicSystemPrompt(prompt);
+		finalTemplateName = templateName;
 
 		// Generate HTML (with feedback from previous validation if exists)
 		const generationPrompt =
@@ -587,7 +678,7 @@ app.post("/ai-designer-autofix", async (c) => {
 			messages: [
 				{
 					role: "system",
-					content: systemPrompt,
+					content: dynamicSystemPrompt,
 				},
 				{
 					role: "user",
@@ -625,6 +716,7 @@ app.post("/ai-designer-autofix", async (c) => {
 <!-- 
 AUTO-FIX REPORT:
 Attempts: ${attempts}/${maxAttempts}
+Dynamic Example: ${finalTemplateName}
 Final Status: ${validationResult.valid ? "PASSED ✓" : "FAILED ✗ (max attempts reached)"}
 Issues Found: ${validationResult.issues.length}
 ${
