@@ -2,6 +2,8 @@
 
 This is a vanilla JavaScript project with various features including:
 
+[] Add more examples inside system prompt for each UI in detail
+
 ## Features
 
 - Blog system with Firebase integration

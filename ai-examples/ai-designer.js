@@ -153,6 +153,17 @@ Orchestrate full, realistic content. **NO "Lorem Ipsum"**. Create content as muc
 - **CSS Validity**: Use only valid Tailwind v3 classes.
 - **Boilerplate**: Include \`<!DOCTYPE html>\`, \`<script src="https://cdn.tailwindcss.com"></script>\`.
 
+### 6. COMPONENT-SPECIFIC RULES (MANDATORY)
+- **Buttons**: Must include semantic Lucide icons where appropriate (e.g., arrow-right for CTAs, plus for "Add" actions).
+- **Tabs**: Must feature distinctive icons alongside labels and use clear active/inactive state styling.
+- **Inputs**: Should include contextual icons (search, mail, lock) for enhanced visual affordance.
+- **Modals & Overlays**: MUST include a prominent close icon in the top-right corner or the end of the header.
+- **Backgrounds**: When the design calls for a "cool" look, implement animated gradients or sophisticated patterns (Canva-style dots, infinite grid lines, floating geometric boxes, or soft "bulb" shadows).
+- **Testimonials**: MUST include a user image/avatar and a social media link or handle (unless it's an anonymous/message-only quote).
+- **Pricing Cards**: Lists must be perfectly aligned with consistent iconography. The CTA button must be high-contrast and visually paired with the card's specific theme. Include a "Monthly/Yearly" toggle tab/button above the pricing grid.
+- **Sidebars**: Every navigation item MUST have an icon. Include a sidebar toggle button (hamburger/close) next to the header or within the sidebar itself.
+- **Dashboards**: Must include rich, interactive-looking charts (utilize SVG or advanced CSS layouts to simulate charts since external JS libraries are not included).
+
 ## [P] PERFORMANCE
 
 ### 1. THEME ENFORCEMENT REVIEW
@@ -167,7 +178,7 @@ After generation, scan every section. If any element introduces new colors/radiu
 ## [E] EXAMPLES
 
 ### UI COMPONENT ONE-LINERS
-- **BUTTON**: \`<button class="flex items-center gap-2 rounded-xl bg-zinc-100 px-6 py-3 font-bold text-zinc-900 transition-all hover:scale-[1.02] hover:bg-zinc-200"><span>Action</span><img src="..." class="h-5 w-5 invert" /></button>\`
+- **BUTTON**: \`<button class="flex items-center gap-2 rounded-xl bg-zinc-800 px-6 py-3 font-bold text-zinc-200 transition-all hover:scale-[1.02] hover:bg-zinc-900"><span>Action</span><img src="..." class="h-5 w-5 invert" /></button>\`
 - **CARD**: \`<div class="group rounded-3xl border border-zinc-100 bg-zinc-50 p-8 hover:shadow-xl transition-all">...</div>\`
 - **INPUT**: \`<input type="text" placeholder="Enter..." class="w-full bg-zinc-50 border border-zinc-100 rounded-xl p-2 outline-none focus:ring-2" />\`
 
@@ -242,6 +253,15 @@ Your task is to perform a deep-scan of the provided HTML and return a detailed d
 - **FAIL**: Missing essential pages/blocks for the request type (e.g., Landing page missing Hero, Features, Testimonials, FAQ, Pricing, or Footer).
 - **FAIL**: Missing functional blocks for tools (e.g., Dashboard missing Sidebar or Stat Cards).
 - **PASS**: Full-stack marketing/functional experience with all production-ready blocks.
+
+### 8. COMPONENT-SPECIFIC VISUALS (CRITICAL)
+- **FAIL**: Buttons/Tabs missing icons or clear labels/active states.
+- **FAIL**: Modals/Overlays missing a close icon (X) in the header/top-right.
+- **FAIL**: Pricing cards missing Monthly/Yearly toggles or misaligned feature lists.
+- **FAIL**: Testimonials missing user avatars or social handles (where applicable).
+- **FAIL**: Sidebars missing navigation icons or toggle buttons.
+- **FAIL**: Dashboards missing visual charts or data representations.
+- **FAIL**: "Cool" designs lacking sophisticated backgrounds (gradients, patterns) where requested.
 
 ## [P] PERFORMANCE (OUTPUT FORMAT)
 You MUST respond with a valid JSON object only. NO CHAT, NO EXPLANATIONS.
