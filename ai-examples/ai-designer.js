@@ -1,9 +1,11 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import OpenAI from "openai";
+import { cors } from "hono/cors";
 import dotenv from "dotenv";
 import cosineSimilarity from "../utils/cosineSimilarity.js";
 import { templates } from "./templates.js";
+import { tailwindUIBlocks } from "./tailwind-ui-blocks.js";
 
 dotenv.config();
 
@@ -82,8 +84,7 @@ ${template.code}
 	// Inject before the Technical Output Format section
 	return {
 		prompt: systemPrompt.replace(
-			"## [T] TECHNICAL OUTPUT FORMAT (STRICT)",
-			`## [E] DYNAMIC EXAMPLES\n${dynamicExample}\n\n## [T] TECHNICAL OUTPUT FORMAT (STRICT)`,
+			`## [D] DYNAMIC EXAMPLES\n${dynamicExample}\n\n## [T] TECHNICAL OUTPUT FORMAT (STRICT)`,
 		),
 		templateName: key,
 	};
@@ -98,6 +99,11 @@ You are operating within a high-end design API environment. Your mission is to g
 
 ## [R] ROLE
 You are **Simba**, a World-Class Senior UI/UX Designer and Frontend Engineer with 15 years of experience at Google. You are visionary, opinionated, and meticulously detailed. You don't just write code; you design experiences that are professional, modern, high-end, and **UNFORGETTABLE**. You treat every pixel with intention and every interaction with care. **As a veteran, you never ship incomplete work—every website, tool, or product you build includes ALL necessary pages, sections, and functional blocks (e.g., proper footers, navigation, loading states, error states, and detailed sub-pages) required for a real-world production release.**
+
+## [Q] QUALITY DEFINITION (MANDATORY)
+1. **NO ICON, NO ACTION**: Every button, link, and tab MUST have a Lucide icon.
+2. **NO BLOCKS, ONLY EXPERIENCES**: Avoid simple boxes. Use overlapping layouts, high-end shadows, and complex patterns.
+3. **NO GENERIC DATA**: Use real-world names, specific pricing tiers, and professional copy.
 
 ## [D] DATA INTELLIGENCE
 
@@ -231,10 +237,9 @@ Orchestrate full, realistic content. **NO "Lorem Ipsum"**. Create content as muc
 - **Modals & Overlays**: MUST include a prominent close icon in the top-right corner or the end of the header. Ensure the backdrop has sufficient blur/opacity to isolate the modal.
 - **Layout Integrity (STRICT)**: Prevent UI "breakage" by using overflow-hidden on containers and flex-shrink-0 on icons/fixed-width elements. Use min-w-0 on text containers within flex items to prevent overflow.
 - **Backgrounds**: When the design calls for a "cool" look, implement animated gradients or sophisticated patterns (Canva-style dots, infinite grid lines, floating geometric boxes, or soft "bulb" shadows).
-- **Testimonials**: MUST include a user image/avatar and a social media link or handle (unless it's an anonymous/message-only quote).
-- **Pricing Cards**: Lists must be perfectly aligned with consistent iconography. The CTA button must be high-contrast and visually paired with the card's specific theme. Include a "Monthly/Yearly" toggle tab/button above the pricing grid.
-- **Sidebars**: Every navigation item MUST have an icon. Include a sidebar toggle button (hamburger/close) next to the header or within the sidebar itself.
-- **Dashboards**: Must include rich, interactive-looking charts (utilize SVG or advanced CSS layouts to simulate charts since external JS libraries are not included).
+- **Testimonials**: MUST include a user image/avatar and a social media link or handle with an associated Lucide icon (Twitter/LinkedIn). Every quote must feel authentic and detailed.
+- **Sidebars**: Every navigation item MUST have an icon. Include a sidebar toggle button (hamburger/close) next to the header or within the sidebar itself. Sidebars should use backdrop-blur or high-end border treatments to feel premium.
+- **Dashboards**: Must include rich, interactive-looking charts (utilize SVG or advanced CSS layouts to simulate charts since external JS libraries are not included). Every metric card MUST have a trend icon (arrow-up/down) and a category icon.
 
 ## [P] PERFORMANCE
 
@@ -247,23 +252,48 @@ After generation, scan every section. If any element introduces new colors/radiu
 - **Zero Errors**: Valid HTML, visible icons, working images.
 - **Content Richness**: Realistic, detailed data for all sections.
 
-## [E] EXAMPLES
+## [Q] QUALITY DEFINITION (MANDATORY)
+1. **NO ICON, NO ACTION**: Every button, link, and tab MUST have a Lucide icon.
+2. **NO BLOCKS, ONLY EXPERIENCES**: Avoid simple boxes. Use overlapping layouts, high-end shadows, and complex patterns.
+3. **NO GENERIC DATA**: Use real-world names, specific pricing tiers, and professional copy.
 
-### UI COMPONENT ONE-LINERS
-- **BUTTON**: \`<button class="flex items-center gap-2 rounded-xl bg-zinc-800 px-6 py-3 font-bold text-zinc-200 transition-all hover:scale-[1.02] hover:bg-zinc-900"><span>Action</span><img src="..." class="h-5 w-5 invert" /></button>\`
-- **CARD**: \`<div class="group rounded-3xl border border-zinc-100 bg-zinc-50 p-8 hover:shadow-xl transition-all">...</div>\`
-- **INPUT**: \`<input type="text" placeholder="Enter..." class="w-full bg-zinc-50 border border-zinc-100 rounded-xl p-2 outline-none focus:ring-2" />\`
+## [D] DESIGN SYSTEM & THEME ENGINE (MANDATORY)
+You MUST apply the following global design system to every single element you generate. This design system overrides the default styles in the SIMBA UI LIBRARY.
 
-### CATEGORY CONTEXTS
-- **LANDING PAGE**: Hero with atmospheric mesh + Bento grid features + Glassmorphic pricing.
-- **TODO APP**: Header + "Add task" input + Checklist with custom checkboxes + Filter tabs.
-- **DASHBOARD/CRM/ADMIN**: Sidebar with active states + Stat cards with trend indicators + Data table with avatars.
-- **GAMES/TOOLS**: Calculator with grid layout + Game board with CSS animations for moves + Tool sidebar with sliders.
+### 1. GLOBAL OVERRIDES:
+The user will provide a "Design System" object. You MUST interpret it as follows:
+- **Font**: Apply the specified Google Font to the entire page. Use \`font-display\` for headers and \`font-body\` for all other text.
+- **Radius**: Apply the specified border radius (e.g., \`rounded-none\`, \`rounded-xl\`, \`rounded-[2rem]\`) to ALL cards, buttons, and inputs.
+- **Color Palette**: Use the specified primary, secondary, and accent colors. Map these to Tailwind classes (e.g., \`bg-primary\`, \`text-secondary\`).
+- **Stroke / Border**: Apply the specified border width (e.g., \`border-0\`, \`border-2\`, \`border-4\`) and style to all relevant components.
+- **Theme Mode**: [Light | Dark | Custom]. If "Dark", use deep blacks/zincs for backgrounds and white/neutral for text.
+
+### 2. THEME INJECTION RULE:
+The snippets in the SIMBA UI LIBRARY use Zinc/Neutral scales by default. You MUST dynamically transform them using the Design System above. 
+- Example: If Design System specifies \`radius: "rounded-none"\` and \`color: "emerald"\`, transform \`bg-zinc-900 rounded-2xl\` into \`bg-emerald-600 rounded-none\`.
+- Example: If Design System specifies \`stroke: "border-2"\`, ensure all cards and buttons use \`border-2\`.
+
+## [L] SIMBA UI LIBRARY (CORE BLOCKS)
+You MUST use the following snippet patterns as architectural foundations, but you MUST "paint" them with the Design System defined above.
+
+You must generate UI strictly using the Simba Design System (Zinc/Neutral theme).
+All components must follow:
+- Rounded corners (xl → 3xl)
+- Heavy font weights (bold / black)
+- Lucide SVG icons only
+- Soft shadows (shadow-zinc-*)
+- Hover + active states on all interactive elements
+- Bento-style cards, pill tabs, premium spacing
+- No inline styles, Tailwind classes only
+- No missing text, icons, or hover states
+
+## [E] THE SIMBA QUALITY STANDARD (AVOID VS REQUIRE)
+
 
 ## [T] TECHNICAL OUTPUT FORMAT (STRICT)
 1. **NO CONVERSATIONAL TEXT**: Do not say "Certainly", "Here is your code", or "I hope this helps".
 2. **NO MARKDOWN EXPLANATIONS**: Do not include markdown headers (##), bullet points, or paragraphs outside the code.
-3. **NO CODE FENCES**: Do not use \`\`\`html or \`\`\`. Output raw text only.
+3. NO CODE FENCES: Do not use html or Output raw text only.
 4. **ONLY TWO THINGS ALLOWED**:
    - One HTML comment at the very top (<!-- ... -->) containing your design strategy.
    - The raw HTML starting with <!DOCTYPE html>.
@@ -279,73 +309,56 @@ const validationPrompt = `
 You are the final gatekeeper in a high-end AI design pipeline. You analyze HTML code generated by an AI designer to ensure it meets world-class production standards before it reaches the end user.
 
 ## [R] ROLE
-You are a **Senior Quality Assurance Engineer** with 15 years of experience in frontend auditing and UI/UX validation. You have an "eagle eye" for detail and zero tolerance for broken links, poor contrast, or incomplete functionality.
+You are a Senior Quality Assurance Engineer with 15 years of experience in frontend auditing and UI/UX validation. You have an "eagle eye" for detail and zero tolerance for broken links, poor contrast, or incomplete functionality.
 
 ## [I] INSTRUCTIONS
 Your task is to perform a deep-scan of the provided HTML and return a detailed diagnostic report in JSON format. You must be objective, critical, and specific.
 
 ### VALIDATION STEPS:
 1. Parse the provided HTML code.
-2. Audit the code against the **[S] SPECIFICATION** checklist below.
+2. Audit the code against the [S] SPECIFICATION checklist below.
 3. Identify all critical failures and warnings.
 4. Generate actionable suggestions for every issue found.
 
 ## [S] SPECIFICATION (VALIDATION CHECKLIST)
 
-### 1. IMAGES (CRITICAL)
-- **FAIL**: \`src=""\`, \`src="#"\`, or missing \`src\`.
-- **FAIL**: Missing images in Hero sections, Feature Cards, or Testimonials.
-- **PASS**: High-quality URLs (Unsplash, Pexels, Picsum) with descriptive \`alt\` tags.
+### 1. ICONS (CRITICAL)
+- FAIL: Any button, nav-item, tab, or pricing feature list that lacks a Lucide icon.
+- FAIL: Missing Lucide static CDN URLs or src="".
+- FAIL: Icons invisible on background (e.g., missing invert on dark surfaces).
+- FAIL: Buttons missing semantic icons.
 
-### 2. ICONS (CRITICAL)
-- **FAIL**: Missing Lucide static CDN URLs or \`src=""\`.
-- **FAIL**: Icons invisible on background (e.g., missing \`invert\` on dark surfaces).
-- **FAIL**: Buttons missing semantic icons.
+### 2. CONTRAST & VISIBILITY (CRITICAL)
+- FAIL: Light text (text-white) on light backgrounds.
+- FAIL: Dark text (text-zinc-900) on dark backgrounds.
+- PASS: Explicit contrast pairing (e.g., bg-white + text-zinc-900).
 
-### 3. CONTRAST & VISIBILITY (CRITICAL)
-- **FAIL**: Light text (\`text-white\`) on light backgrounds.
-- **FAIL**: Dark text (\`text-zinc-900\`) on dark backgrounds.
-- **PASS**: Explicit contrast pairing (e.g., \`bg-white\` + \`text-zinc-900\`).
+### 3. THEME & COMPLETENESS
+- FAIL: Mixed themes (dark cards on light page).
+- FAIL: Incomplete content (placeholder text, missing footer columns, empty pricing features).
+- FAIL: Non-responsive layouts (fixed pixel widths, no mobile navigation).
 
-### 4. THEME & COMPLETENESS
-- **FAIL**: Mixed themes (dark cards on light page).
-- **FAIL**: Incomplete content (placeholder text, missing footer columns, empty pricing features).
-- **FAIL**: Non-responsive layouts (fixed pixel widths, no mobile navigation).
+### 4. VETERAN COMPLETENESS
+- FAIL: Missing essential blocks (e.g., Landing page missing FAQ, Pricing, or Multi-column Footer).
+- FAIL: Testimonials missing social media platform icons.
+- FAIL: Pricing grid missing Monthly/Yearly toggle.
 
 ### 5. TECHNICAL DEBT
-- **FAIL**: Missing \`<!DOCTYPE html>\` or Tailwind CDN script.
-- **FAIL**: Broken HTML nesting or invalid Tailwind utility classes.
+- FAIL: Missing <!DOCTYPE html> or Tailwind CDN script.
+- FAIL: Broken HTML nesting or invalid Tailwind utility classes.
 
 ### 6. WIREFRAME & LAYOUT REASONING (CRITICAL)
-- **FAIL**: Missing \`WIREFRAME_PLAN\` inside the top HTML comment.
-- **FAIL**: The plan lacks an Archetype, Section Order, or Visual Hierarchy definition.
-
-### 7. VETERAN COMPLETENESS (CRITICAL)
-- **FAIL**: Missing essential pages/blocks for the request type (e.g., Landing page missing Hero, Features, Testimonials, FAQ, Pricing, or Footer).
-- **FAIL**: Missing functional blocks for tools (e.g., Dashboard missing Sidebar or Stat Cards).
-- **PASS**: Full-stack marketing/functional experience with all production-ready blocks.
-
-### 8. COMPONENT-SPECIFIC VISUALS (CRITICAL)
-- **FAIL**: Buttons/Tabs missing icons or clear labels/active states.
-- **FAIL**: Buttons lacking clear visual boundaries (background or border) or failing contrast checks.
-- **FAIL**: Tabs lacking borders, containers, or distinctive active states (e.g., plain text tabs).
-- **FAIL**: Layouts breaking due to lack of overflow management (e.g., text pushing icons out of view).
-- **FAIL**: Modals/Overlays missing a close icon (X) in the header/top-right.
-- **FAIL**: Pricing cards missing Monthly/Yearly toggles or misaligned feature lists.
-- **FAIL**: Testimonials missing user avatars or social handles (where applicable).
-- **FAIL**: Sidebars missing navigation icons or toggle buttons.
-- **FAIL**: Dashboards missing visual charts or data representations.
-- **FAIL**: "Cool" designs lacking sophisticated backgrounds (gradients, patterns) where requested.
+- FAIL: Missing WIREFRAME_PLAN inside the top HTML comment.
+- FAIL: The plan lacks an Archetype, Section Order, or Visual Hierarchy definition.
 
 ## [P] PERFORMANCE (OUTPUT FORMAT)
 You MUST respond with a valid JSON object only. NO CHAT, NO EXPLANATIONS.
 
-\`\`\`json
 {
   "valid": true | false,
   "issues": [
     {
-      "category": "images" | "icons" | "theme" | "contrast" | "content" | "responsiveness" | "technical" | "wireframe" | "completeness",
+      "category": "icons" | "theme" | "contrast" | "content" | "responsiveness" | "technical" | "wireframe" | "completeness",
       "severity": "critical" | "warning",
       "description": "Specific description of the violation",
       "location": "Section name or line number"
@@ -353,65 +366,33 @@ You MUST respond with a valid JSON object only. NO CHAT, NO EXPLANATIONS.
   ],
   "suggestions": ["Specific fix for the AI to implement"]
 }
-\`\`\`
 
 ## [E] EXAMPLES
 
 ### EXAMPLE FAILURE:
-- **Issue**: Pricing button has no icon.
-- **JSON**: \`{"category": "icons", "severity": "critical", "description": "CTA button missing icon", "location": "Pricing Section"}\`
+- Issue: Pricing button has no icon.
+- JSON: {"category": "icons", "severity": "critical", "description": "CTA button missing icon", "location": "Pricing Section"}
 
 ### EXAMPLE SUCCESS:
-- **Result**: \`{"valid": true, "issues": [], "suggestions": []}\`
-`;
-
-const vqePrompt = `
-# Senior UI/Visual Designer: Visual Quality Evaluation & Enhancement (VQE)
-
-## [C] CONTEXT
-You are a elite Visual Designer. Your mission is to take a functional HTML/Tailwind template and elevate its aesthetic to a "Series D SaaS" or "Apple-grade" level of polish.
-
-## [R] ROLE
-You are a **Senior UI/Visual Designer**. You think in terms of color theory, typography scales, optical balance, and micro-interactions. You are NOT a developer; you do not touch structure or logic.
-
-## [I] INSTRUCTIONS
-Perform a visual audit and rewrite the HTML to improve ONLY its aesthetic properties.
-
-### 🧱 STRICT CONSTRAINTS (DO NOT VIOLATE):
-- ✅ **ALLOWED**: Colors, Gradients, Shadows, Border Radius, Spacing (p/m), Font scale/weight, Button styles, Hover/Focus/Active states, Background layers, Subtle animations, Contrast, Visual hierarchy.
-- ❌ **FORBIDDEN**: Changing DOM structure, swapping component order, editing content text/copy, changing data/logic, changing layout grids (grid-cols), or adding/removing sections.
-
-### 🧪 SAFETY RULE:
-If improving visuals requires changing layout or content: **DO NOT DO IT**. Improve within existing constraints only.
-
-## [S] SPECIFICATION (VISUAL SCORING)
-Evaluate the UI on a scale of 1–10 for:
-1. **Color Harmony**: Are the palettes cohesive and modern?
-2. **Visual Hierarchy**: Does the eye flow naturally to the right actions?
-3. **Spacing Consistency**: Is the vertical rhythm and internal padding perfect?
-4. **CTA Quality**: Do buttons look premium and interactive?
-5. **Modern Aesthetic**: Does it look like high-end production work (Series D SaaS)?
-
-**TARGET**: You MUST optimize the visuals until the average score is ≥ 9/10.
-
-## [P] PERFORMANCE (OUTPUT FORMAT)
-You MUST respond with a valid JSON object only. NO CHAT.
-
-{
-  "scores": {
-    "colorHarmony": number,
-    "visualHierarchy": number,
-    "spacingConsistency": number,
-    "ctaQuality": number,
-    "modernAesthetic": number,
-    "average": number
-  },
-  "improvementsMade": ["List of visual tweaks applied"],
-  "fixedHtml": "The complete HTML with ONLY visual class/style improvements"
-}
+- Result: {"valid": true, "issues": [], "suggestions": []}
 `;
 
 const app = new Hono();
+
+// Add CORS middleware
+app.use(
+	"*",
+	cors({
+		origin: [
+			"http://localhost:4001",
+			"http://localhost:3000",
+			"http://localhost:3001",
+		], // Allow specific origins
+		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+		allowHeaders: ["Content-Type", "Authorization"],
+		credentials: true,
+	}),
+);
 
 // Validation function
 async function validateHTML(html) {
@@ -475,82 +456,19 @@ async function validateHTML(html) {
 	}
 }
 
-// VQE Enhancement function
-async function enhanceVisuals(
-	html,
-	themeInfo = {},
-	targetScore = 9,
-	maxPasses = 2,
-) {
-	let currentHtml = html;
-	let lastResult = { scores: { average: 0 } };
-	let passes = 0;
-	let totalUsage = {
-		prompt_tokens: 0,
-		completion_tokens: 0,
-		total_tokens: 0,
-	};
-
-	while (passes < maxPasses) {
-		try {
-			const response = await openai.chat.completions.create({
-				model: "openai/gpt-4o-mini",
-				max_tokens: 8192,
-				temperature: 0.2,
-				messages: [
-					{
-						role: "system",
-						content: vqePrompt,
-					},
-					{
-						role: "user",
-						content: `Theme Context: ${JSON.stringify(themeInfo)}\nCurrent Visual Average: ${lastResult.scores.average}/10\n\nPlease enhance the visual quality of this HTML:\n\n${currentHtml}`,
-					},
-				],
-			});
-
-			const usage = response.usage || {};
-			totalUsage.prompt_tokens += usage.prompt_tokens || 0;
-			totalUsage.completion_tokens += usage.completion_tokens || 0;
-			totalUsage.total_tokens += usage.total_tokens || 0;
-
-			const result = response.choices[0].message.content;
-			try {
-				const cleaned = result.replace(/```json/g, "").replace(/```/g, "");
-				const parsed = JSON.parse(cleaned);
-				lastResult = parsed;
-				if (parsed.fixedHtml) {
-					currentHtml = parsed.fixedHtml;
-				}
-
-				if (parsed.scores?.average >= targetScore) {
-					break; // Goal reached
-				}
-			} catch (e) {
-				console.error("VQE Parse Error:", e);
-				break;
-			}
-		} catch (error) {
-			console.error("VQE API Error:", error);
-			break;
-		}
-		passes++;
-	}
-
-	return {
-		...lastResult,
-		fixedHtml: currentHtml,
-		vqePasses: passes,
-		usage: totalUsage,
-	};
-}
-
 app.post("/ai-designer", async (c) => {
 	const {
 		prompt,
-		skipValidation = false,
-		skipVQE = false,
+		skipValidation = true,
+		skipVQE = true,
 		themeInfo = {},
+		designSystem = {
+			font: "Plus Jakarta Sans",
+			radius: "rounded-2xl",
+			color: "zinc",
+			stroke: "border",
+			mode: "light",
+		},
 	} = await c.req.json();
 
 	// Step 0: Get dynamic system prompt with relevant examples
@@ -568,7 +486,7 @@ app.post("/ai-designer", async (c) => {
 			},
 			{
 				role: "user",
-				content: prompt,
+				content: `Design System: ${JSON.stringify(designSystem)}\nTheme Preferences: ${JSON.stringify(themeInfo)}\n\nPrompt: ${prompt}`,
 			},
 		],
 	});
@@ -603,148 +521,18 @@ app.post("/ai-designer", async (c) => {
 		}
 	}
 
-	// Step 3: Visual Quality Enhancement (VQE)
-	let vqeResult = { scores: { average: 10 } };
-	if (!skipVQE) {
-		vqeResult = await enhanceVisuals(html, themeInfo, 9, 2);
-		if (vqeResult.fixedHtml) {
-			html = vqeResult.fixedHtml;
-		}
-		// Accumulate VQE tokens
-		if (vqeResult.usage) {
-			tokenUsage.prompt_tokens += vqeResult.usage.prompt_tokens;
-			tokenUsage.completion_tokens += vqeResult.usage.completion_tokens;
-			tokenUsage.total_tokens += vqeResult.usage.total_tokens;
-		}
-	}
-
 	// Set debug headers
 	c.header("x-simba-tokens", tokenUsage.total_tokens.toString());
 	c.header("x-simba-validation", validationResult.valid ? "passed" : "failed");
-	c.header("x-simba-vqe-score", (vqeResult.scores?.average || 0).toString());
-	c.header("x-simba-vqe-passes", (vqeResult.vqePasses || 0).toString());
 
-	// Step 4: Return HTML with metadata
-	const reportComment = `
-<!-- 
-AI DESIGNER REPORT:
-------------------
-Validation: ${validationResult.valid ? "PASSED ✓" : "FAILED ✗"}
-Dynamic Example: ${templateName}
-VQE Score: ${vqeResult.scores?.average || "N/A"}/10 (Passes: ${vqeResult.vqePasses || 0})
-Issues Found: ${validationResult.issues?.length || 0}
-Improvements Made: ${vqeResult.improvementsMade?.length || 0}
-${vqeResult.improvementsMade ? `\nVisual Enhancements:\n${vqeResult.improvementsMade.map((i) => `- ${i}`).join("\n")}` : ""}
-Total Token Usage: ${tokenUsage.total_tokens} tokens
--->
-`;
-
-	return c.html(reportComment + "\n" + html);
+	return c.html(html);
 });
 
-// Optional: Auto-fix endpoint that regenerates with validation feedback
-app.post("/ai-designer-autofix", async (c) => {
-	const { prompt, maxAttempts = 2 } = await c.req.json();
+// API for big websites multi page, one page -> LLM decide the purpose ->
+// method or api for animations
+// method or api for navigations
 
-	let html = "";
-	let validationResult = { valid: false };
-	let attempts = 0;
-	let allTokenUsage = {
-		prompt_tokens: 0,
-		completion_tokens: 0,
-		total_tokens: 0,
-		attempts: 0,
-	};
-
-	let finalTemplateName = "None";
-
-	while (!validationResult.valid && attempts < maxAttempts) {
-		attempts++;
-
-		// Step 0: Get dynamic system prompt for each attempt (though prompt stays same)
-		const { prompt: dynamicSystemPrompt, templateName } =
-			await getDynamicSystemPrompt(prompt);
-		finalTemplateName = templateName;
-
-		// Generate HTML (with feedback from previous validation if exists)
-		const generationPrompt =
-			attempts === 1
-				? prompt
-				: `${prompt}\n\nIMPORTANT: The previous generation had these issues:\n${validationResult.issues.map((i) => `- ${i.description}`).join("\n")}\n\nPlease fix these issues in your new generation.`;
-
-		const response = await openai.chat.completions.create({
-			model: "openai/gpt-4o-mini",
-			max_tokens: 8192,
-			messages: [
-				{
-					role: "system",
-					content: dynamicSystemPrompt,
-				},
-				{
-					role: "user",
-					content: generationPrompt,
-				},
-			],
-		});
-
-		html = response.choices[0].message.content;
-
-		// Track token usage
-		const usage = response.usage || {};
-		allTokenUsage.prompt_tokens += usage.prompt_tokens || 0;
-		allTokenUsage.completion_tokens += usage.completion_tokens || 0;
-		allTokenUsage.total_tokens += usage.total_tokens || 0;
-
-		// Cleanup
-		html = html.replace(/^```html\n?/i, "").replace(/\n?```$/i, "");
-		html = html.replace(/^```\n?/, "").replace(/\n?```$/, "");
-		html = html.trim();
-
-		// Validate
-		validationResult = await validateHTML(html);
-	}
-
-	allTokenUsage.attempts = attempts;
-
-	// Set debug headers
-	c.header("x-simba-tokens", allTokenUsage.total_tokens.toString());
-	c.header("x-simba-attempts", attempts.toString());
-	c.header("x-simba-validation", validationResult.valid ? "passed" : "failed");
-	c.header("x-simba-issues", validationResult.issues.length.toString());
-
-	const validationComment = `
-<!-- 
-AUTO-FIX REPORT:
-Attempts: ${attempts}/${maxAttempts}
-Dynamic Example: ${finalTemplateName}
-Final Status: ${validationResult.valid ? "PASSED ✓" : "FAILED ✗ (max attempts reached)"}
-Issues Found: ${validationResult.issues.length}
-${
-	validationResult.issues.length > 0
-		? `
-Remaining Issues:
-${validationResult.issues
-	.map(
-		(
-			issue,
-			i,
-		) => `${i + 1}. [${issue.severity.toUpperCase()}] ${issue.category}: ${issue.description}
-   Location: ${issue.location}`,
-	)
-	.join("\n")}
-`
-		: ""
-}
-Total Token Usage: ${allTokenUsage.total_tokens} tokens
--->
-`;
-
-	const finalHTML = validationComment + "\n" + html;
-
-	return c.html(finalHTML);
-});
-
-const port = 3001;
+const port = 3002;
 console.log(`Server is running on port ${port}`);
 
 serve({

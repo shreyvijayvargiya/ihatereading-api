@@ -1207,7 +1207,7 @@ app.post("/scrap-airbnb", async (c) => {
 	let scrapedData = {};
 
 	try {
-		const response = await fetch(`http://localhost:3001/scrap-url`, {
+		const response = await fetch(`http://localhost:3001/scrap-url-puppeteer`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -1238,7 +1238,7 @@ app.post("/scrap-airbnb", async (c) => {
 				// Only include links that match the required Airbnb room URL pattern
 				if (
 					typeof listingUrl === "string" &&
-					listingUrl.startsWith("https://www.airbnb.co.in/rooms")
+					listingUrl.startsWith("https://www.airbnb.co")
 				) {
 					// Extract title from link text
 					const title = link.text ? link.text : link.title;
@@ -1257,21 +1257,6 @@ app.post("/scrap-airbnb", async (c) => {
 			}
 		}
 
-		// Get page info from scrap-url response
-		const pageInfo = {
-			title:
-				scrapData.data?.pageInfo?.title ||
-				scrapData.data?.title ||
-				scrapData.title ||
-				"Airbnb Search Results",
-			url: fullUrl,
-			description:
-				scrapData.data?.pageInfo?.description ||
-				scrapData.data?.description ||
-				scrapData.description ||
-				"",
-		};
-
 		scrapedData = {
 			success: true,
 			url: fullUrl,
@@ -1280,7 +1265,6 @@ app.post("/scrap-airbnb", async (c) => {
 			checkout: checkout || null,
 			listings: listings,
 			totalListings: listings.length,
-			pageInfo: pageInfo,
 			timestamp: new Date().toISOString(),
 			useProxy: useProxy,
 		};
