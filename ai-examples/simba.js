@@ -5,12 +5,21 @@ import OpenAI from "openai";
 import { cors } from "hono/cors";
 import dotenv from "dotenv";
 import {
-	tailwindUIBlocks,
-	uiBlocks,
 	uiBlockLibrary,
+	uiBlocksBrutal,
+	uiBlocksMinimal,
+	uiBlocksCyber,
+	uiBlocksGaia,
+	uiBlocksJoy,
+	uiBlocksModern,
+	uiBlocksKids,
+	uiBlocksSports,
+	uiBlocksFinance,
+	uiBlocksHealth,
 } from "./tailwind-ui-blocks.js";
 import { templates } from "./templates.js";
 import cosineSimilarity from "../utils/cosineSimilarity.js";
+import { fetchUnsplash } from "../utils/unsplash.js";
 
 dotenv.config();
 
@@ -51,10 +60,11 @@ async function getTemplateEmbeddings() {
 async function getBlockEmbeddings() {
 	if (blockEmbeddingsCache) return blockEmbeddingsCache;
 	const embeddings = [];
-	for (const block of uiBlockLibrary) {
+	for (let i = 0; i < uiBlockLibrary.length; i++) {
+		const block = uiBlockLibrary[i];
 		const text = `${block.name} ${block.tags.join(" ")}`;
 		const embedding = await getEmbedding(text);
-		if (embedding) embeddings.push({ name: block.name, embedding });
+		if (embedding) embeddings.push({ index: i, embedding });
 	}
 	blockEmbeddingsCache = embeddings;
 	return embeddings;
@@ -78,7 +88,7 @@ async function findRelevantTemplate(prompt) {
 		: null;
 }
 
-async function findRelevantBlocks(prompt, limit = 6) {
+async function findRelevantBlocks(prompt, limit = 10) {
 	const promptEmbedding = await getEmbedding(prompt);
 	if (!promptEmbedding)
 		return uiBlockLibrary
@@ -89,14 +99,14 @@ async function findRelevantBlocks(prompt, limit = 6) {
 	const scores = [];
 	for (const item of blockEmbeddings) {
 		const similarity = cosineSimilarity(promptEmbedding, item.embedding);
-		scores.push({ name: item.name, similarity });
+		scores.push({ index: item.index, similarity });
 	}
 	const topMatches = scores
 		.sort((a, b) => b.similarity - a.similarity)
 		.slice(0, limit);
 
 	return topMatches
-		.map((match) => uiBlockLibrary.find((b) => b.name === match.name).code)
+		.map((match) => uiBlockLibrary[match.index].code)
 		.join("\n\n");
 }
 
@@ -225,6 +235,7 @@ You ship only production-ready work.
 You receive:
 - Page structure from Agent B
 - Full Intent context from Agent A
+- Image requirements from Asset Planner
 - Design System object
 - Simba UI Library patterns
 
@@ -249,11 +260,12 @@ TECH STACK
 - Every button, tab, link: Visible boundary, Icon, Hover + focus state
 - Every section: Complete content, Realistic copy, Production-grade detail
 
-🎨 DESIGN SYSTEM ENFORCEMENT
-- Apply provided theme tokens globally
-- Respect radius, color, stroke, mode
-- Enforce contrast rules strictly
-- No new colors, shadows, or radii allowed
+🎨 DESIGN SYSTEM (TOON)
+Apply provided theme tokens only. No new colors, shadows, or radii. Contrast strict.
+
+Design: primary-btn → solid, icon, hover-lift | secondary-btn → outline, hover-fill | card → rounded, shadow, hover-lift | section → vertical rhythm 80–120px
+Motion: button → scale(1.03) on hover | card → translateY(-4px) | section → fade-up on enter (CSS only: transition + transform)
+Color: primary → brand-600 | surface → neutral-50 | text → neutral-900
 
 🧩 COMPONENT RULES
 - Inputs: visible borders + icons
@@ -263,20 +275,120 @@ TECH STACK
 - Modals: backdrop + close icon
 - Layout integrity: overflow-safe, min-w-0, flex-safe
 
+🖼️ IMAGES
+- Use the provided Image Assets data to populate image tags.
+- Use the actual 'url' provided in the Image Assets object.
+- Ensure alt tags match the query or description.
+- Match orientation (landscape/portrait) to the layout usage.
+
 ## [L] SIMBA UI LIBRARY (CORE BLOCKS)
 You MUST use the following snippet patterns as architectural foundations. These are carefully selected based on the user's request:
-\${relevantBlocks}
+\${RELEVANT_BLOCKS}
 
 ## [D] REFERENCE TEMPLATE
 Use the structure and quality of this relevant example as a guide:
-\${relevantTemplateCode}
+\${RELEVANT_TEMPLATE_CODE}
 
 [P] PERFORMANCE
 - Zero visual bugs
-- Mobile-first responsive
+- Desktop and Mobile Responsive code
 - Accessible contrast
 - No “AI slop”
 - Looks like it shipped from a real company
+
+## 🧱 PRODUCTION COMPLETENESS CONTRACT
+You MUST ensure ALL of the following are true:
+
+STRUCTURE
+- No empty sections
+- No single-element sections unless intentional (hero)
+- Navigation present where required
+- Footer always present unless explicitly excluded
+
+INTERACTION
+- Every clickable element MUST have:
+  - hover state
+  - focus state
+  - active state
+- Every card MUST have at least one interaction (hover or click)
+
+MOTION (REQUIRED)
+- Use subtle motion for:
+  - section entry (fade/slide)
+  - hover elevation for cards
+  - button feedback
+- Motion must be CSS-only (no JS)
+- Use transition + transform utilities
+
+CONTENT
+- No placeholders
+- No "Lorem ipsum"
+- Copy must be realistic and specific to the domain
+
+VISUAL DEPTH
+- Flat UI is forbidden
+- Use spacing, shadows, or borders to separate layers
+
+FAIL CONDITION
+If ANY rule is violated, the output is INVALID.
+`;
+
+const imageAssetAgentPrompt = `
+[C] CONTEXT
+You are part of a multi-agent website generation system.
+Your task is to plan stock image requirements for web pages.
+
+[R] ROLE
+You are a Visual Asset Planner.
+You do NOT generate images.
+You do NOT design UI.
+You only decide image needs and stock search strategy.
+
+[I] INFORMATION
+Input:
+- App intent (domain, brand tone)
+- Page metadata (purpose, density)
+- Page architecture (regions + elements)
+
+[S] SPECIFICATION (STRICT)
+Output ONLY valid JSON.
+No prose. No markdown. No HTML.
+
+Rules:
+- Use stock photography only.
+- Providers allowed: Unsplash, Pexels.
+- Prefer realistic, literal search queries.
+- Avoid abstract, marketing, or emotional words.
+- Only include images when they serve a functional UI purpose.
+- Never invent logos, mascots, or brand assets.
+
+For each image:
+- Provide multiple fallback queries (most specific → generic).
+- Provide provider priority order.
+- Orientation must match UI usage.
+
+Required JSON Shape:
+{
+  "images": [
+    {
+      "region": "",
+      "usage": "hero | section | card | background",
+      "provider_order": ["unsplash", "pexels"],
+      "queries": [
+        "primary query",
+        "fallback query",
+        "generic fallback"
+      ],
+      "orientation": "landscape | portrait | square",
+      "priority": "high | medium | low"
+    }
+  ]
+}
+
+[P] PERFORMANCE
+- Zero unnecessary images
+- Queries must be realistic for stock APIs
+- Must work without human correction
 `;
 
 const actionAgentPrompt = `
@@ -431,6 +543,26 @@ Required JSON Shape:
 }
 `;
 
+const variantAgentPrompt = `
+[C] CONTEXT
+You are a High-Speed UI Refactoring Agent. Your task is to apply a new visual "skin" to an existing HTML document instantly.
+
+[R] ROLE
+You are a CSS/Tailwind Optimizer. You rewrite styling to match a specific design system's aesthetic (typography, spacing, borders, shadows, colors).
+
+[S] SPECIFICATION (STRICT)
+- OUTPUT ONLY RAW HTML.
+- NO markdown, NO explanations.
+- DO NOT CHANGE CONTENT: Keep all text, headlines, and descriptions exactly as they are.
+- DO NOT CHANGE ASSETS: Keep all <img> src tags, icons, and logos exactly as they are.
+- DO NOT CHANGE STRUCTURE: Keep the layout and sections in the same order.
+- ONLY CHANGE STYLING: Update Tailwind classes to match the target aesthetic.
+
+[P] PERFORMANCE
+- Direct and surgical transformation.
+- Prioritize speed and fidelity.
+`;
+
 // Agent Helper Functions
 async function callEditIntentAgent({ prompt, currentAppContext }) {
 	const response = await openai.chat.completions.create({
@@ -543,9 +675,28 @@ async function callArchitectureAgent({ intent, page }) {
 	};
 }
 
+async function callImageAssetAgent({ intent, page, architecture }) {
+	const response = await openai.chat.completions.create({
+		model: "openai/gpt-4o-mini",
+		messages: [
+			{ role: "system", content: imageAssetAgentPrompt },
+			{
+				role: "user",
+				content: `App Intent: ${JSON.stringify(intent.app_intent)}\nPage Metadata: ${JSON.stringify(page)}\nArchitecture: ${JSON.stringify(architecture)}`,
+			},
+		],
+		response_format: { type: "json_object" },
+	});
+	return {
+		data: JSON.parse(response.choices[0].message.content),
+		usage: response.usage,
+	};
+}
+
 async function callRenderAgent({
 	intent,
 	architecture,
+	images,
 	designSystem,
 	relevantBlocks,
 	relevantTemplateCode,
@@ -556,12 +707,22 @@ async function callRenderAgent({
 			{
 				role: "system",
 				content: rendererAgentPrompt
-					.replace("${relevantBlocks}", relevantBlocks || "")
-					.replace("${relevantTemplateCode}", relevantTemplateCode || ""),
+					.replace(
+						"${RELEVANT_BLOCKS}",
+						relevantBlocks != null && relevantBlocks !== ""
+							? relevantBlocks
+							: "No specific blocks were matched for this page. Use Tailwind utilities and the design system to build production-grade components.",
+					)
+					.replace(
+						"${RELEVANT_TEMPLATE_CODE}",
+						relevantTemplateCode != null && relevantTemplateCode !== ""
+							? "```html\n" + relevantTemplateCode + "\n```"
+							: "No reference template was provided. Follow the page architecture and design system to produce clean, semantic HTML.",
+					),
 			},
 			{
 				role: "user",
-				content: `Intent Context: ${JSON.stringify(intent)}\nPage Architecture: ${JSON.stringify(architecture)}\nDesign System: ${JSON.stringify(designSystem)}`,
+				content: `Intent Context: ${JSON.stringify(intent)}\nPage Architecture: ${JSON.stringify(architecture)}\nImage Assets: ${JSON.stringify(images)}\nDesign System: ${JSON.stringify(designSystem)}`,
 			},
 		],
 	});
@@ -575,15 +736,37 @@ async function callRenderAgent({
 	};
 }
 
+async function callVariantAgent({ html, styleExamples }) {
+	const response = await openai.chat.completions.create({
+		model: "openai/gpt-4o-mini",
+		messages: [
+			{ role: "system", content: variantAgentPrompt },
+			{
+				role: "user",
+				content: `ORIGINAL HTML:\n${html}\n\nSTYLE EXAMPLES:\n${styleExamples}`,
+			},
+		],
+	});
+	let updatedHtml = response.choices[0].message.content;
+	updatedHtml = updatedHtml.replace(/^```html\n?/i, "").replace(/\n?```$/i, "");
+	updatedHtml = updatedHtml.replace(/^```\n?/, "").replace(/\n?```$/, "");
+	return {
+		html: updatedHtml.trim(),
+		usage: response.usage,
+	};
+}
+
 // Internal Agent Methods (Encapsulated)
 const agents = {
 	intent: callIntentAgent,
 	architecture: callArchitectureAgent,
+	imageAsset: callImageAssetAgent,
 	render: callRenderAgent,
 	editIntent: callEditIntentAgent,
 	action: callActionAgent,
 	aiEdit: callAiEditAgent,
 	regenerate: callRegenerateAgent,
+	variant: callVariantAgent,
 };
 
 // Main Public Orchestrator
@@ -602,6 +785,7 @@ app.post("/simba", async (c) => {
 	let totalUsage = {
 		intent: 0,
 		architecture: 0,
+		imageAsset: 0,
 		renderer: 0,
 		total: 0,
 	};
@@ -652,11 +836,47 @@ app.post("/simba", async (c) => {
 						page,
 					});
 
+				// 2.5️⃣ IMAGE ASSETS
+				const { data: imagePlan, usage: imageUsage } = await agents.imageAsset({
+					intent,
+					page,
+					architecture,
+				});
+
+				// Fetch actual images from Unsplash based on the plan
+				const images = await Promise.all(
+					(imagePlan.images || []).map(async (imgReq) => {
+						const query = imgReq.queries[0] || "business";
+						try {
+							const results = await fetchUnsplash(query);
+							const selectedImage = results[0] || null;
+							return {
+								...imgReq,
+								url: selectedImage
+									? selectedImage.url
+									: `https://images.unsplash.com/photo-1497215728101-856f4ea42174?auto=format&fit=crop&q=80&w=1000`, // fallback
+								alt: selectedImage ? selectedImage.alt : query,
+							};
+						} catch (error) {
+							console.error(
+								`Error fetching image for query "${query}":`,
+								error,
+							);
+							return {
+								...imgReq,
+								url: `https://images.unsplash.com/photo-1497215728101-856f4ea42174?auto=format&fit=crop&q=80&w=1000`,
+								alt: query,
+							};
+						}
+					}),
+				);
+
 				// 3️⃣ RENDER
 				// We pass relevant context to the prompt injection variables
 				const { html, usage: renderUsage } = await agents.render({
 					intent,
 					architecture,
+					images,
 					designSystem,
 					relevantBlocks,
 					relevantTemplateCode,
@@ -664,8 +884,12 @@ app.post("/simba", async (c) => {
 
 				// Update usage
 				totalUsage.architecture += archUsage.total_tokens;
+				totalUsage.imageAsset += imageUsage.total_tokens;
 				totalUsage.renderer += renderUsage.total_tokens;
-				totalUsage.total += archUsage.total_tokens + renderUsage.total_tokens;
+				totalUsage.total +=
+					archUsage.total_tokens +
+					imageUsage.total_tokens +
+					renderUsage.total_tokens;
 
 				// Send page data
 				// To handle the \n issue and make it readable, we can send the HTML in chunks or as a dedicated event
@@ -678,6 +902,7 @@ app.post("/simba", async (c) => {
 						html,
 						usage: {
 							architecture: archUsage.total_tokens,
+							imageAsset: imageUsage.total_tokens,
 							renderer: renderUsage.total_tokens,
 						},
 					}),
@@ -877,6 +1102,86 @@ app.post("/agent-edit", async (c) => {
 				status: "complete",
 				usage: totalUsage,
 			}),
+		});
+	});
+});
+// 1. Pick a random design system theme
+const designSystems = [
+	{
+		name: "Brutal",
+		blocks: Object.values(uiBlocksBrutal).map((b) => b.code),
+	},
+	{
+		name: "Minimal",
+		blocks: Object.values(uiBlocksMinimal).map((b) => b.code),
+	},
+	{ name: "Cyber", blocks: Object.values(uiBlocksCyber).map((b) => b.code) },
+	{ name: "Gaia", blocks: Object.values(uiBlocksGaia).map((b) => b.code) },
+	{ name: "Joy", blocks: Object.values(uiBlocksJoy).map((b) => b.code) },
+	{
+		name: "Modern",
+		blocks: Object.values(uiBlocksModern).map((b) => b.code),
+	},
+	{ name: "Kids", blocks: Object.values(uiBlocksKids).map((b) => b.code) },
+	{
+		name: "Sports",
+		blocks: Object.values(uiBlocksSports).map((b) => b.code),
+	},
+	{
+		name: "Finance",
+		blocks: Object.values(uiBlocksFinance).map((b) => b.code),
+	},
+	{
+		name: "Health",
+		blocks: Object.values(uiBlocksHealth).map((b) => b.code),
+	},
+];
+
+// Variant Generation Orchestrator
+app.post("/generate-variant", async (c) => {
+	const { html } = await c.req.json();
+
+	const randomSystem =
+		designSystems[Math.floor(Math.random() * designSystems.length)];
+	const styleExamples = randomSystem.blocks.join("\n\n");
+
+	// 2. Stream the variant generation
+	return streamSSE(c, async (stream) => {
+		await stream.writeSSE({
+			event: "meta",
+			data: JSON.stringify({
+				type: "variant",
+				chosenTheme: randomSystem.name,
+				engine: "ai",
+			}),
+		});
+
+		try {
+			// Optimization: variant agent already uses gpt-4o-mini
+			const { html: variantHtml, usage } = await agents.variant({
+				html,
+				styleExamples,
+			});
+
+			await stream.writeSSE({
+				event: "page",
+				data: JSON.stringify({
+					slug: "variant",
+					html: variantHtml,
+					usage,
+				}),
+			});
+		} catch (err) {
+			console.error("Variant generation failed:", err);
+			await stream.writeSSE({
+				event: "error",
+				data: JSON.stringify({ error: "Variant generation failed" }),
+			});
+		}
+
+		await stream.writeSSE({
+			event: "done",
+			data: JSON.stringify({ status: "complete" }),
 		});
 	});
 });

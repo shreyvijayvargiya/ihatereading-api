@@ -164,6 +164,35 @@ export const uiBlocksBrutal = {
   <p class="text-black font-bold leading-tight">Optimized for high-speed delivery and zero latency. No fluff, just performance.</p>
 </div>`,
 	},
+	"navbar-brutal": {
+		tags: ["brutal", "navbar", "navigation", "yellow", "black-border"],
+		code: `
+<nav class="border-b-8 border-black bg-white px-8 py-6">
+  <div class="max-w-7xl mx-auto flex justify-between items-center">
+    <div class="text-4xl font-black italic tracking-tighter bg-yellow-400 border-4 border-black px-4 py-1 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">BRUTAL.</div>
+    <div class="hidden md:flex gap-10 font-black uppercase italic">
+      <a href="#" class="hover:bg-cyan-300 px-2">Work</a>
+      <a href="#" class="hover:bg-lime-400 px-2">About</a>
+      <a href="#" class="hover:bg-pink-400 px-2">Pricing</a>
+    </div>
+    <button class="border-4 border-black bg-black text-white px-6 py-2 font-black uppercase hover:bg-white hover:text-black transition-colors shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] active:shadow-none">Login</button>
+  </div>
+</nav>`,
+	},
+	"hero-brutal": {
+		tags: ["brutal", "hero", "marketing", "yellow", "cyan", "black-border"],
+		code: `
+<section class="py-24 px-8 bg-cyan-300 border-b-8 border-black">
+  <div class="max-w-5xl mx-auto text-center">
+    <h1 class="text-7xl md:text-9xl font-black text-black leading-none uppercase italic mb-12 shadow-white drop-shadow-[4px_4px_0px_rgba(0,0,0,1)]">Stop playing <br/> <span class="bg-yellow-400 border-4 border-black px-4">safe.</span></h1>
+    <p class="text-2xl font-black text-black mb-12 max-w-2xl mx-auto border-4 border-black bg-white p-6 shadow-[8px_8px_0px_0px_rgba(0,0,0,1)]">The world belongs to the bold. Build interfaces that demand attention and refuse to be ignored.</p>
+    <div class="flex flex-col sm:flex-row justify-center gap-6">
+      <button class="bg-black text-white text-3xl font-black px-12 py-6 border-4 border-black shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all">JOIN NOW</button>
+      <button class="bg-white text-black text-3xl font-black px-12 py-6 border-4 border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all">LEARN MORE</button>
+    </div>
+  </div>
+</section>`,
+	},
 };
 
 /**
@@ -188,6 +217,27 @@ export const uiBlocksMinimal = {
   <h3 class="text-lg font-semibold text-zinc-900 mb-2">Knowledge Base</h3>
   <p class="text-sm text-zinc-500 leading-relaxed">Centralize your team's documentation and guides in one organized place.</p>
 </div>`,
+	},
+	"navbar-minimal": {
+		tags: ["minimal", "navbar", "navigation", "zinc", "white"],
+		code: `
+<nav class="border-b border-zinc-200 bg-white/50 backdrop-blur-sm px-4 py-3">
+  <div class="max-w-7xl mx-auto flex justify-between items-center">
+    <div class="flex items-center gap-2 font-semibold text-zinc-900">
+      <img src="https://unpkg.com/lucide-static@latest/icons/box.svg" class="w-5 h-5" />
+      <span>Minimal</span>
+    </div>
+    <div class="flex gap-6 text-sm text-zinc-500 font-medium">
+      <a href="#" class="hover:text-zinc-900 transition-colors">Docs</a>
+      <a href="#" class="hover:text-zinc-900 transition-colors">Templates</a>
+      <a href="#" class="hover:text-zinc-900 transition-colors">API</a>
+    </div>
+    <div class="flex items-center gap-3">
+      <button class="text-sm font-medium text-zinc-500 hover:text-zinc-900">Log in</button>
+      <button class="bg-zinc-900 text-white px-3 py-1.5 rounded-md text-sm font-medium hover:bg-zinc-800">Sign up</button>
+    </div>
+  </div>
+</nav>`,
 	},
 };
 
@@ -228,6 +278,27 @@ export const uiBlocksCyber = {
     <div class="absolute inset-y-0 left-0 bg-cyan-500 w-[84%] shadow-[0_0_10px_#06b6d4]"></div>
   </div>
 </div>`,
+	},
+	"navbar-cyber": {
+		tags: ["cyber", "navbar", "dark", "neon", "cyan"],
+		code: `
+<nav class="bg-black border-b border-cyan-500/30 px-6 py-4 relative">
+  <div class="absolute bottom-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent"></div>
+  <div class="max-w-7xl mx-auto flex justify-between items-center">
+    <div class="flex items-center gap-4">
+      <div class="w-10 h-10 border border-cyan-500 rotate-45 flex items-center justify-center">
+        <div class="w-6 h-6 bg-cyan-500 -rotate-45"></div>
+      </div>
+      <span class="text-2xl font-black tracking-widest text-white uppercase italic">CyberOS</span>
+    </div>
+    <div class="hidden md:flex gap-10 text-[10px] font-mono uppercase tracking-[0.4em] text-cyan-500/60">
+      <a href="#" class="hover:text-cyan-400 transition-colors">Nodes</a>
+      <a href="#" class="hover:text-cyan-400 transition-colors">Protocols</a>
+      <a href="#" class="hover:text-cyan-400 transition-colors">Mainnet</a>
+    </div>
+    <button class="px-6 py-2 border border-cyan-500 text-cyan-500 font-mono text-xs uppercase tracking-widest hover:bg-cyan-500 hover:text-black transition-all">Connect Wallet</button>
+  </div>
+</nav>`,
 	},
 };
 
