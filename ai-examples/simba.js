@@ -4,6 +4,8 @@ import { streamSSE } from "hono/streaming";
 import OpenAI from "openai";
 import { cors } from "hono/cors";
 import dotenv from "dotenv";
+import { readFileSync } from "fs";
+import path from "path";
 import {
 	uiBlockLibrary,
 	uiBlocksBrutal,
@@ -20,6 +22,7 @@ import {
 import { templates } from "./templates.js";
 import cosineSimilarity from "../utils/cosineSimilarity.js";
 import { fetchUnsplash } from "../utils/unsplash.js";
+import { load as cheerioLoad } from "cheerio";
 
 dotenv.config();
 
@@ -181,27 +184,28 @@ Required JSON Shape
 
 const architectureAgentPrompt = `
 [C] CONTEXT
-You are the second agent. You convert product intent into page-level structural architecture.
+You are the second agent. You convert product intent into page-level structural architecture. Your output is MANDATORY for the renderer—every region you list MUST be filled with HTML; missing regions mean incomplete pages.
 
 [R] ROLE
-You are a Principal UX Architect. You define layout logic, hierarchy, and regions, not visuals.
+You are a Principal UX Architect. You define layout logic, hierarchy, and regions, not visuals. You MUST NOT omit standard regions (navbar, hero, cards/sections, footer) unless explicitly excluded by intent.
 
-[I] INFORMATION
-You receive:
-- Intent JSON from Agent A
-- Target Page object to architect
+[S] SPECIFICATION (STRICT & MANDATORY)
+- Output ONLY valid JSON. One output object for the requested page. NO HTML, NO Tailwind, NO copy. DO NOT invent pages.
+- The "regions" array MUST be COMPLETE. Every region required for a full page MUST be listed. Omission of a required region makes the architecture INVALID.
 
-[S] SPECIFICATION (STRICT)
-Output ONLY valid JSON
-One output object for the requested page
-NO HTML, NO Tailwind, NO copy
-DO NOT invent pages
+MANDATORY REGIONS (include ALL that apply; do NOT skip):
+- Navbar/Header: REQUIRED for almost every page (e-commerce, landing, dashboard, blog). Include: logo, nav links, primary CTA, optional cart/search. Exception: only omit if intent explicitly says "no navigation".
+- Hero/Banner: REQUIRED for landing and marketing pages. Include: headline, subheadline, primary CTA, optional image.
+- Content sections: REQUIRED. Define each distinct section (e.g. features, product-grid, testimonials, pricing cards, FAQ). E-commerce: MUST include product cards/grid or product list. Landing: MUST include features and at least one cards/benefits section.
+- Footer: REQUIRED unless intent explicitly excludes it. Include: links, copyright, optional newsletter/social.
+- For dashboards/CRM: sidebar or top nav, main content regions, cards/widgets. Do NOT omit sidebar when the archetype is dashboard/CRM.
 
-You MUST:
-- Select a layout archetype per page
-- Define major regions (header, hero, features, footer, etc.)
-- For each region, define its purpose and required data elements
-- Ensure production completeness: navigation presence, primary action zone, secondary/supporting content, system states where relevant (empty, error, loading)
+Domain-specific (MANDATORY):
+- E-commerce: regions MUST include navbar (with cart/account), hero or promo banner, product grid or product cards section, CTA/checkout area, footer.
+- Landing/marketing: navbar, hero, features/cards section, social proof or testimonials, CTA section, footer.
+- Dashboard/tool: navigation (sidebar or top), main content area, at least one cards/stats/list region.
+
+For each region you MUST provide: "name", "purpose", and "elements" (array of concrete data elements e.g. "headline", "cta", "feature-grid", "product-cards", "nav-links", "logo"). Be specific so the renderer can fill every element.
 
 Required JSON Shape
 {
@@ -211,41 +215,38 @@ Required JSON Shape
     {
       "name": "",
       "purpose": "",
-      "elements": ["list of data elements like 'headline', 'cta', 'feature-grid'"]
+      "elements": ["list of data elements like 'headline', 'cta', 'feature-grid', 'product-cards', 'nav-links'"]
     }
   ],
   "hierarchy": "primary | secondary | tertiary"
 }
 
-[P] PERFORMANCE
-Every page is renderable without guessing
-Density matches region count
-Archetypes evolve beyond trivial templates
+[P] PERFORMANCE (MANDATORY)
+- Every page MUST be fully renderable: every region has a purpose and elements. No guessing, no missing navbar/cards/footer.
+- Density matches region count. Archetypes evolve beyond trivial templates.
+- FAIL: Output is INVALID if navbar is required by domain but missing, or if content sections (e.g. cards, product grid) are missing, or if footer is required but missing.
 `;
 
 const rendererAgentPrompt = `
 [C] CONTEXT
-You are the final execution agent. You render production-grade HTML from structured architecture and constraints.
+You are the final execution agent. You render production-grade HTML from structured architecture and constraints. Your output is STRICTLY and MANDATORILY bound to the Page Architecture and the REFERENCE TEMPLATE / CORE BLOCKS—every region and element from the architecture MUST appear in the HTML, fully filled. No missing sections, no empty placeholders.
 
 [R] ROLE
 You are Simba — a World-Class UI/UX Designer & Senior Frontend Engineer with 15 years of experience.
-You ship only production-ready work.
+You ship only production-ready work. You MUST fill the entire page as specified: every region from the architecture (navbar, hero, cards, footer, etc.) MUST be present and complete in the HTML.
 
 [I] INFORMATION
 You receive:
-- Page structure from Agent B
+- Page structure from Agent B (MANDATORY: implement every region listed)
 - Full Intent context from Agent A
 - Image requirements from Asset Planner
 - Design System object
 - Simba UI Library patterns
 
-[S] SPECIFICATION (STRICT)
+[S] SPECIFICATION (STRICT & MANDATORY)
 OUTPUT RULES
-- Output ONLY raw HTML
-- Start with <!DOCTYPE html>
-- One optional HTML comment at the very top (design strategy)
-- NO markdown
-- NO explanations
+- Output ONLY raw HTML. Start with <!DOCTYPE html>. One optional HTML comment at the very top (design strategy). NO markdown. NO explanations.
+- STRICTLY implement EVERY region from the Page Architecture: if architecture has navbar, hero, features, cards, footer—your HTML MUST include all of them, fully filled with real content. Omission of any architecture region makes the output INVALID.
 
 TECH STACK
 - HTML5
@@ -253,12 +254,11 @@ TECH STACK
 - Lucide SVG icons ONLY (using unpkg.com/lucide-static)
 - Google Fonts ONLY (❌ Forbidden: Inter, Roboto, Arial, Space Grotesk)
 
-🔒 HARD QUALITY RULES (NON-NEGOTIABLE)
-- NO ICON, NO ACTION
-- NO GENERIC DATA
-- NO PLACEHOLDERS
-- Every button, tab, link: Visible boundary, Icon, Hover + focus state
-- Every section: Complete content, Realistic copy, Production-grade detail
+🔒 HARD QUALITY RULES (STRICT & MANDATORY — NON-NEGOTIABLE)
+- NO ICON, NO ACTION: every interactive element must have an icon and clear action.
+- NO GENERIC DATA; NO PLACEHOLDERS. Copy MUST be realistic and domain-specific.
+- Every button, tab, link: MANDATORY visible boundary, Icon, Hover + focus state.
+- Every section: MANDATORY complete content, realistic copy, production-grade detail. No empty or half-filled sections.
 
 🎨 DESIGN SYSTEM (TOON)
 Apply provided theme tokens only. No new colors, shadows, or radii. Contrast strict.
@@ -282,12 +282,15 @@ Color: primary → brand-600 | surface → neutral-50 | text → neutral-900
 - Match orientation (landscape/portrait) to the layout usage.
 
 ## [L] SIMBA UI LIBRARY (CORE BLOCKS)
-You MUST use the following snippet patterns as architectural foundations. These are carefully selected based on the user's request:
+Your page MUST be composed from these blocks. Use their markup and Tailwind patterns; adapt copy and images to the intent. Do NOT replace them with different layouts or components. If multiple blocks are provided, use them in the order given or as specified by Page Architecture.
 \${RELEVANT_BLOCKS}
 
 ## [D] REFERENCE TEMPLATE
-Use the structure and quality of this relevant example as a guide:
+Your output MUST follow this template's structure: same section order, same high-level layout (hero, nav, sections, footer). Only replace content (text, images) and apply the design system; do NOT change the template's structure or invent new sections.
 \${RELEVANT_TEMPLATE_CODE}
+
+## STRICT USE
+The HTML you output MUST (1) follow the section order and layout of the REFERENCE TEMPLATE above, and (2) use the markup/patterns from the CORE BLOCKS above. Do NOT invent a different page structure or ignore the template/blocks.
 
 [P] PERFORMANCE
 - Zero visual bugs
@@ -296,41 +299,30 @@ Use the structure and quality of this relevant example as a guide:
 - No “AI slop”
 - Looks like it shipped from a real company
 
-## 🧱 PRODUCTION COMPLETENESS CONTRACT
-You MUST ensure ALL of the following are true:
+## 🧱 PRODUCTION COMPLETENESS CONTRACT (STRICT & MANDATORY)
+You MUST ensure ALL of the following are true. Failure on any point makes the output INVALID.
 
-STRUCTURE
-- No empty sections
-- No single-element sections unless intentional (hero)
-- Navigation present where required
-- Footer always present unless explicitly excluded
+STRUCTURE (MANDATORY)
+- No empty sections. Every region from Page Architecture MUST be present and fully filled in the HTML (navbar, hero, cards/sections, footer as specified).
+- No single-element sections unless intentional (e.g. hero). Cards and content sections MUST have multiple elements as appropriate.
+- Navigation (navbar/header) MUST be present where required by architecture or domain (e.g. e-commerce, landing). Include logo, links, primary CTA; e-commerce must include cart/account when applicable.
+- Footer MUST always be present unless explicitly excluded by intent.
 
-INTERACTION
-- Every clickable element MUST have:
-  - hover state
-  - focus state
-  - active state
-- Every card MUST have at least one interaction (hover or click)
+INTERACTION (MANDATORY)
+- Every clickable element MUST have: hover state, focus state, active state.
+- Every card MUST have at least one interaction (hover or click).
 
-MOTION (REQUIRED)
-- Use subtle motion for:
-  - section entry (fade/slide)
-  - hover elevation for cards
-  - button feedback
-- Motion must be CSS-only (no JS)
-- Use transition + transform utilities
+MOTION (MANDATORY)
+- Use subtle motion for: section entry (fade/slide), hover elevation for cards, button feedback. Motion must be CSS-only (no JS). Use transition + transform utilities.
 
-CONTENT
-- No placeholders
-- No "Lorem ipsum"
-- Copy must be realistic and specific to the domain
+CONTENT (MANDATORY)
+- No placeholders. No "Lorem ipsum". Copy must be realistic and specific to the domain.
 
-VISUAL DEPTH
-- Flat UI is forbidden
-- Use spacing, shadows, or borders to separate layers
+VISUAL DEPTH (MANDATORY)
+- Flat UI is forbidden. Use spacing, shadows, or borders to separate layers.
 
-FAIL CONDITION
-If ANY rule is violated, the output is INVALID.
+FAIL CONDITION (STRICT)
+If ANY rule is violated, the output is INVALID. Output is also INVALID if: the page structure does not follow the REFERENCE TEMPLATE; you did not use the provided CORE BLOCKS; any region from the Page Architecture is missing or empty in the HTML (e.g. missing navbar, missing cards section, missing footer).
 `;
 
 const imageAssetAgentPrompt = `
@@ -563,6 +555,63 @@ You are a CSS/Tailwind Optimizer. You rewrite styling to match a specific design
 - Prioritize speed and fidelity.
 `;
 
+const convertAgentPrompt = `
+[C] CONTEXT
+You are a strict code-conversion agent. You convert in ONE direction per request, vice versa:
+• Input HTML  → Output React code (one component).
+• Input React → Output HTML (full document or fragment).
+You do NOT add, remove, or reinterpret—translate the ENTIRE input as-is into the target format.
+
+[R] ROLE — VICE VERSA
+1) When the user sends HTML (direction: HTML → React):
+   - Read the ENTIRE HTML (all sections, all elements).
+   - Output ONLY raw React/JSX: one file, one default-export component.
+   - Use: lucide-react (icons), framer-motion (motion), Tailwind (className). Import others only if needed.
+   - Map: class → className, for → htmlFor. Keep all Tailwind/inline styles. SVG/icons → Lucide where applicable.
+   - Preserve every section and element. No summaries or placeholders. If prompt/designSystem is given, apply tokens without changing structure.
+
+2) When the user sends React code (direction: React → HTML):
+   - Read the ENTIRE React/JSX (all components and JSX).
+   - Output ONLY raw HTML: full document or fragment that matches the same UI.
+   - Map: className → class. React state → static HTML (e.g. default/first visible state). Keep Tailwind classes.
+   - Lucide icons → inline SVG or <img> from unpkg.com/lucide-static. Preserve every section and element.
+
+[S] RULES (BOTH DIRECTIONS)
+- Convert the ENTIRE input. Nothing left behind; nothing new added (except required boilerplate: React imports + one root, or HTML doctype when needed).
+- No markdown, no code fences, no explanations—only the target code.
+- Structure and nesting must match (e.g. 5 sections in → 5 sections out).
+- Fail: omitting any part of the input or injecting new content makes the output invalid.
+`;
+
+function getStructureFingerprint(type, code) {
+	if (!code || typeof code !== "string") return "";
+	const trimmed = code.trim();
+	if (!trimmed) return "";
+	if (type === "html") {
+		try {
+			const $ = cheerioLoad(trimmed, { xmlMode: false });
+			const names = [];
+			$("*").each((_, el) => {
+				const tag = el.tagName?.toLowerCase();
+				if (tag) names.push(tag);
+			});
+			return names.join(",");
+		} catch {
+			return "";
+		}
+	}
+	if (type === "react") {
+		const tagRegex = /<([A-Za-z][A-Za-z0-9]*)\s|<\s*([A-Za-z][A-Za-z0-9]*)\s/g;
+		const names = [];
+		let m;
+		while ((m = tagRegex.exec(trimmed)) !== null) {
+			names.push((m[1] || m[2] || "").toLowerCase());
+		}
+		return names.join(",");
+	}
+	return "";
+}
+
 // Agent Helper Functions
 async function callEditIntentAgent({ prompt, currentAppContext }) {
 	const response = await openai.chat.completions.create({
@@ -722,7 +771,7 @@ async function callRenderAgent({
 			},
 			{
 				role: "user",
-				content: `Intent Context: ${JSON.stringify(intent)}\nPage Architecture: ${JSON.stringify(architecture)}\nImage Assets: ${JSON.stringify(images)}\nDesign System: ${JSON.stringify(designSystem)}`,
+				content: `Intent Context: ${JSON.stringify(intent)}\nPage Architecture: ${JSON.stringify(architecture)}\nImage Assets: ${JSON.stringify(images)}\nDesign System: ${JSON.stringify(designSystem)}\n\nReminder (STRICT & MANDATORY): (1) Your HTML must include EVERY region from Page Architecture (navbar, hero, cards/sections, footer—all fully filled). (2) Follow the REFERENCE TEMPLATE structure and use the CORE BLOCKS from the system prompt. Do not omit any section or generate a different layout.`,
 			},
 		],
 	});
@@ -756,6 +805,96 @@ async function callVariantAgent({ html, styleExamples }) {
 	};
 }
 
+function stripCodeFences(raw, lang) {
+	let s = raw.trim();
+	s = s
+		.replace(/^```(?:html|jsx|tsx|javascript|js)\n?/i, "")
+		.replace(/\n?```$/i, "");
+	s = s.replace(/^```\n?/, "").replace(/\n?```$/, "");
+	return s.trim();
+}
+
+async function callConvertAgent({ html, reactCode, prompt, designSystem }) {
+	const hasHtml = html != null && String(html).trim() !== "";
+	const hasReactCode = reactCode != null && String(reactCode).trim() !== "";
+
+	if (hasHtml && hasReactCode) {
+		throw new Error(
+			"Provide exactly one of html or reactCode: html → React code, reactCode → HTML",
+		);
+	}
+	if (!hasHtml && !hasReactCode) {
+		throw new Error(
+			"Provide either html (to get React code) or reactCode (to get HTML)",
+		);
+	}
+
+	const isHtmlToReact = hasHtml;
+	const isReactToHtml = hasReactCode;
+
+	const inputFingerprint = isReactToHtml
+		? getStructureFingerprint("react", reactCode)
+		: getStructureFingerprint("html", html);
+
+	const buildUserMessage = (feedback) => {
+		const parts = [];
+		if (isHtmlToReact) {
+			parts.push("DIRECTION: HTML → React");
+			parts.push(`HTML:\n${html}`);
+		} else {
+			parts.push("DIRECTION: React → HTML");
+			parts.push(`REACT CODE:\n${reactCode}`);
+		}
+		if (prompt) parts.push(`\nPrompt/context: ${prompt}`);
+		if (designSystem && Object.keys(designSystem).length > 0) {
+			parts.push(`\nDesign system: ${JSON.stringify(designSystem)}`);
+		}
+		if (feedback) parts.push(`\n[FEEDBACK] ${feedback}`);
+		return parts.join("\n");
+	};
+
+	let userContent = buildUserMessage();
+	const response = await openai.chat.completions.create({
+		model: "openai/gpt-4o-mini",
+		messages: [
+			{ role: "system", content: convertAgentPrompt },
+			{ role: "user", content: userContent },
+		],
+	});
+	let output = response.choices[0].message.content;
+	output = stripCodeFences(output, isHtmlToReact ? "jsx" : "html");
+
+	const outputFingerprint = isHtmlToReact
+		? getStructureFingerprint("react", output)
+		: getStructureFingerprint("html", output);
+
+	const hasSignificantDiff =
+		inputFingerprint.length > 0 &&
+		outputFingerprint.length > 0 &&
+		inputFingerprint !== outputFingerprint;
+
+	let usage = response.usage;
+	if (hasSignificantDiff) {
+		const feedback = `Structure mismatch. Preserve exact structure. Input structure (tag sequence): ${inputFingerprint.slice(0, 500)}. Output had: ${outputFingerprint.slice(0, 500)}. Convert again without omitting or adding nodes.`;
+		const retryResponse = await openai.chat.completions.create({
+			model: "openai/gpt-4o-mini",
+			messages: [
+				{ role: "system", content: convertAgentPrompt },
+				{ role: "user", content: buildUserMessage(feedback) },
+			],
+		});
+		output = retryResponse.choices[0].message.content;
+		output = stripCodeFences(output, isHtmlToReact ? "jsx" : "html");
+		usage = retryResponse.usage;
+	}
+
+	return {
+		...(isHtmlToReact ? { reactCode: output } : { html: output }),
+		direction: isHtmlToReact ? "html-to-react" : "react-to-html",
+		usage,
+	};
+}
+
 // Internal Agent Methods (Encapsulated)
 const agents = {
 	intent: callIntentAgent,
@@ -767,6 +906,7 @@ const agents = {
 	aiEdit: callAiEditAgent,
 	regenerate: callRegenerateAgent,
 	variant: callVariantAgent,
+	convert: callConvertAgent,
 };
 
 // Main Public Orchestrator
@@ -1184,6 +1324,42 @@ app.post("/generate-variant", async (c) => {
 			data: JSON.stringify({ status: "complete" }),
 		});
 	});
+});
+
+// Convert: HTML ↔ React (one endpoint, one prompt)
+app.post("/convert-to-code", async (c) => {
+	try {
+		const body = await c.req.json();
+		const { html, prompt, designSystem } = body;
+		const reactCode = await readFileSync(
+			path.join(
+				path.basename(import.meta.url),
+				"../frontend/SampleLandingPage.jsx",
+			),
+			"utf8",
+		);
+
+		const result = await agents.convert({
+			html: html ?? null,
+			reactCode: reactCode ?? null,
+			prompt: prompt ?? "",
+			designSystem: designSystem ?? {},
+		});
+
+		return c.json({
+			ok: true,
+			...result,
+		});
+	} catch (err) {
+		console.error("Convert failed:", err);
+		return c.json(
+			{
+				ok: false,
+				error: err.message || "Convert failed",
+			},
+			400,
+		);
+	}
 });
 
 const port = 3002;
