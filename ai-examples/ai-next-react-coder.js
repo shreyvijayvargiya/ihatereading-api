@@ -28,7 +28,20 @@ async function getEmbedding(text) {
 			model: "openai/text-embedding-3-small",
 			input: text,
 		});
-		return response.data[0].embedding;
+		if (
+			response &&
+			response.data &&
+			Array.isArray(response.data) &&
+			response.data[0] &&
+			response.data[0].embedding
+		) {
+			return response.data[0].embedding;
+		}
+		console.error(
+			"Embedding API returned unexpected format:",
+			JSON.stringify(response),
+		);
+		return null;
 	} catch (error) {
 		console.error("Embedding API error:", error);
 		return null;

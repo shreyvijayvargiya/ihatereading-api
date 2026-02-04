@@ -9,7 +9,10 @@
 	"scripts": {
 		"start": "node index.js",
 		"dev": "nodemon index.js",
+		"ai-designer": "nodemon ai-examples/ai-designer.js",
 		"simba": "nodemon ai-examples/simba.js",
+		"simba:ui-system": "nodemon ai-examples/simba-ui-system.js",
+		"simba:monolithic": "nodemon ai-examples/simba-monolithic.js",
 		"ai-next-react-coder": "nodemon ai-examples/ai-next-react-coder.js",
 		"dev:profiler": "nodemon index.js --firebase_env=profiler",
 		"build": "npm install && npm install --only=dev",

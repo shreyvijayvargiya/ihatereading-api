@@ -1,0 +1,367 @@
+<html lang="en"><head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbit - Modern DevTools</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&amp;display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        /* Custom scrollbar for light theme */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #f8fafc; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        /* Subtle gradients */
+        .glass-nav {
+            background: rgba(255, 255, 255, 0.8);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+        }
+        
+        .hero-glow {
+            background: radial-gradient(circle at center, rgba(99, 102, 241, 0.08) 0%, rgba(255, 255, 255, 0) 60%);
+        }
+        
+        .card-gradient {
+            background: linear-gradient(180deg, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0) 100%);
+        }
+    </style>
+</head>
+<body class="bg-white text-slate-600 antialiased selection:bg-indigo-100 selection:text-indigo-700">
+
+    <!-- Navigation -->
+    <nav class="fixed top-0 w-full z-50 glass-nav">
+        <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2">
+                <div class="w-6 h-6 rounded bg-gradient-to-br from-indigo-600 to-purple-600 flex items-center justify-center text-white text-xs font-bold shadow-sm">O</div>
+                <span class="text-slate-900 font-semibold tracking-tight">orbit</span>
+            </div>
+            
+            <div class="hidden md:flex items-center gap-8 text-sm font-medium text-slate-500">
+                <a href="#" class="hover:text-slate-900 transition-colors">Features</a>
+                <a href="#" class="hover:text-slate-900 transition-colors">Methodology</a>
+                <a href="#" class="hover:text-slate-900 transition-colors">Customers</a>
+                <a href="#" class="hover:text-slate-900 transition-colors">Changelog</a>
+            </div>
+
+            <div class="flex items-center gap-4">
+                <a href="#" class="hidden sm:block text-xs font-medium text-slate-500 hover:text-slate-900 transition-colors">Log in</a>
+                <a href="#" class="group relative inline-flex h-8 items-center justify-center overflow-hidden rounded-full bg-slate-900 px-4 font-medium text-white shadow ring-1 ring-slate-950/10 transition-all hover:bg-slate-800 hover:ring-slate-950/20 focus:outline-none focus:ring-2 focus:ring-slate-950 focus:ring-offset-2">
+                    <span class="relative text-xs">Get Started</span>
+                    <iconify-icon icon="solar:arrow-right-linear" stroke-width="1.5" class="ml-1 text-slate-400 transition-transform group-hover:translate-x-0.5"></iconify-icon>
+                </a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <main class="overflow-hidden pt-32 pb-20 relative">
+        <!-- Abstract Background Glow -->
+        <div class="absolute top-0 left-1/2 -translate-x-1/2 w-[1000px] h-[800px] hero-glow pointer-events-none"></div>
+
+        <div class="max-w-4xl mx-auto px-6 text-center relative z-10">
+            <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-indigo-200 bg-indigo-50 text-indigo-700 text-xs font-medium mb-8 shadow-sm">
+                <span class="relative flex h-2 w-2">
+                  <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                  <span class="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                </span>
+                Orbit v2.0 is now available
+            </div>
+            
+            <h1 class="text-5xl md:text-7xl font-bold text-slate-900 tracking-tight mb-6 leading-[1.1]">
+                Sync your engineering <br>
+                <span class="text-transparent bg-clip-text bg-gradient-to-r from-slate-900 via-slate-700 to-slate-900">at the speed of thought.</span>
+            </h1>
+            
+            <p class="text-lg text-slate-500 max-w-2xl mx-auto mb-10 leading-relaxed font-normal">
+                The integrated workspace for modern product teams. Linear workflows, real-time collaboration, and automated insights in one place.
+            </p>
+
+            <div class="flex flex-col sm:flex-row items-center justify-center gap-3 mb-16">
+                <div class="relative w-full sm:w-80 shadow-sm rounded-md">
+                    <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                        <iconify-icon icon="solar:letter-linear" class="text-slate-400 text-lg" stroke-width="1.5"></iconify-icon>
+                    </div>
+                    <input type="email" placeholder="Enter work email..." class="placeholder-slate-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all text-sm text-slate-900 bg-white w-full h-10 border-slate-200 border rounded-md pr-4 pl-10">
+                </div>
+                <button class="h-10 px-6 rounded-md bg-white text-slate-900 text-sm font-semibold border border-slate-200 hover:bg-slate-50 hover:border-slate-300 transition-all shadow-sm w-full sm:w-auto">
+                    Start Building
+                </button>
+            </div>
+
+            <!-- Dashboard Preview -->
+            <div class="relative mx-auto max-w-5xl rounded-xl border border-slate-200 bg-white shadow-2xl shadow-slate-200/50 overflow-hidden group">
+                <!-- Browser Header -->
+                <div class="h-10 border-b border-slate-100 bg-slate-50 flex items-center px-4 gap-2">
+                    <div class="flex gap-1.5">
+                        <div class="w-2.5 h-2.5 rounded-full bg-slate-200 border border-slate-300"></div>
+                        <div class="w-2.5 h-2.5 rounded-full bg-slate-200 border border-slate-300"></div>
+                        <div class="w-2.5 h-2.5 rounded-full bg-slate-200 border border-slate-300"></div>
+                    </div>
+                    <div class="ml-4 flex-1 h-5 rounded bg-white border border-slate-200 max-w-[200px] shadow-sm"></div>
+                </div>
+                
+                <!-- Interface Content -->
+                <div class="p-6 grid grid-cols-12 gap-6 h-[400px] bg-white">
+                    <!-- Sidebar -->
+                    <div class="col-span-3 border-r border-slate-100 pr-6 flex flex-col gap-4">
+                        <div class="flex items-center justify-between text-slate-400 mb-2">
+                            <span class="text-xs font-semibold uppercase tracking-wider">Workspace</span>
+                            <iconify-icon icon="solar:add-circle-linear" class="text-base cursor-pointer hover:text-indigo-600 transition-colors"></iconify-icon>
+                        </div>
+                        <div class="space-y-1">
+                            <div class="flex items-center gap-2 px-2 py-1.5 rounded bg-indigo-50 text-indigo-700 text-xs font-medium border border-indigo-100">
+                                <iconify-icon icon="solar:inbox-linear" stroke-width="1.5"></iconify-icon>
+                                Inbox
+                                <span class="ml-auto text-[10px] bg-indigo-600 text-white px-1.5 rounded-full font-bold">4</span>
+                            </div>
+                            <div class="flex items-center gap-2 px-2 py-1.5 rounded text-slate-600 hover:text-slate-900 hover:bg-slate-50 transition-colors text-xs font-medium cursor-pointer">
+                                <iconify-icon icon="solar:document-text-linear" stroke-width="1.5"></iconify-icon>
+                                Projects
+                            </div>
+                            <div class="flex items-center gap-2 px-2 py-1.5 rounded text-slate-600 hover:text-slate-900 hover:bg-slate-50 transition-colors text-xs font-medium cursor-pointer">
+                                <iconify-icon icon="solar:users-group-rounded-linear" stroke-width="1.5"></iconify-icon>
+                                Team
+                            </div>
+                        </div>
+                        
+                        <div class="mt-auto p-3 rounded-lg bg-slate-50 border border-slate-200">
+                            <div class="flex items-center gap-3">
+                                <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-emerald-400 to-teal-300 border border-white shadow-sm"></div>
+                                <div>
+                                    <div class="text-xs text-slate-900 font-semibold">System Status</div>
+                                    <div class="text-[10px] text-emerald-600 flex items-center gap-1 font-medium">
+                                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                                        Operational
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Main Area -->
+                    <div class="col-span-9 flex flex-col">
+                        <div class="flex items-center justify-between mb-6">
+                            <h3 class="text-slate-900 text-sm font-semibold">Q3 Sprint Planning</h3>
+                            <div class="flex -space-x-2">
+                                <div class="w-6 h-6 rounded-full border-2 border-white bg-slate-200"></div>
+                                <div class="w-6 h-6 rounded-full border-2 border-white bg-slate-300"></div>
+                                <div class="w-6 h-6 rounded-full border-2 border-white bg-slate-400 flex items-center justify-center text-[10px] text-white font-medium shadow-sm">+3</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Kanban Board Simulation -->
+                        <div class="grid grid-cols-3 gap-4 h-full">
+                            <!-- Column 1 -->
+                            <div class="bg-slate-50 rounded-lg p-3 border border-slate-100 flex flex-col gap-3">
+                                <div class="flex items-center gap-2 text-xs text-slate-500 font-medium mb-1">
+                                    <div class="w-2 h-2 rounded-full border border-slate-400"></div>
+                                    To Do
+                                </div>
+                                <div class="p-3 bg-white border border-slate-200 rounded shadow-sm group/card hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer">
+                                    <div class="flex items-start justify-between mb-2">
+                                        <span class="text-xs text-slate-700 font-medium">API Migration</span>
+                                        <iconify-icon icon="solar:menu-dots-linear" class="text-slate-400"></iconify-icon>
+                                    </div>
+                                    <div class="flex items-center gap-2 mt-2">
+                                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-orange-50 text-orange-600 border border-orange-200 font-medium">High</span>
+                                    </div>
+                                </div>
+                                <div class="p-3 bg-white border border-slate-200 rounded shadow-sm group/card hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer">
+                                    <div class="flex items-start justify-between mb-2">
+                                        <span class="text-xs text-slate-700 font-medium">Mobile Auth</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Column 2 -->
+                            <div class="bg-slate-50 rounded-lg p-3 border border-slate-100 flex flex-col gap-3">
+                                <div class="flex items-center gap-2 text-xs text-slate-500 font-medium mb-1">
+                                    <div class="w-2 h-2 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin"></div>
+                                    In Progress
+                                </div>
+                                <div class="p-3 bg-white border border-slate-200 rounded shadow-sm group/card hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer ring-1 ring-indigo-100">
+                                    <div class="flex items-start justify-between mb-2">
+                                        <span class="text-xs text-slate-900 font-medium">Dashboard V2</span>
+                                    </div>
+                                    <div class="w-full bg-slate-100 h-1 rounded-full mt-2 overflow-hidden">
+                                        <div class="bg-indigo-500 h-full w-2/3"></div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Column 3 -->
+                            <div class="bg-slate-50 rounded-lg p-3 border border-slate-100 flex flex-col gap-3 opacity-60">
+                                <div class="flex items-center gap-2 text-xs text-slate-500 font-medium mb-1">
+                                    <div class="w-2 h-2 rounded-full bg-emerald-500"></div>
+                                    Done
+                                </div>
+                                <div class="p-3 bg-white border border-slate-200 rounded shadow-sm">
+                                    <div class="flex items-start justify-between mb-2">
+                                        <span class="text-xs text-slate-400 font-medium line-through decoration-slate-300">User Settings</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Overlay Gradient Bottom -->
+                <div class="absolute bottom-0 left-0 w-full h-24 bg-gradient-to-t from-white to-transparent pointer-events-none"></div>
+            </div>
+            
+            <!-- Brands -->
+            <div class="mt-20 pt-10 border-t border-slate-100">
+                <p class="text-xs text-slate-400 font-semibold mb-8 uppercase tracking-wider">Trusted by engineers at</p>
+                <div class="flex flex-wrap justify-center gap-x-12 gap-y-8 opacity-60 grayscale hover:grayscale-0 transition-all duration-500">
+                    <!-- Simple Text Logos using Fonts -->
+                    <span class="text-lg font-bold tracking-tighter text-slate-800">ACME<span class="text-indigo-600">.</span></span>
+                    <span class="text-lg font-semibold tracking-tight text-slate-800 flex items-center gap-1"><div class="w-3 h-3 bg-slate-800 rounded-full"></div>Global</span>
+                    <span class="text-lg font-bold tracking-widest text-slate-800 italic">STRATUM</span>
+                    <span class="text-lg font-medium tracking-tight text-slate-800 flex items-center gap-1">nex<span class="font-light">us</span></span>
+                    <span class="text-lg font-bold tracking-tight text-slate-800">VORTEX</span>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Features Grid -->
+    <section class="py-24 bg-white relative border-t border-slate-100">
+        <div class="max-w-6xl mx-auto px-6">
+            <div class="mb-16">
+                <h2 class="text-3xl font-bold text-slate-900 tracking-tight mb-4">Built for flow state.</h2>
+                <p class="text-slate-500 text-lg max-w-xl">Every interaction is designed to be instantaneous. No spinners, no waiting, just pure speed.</p>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <!-- Card 1 -->
+                <div class="group relative p-8 rounded-2xl bg-white border border-slate-200 shadow-sm hover:shadow-lg hover:-translate-y-1 transition-all duration-300 overflow-hidden">
+                    <div class="w-10 h-10 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <iconify-icon icon="solar:bolt-linear" class="text-xl" stroke-width="1.5"></iconify-icon>
+                    </div>
+                    <h3 class="text-slate-900 font-semibold text-lg mb-2">Instant Sync</h3>
+                    <p class="text-sm text-slate-500 leading-relaxed">Changes propagate to your team in milliseconds. Our realtime engine handles the complexity.</p>
+                </div>
+
+                <!-- Card 2 -->
+                <div class="group relative p-8 rounded-2xl bg-white border border-slate-200 shadow-sm hover:shadow-lg hover:-translate-y-1 transition-all duration-300 overflow-hidden">
+                    <div class="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-100 flex items-center justify-center text-emerald-600 mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <iconify-icon icon="solar:shield-check-linear" class="text-xl" stroke-width="1.5"></iconify-icon>
+                    </div>
+                    <h3 class="text-slate-900 font-semibold text-lg mb-2">Enterprise Security</h3>
+                    <p class="text-sm text-slate-500 leading-relaxed">SOC2 Type II certified. End-to-end encryption for all sensitive data stored within Orbit.</p>
+                </div>
+
+                <!-- Card 3 -->
+                <div class="group relative p-8 rounded-2xl bg-white border border-slate-200 shadow-sm hover:shadow-lg hover:-translate-y-1 transition-all duration-300 overflow-hidden">
+                    <div class="w-10 h-10 rounded-lg bg-purple-50 border border-purple-100 flex items-center justify-center text-purple-600 mb-6 group-hover:scale-110 transition-transform duration-300">
+                        <iconify-icon icon="solar:widget-2-linear" class="text-xl" stroke-width="1.5"></iconify-icon>
+                    </div>
+                    <h3 class="text-slate-900 font-semibold text-lg mb-2">Extensible API</h3>
+                    <p class="text-sm text-slate-500 leading-relaxed">Build custom workflows with our typed SDK. Integrate with your existing toolchain effortlessly.</p>
+                </div>
+            </div>
+
+            <!-- Bento Grid Section -->
+            <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Wide Card -->
+                <div class="md:col-span-2 p-8 rounded-2xl bg-slate-50 border border-slate-200 flex flex-col md:flex-row gap-8 items-center overflow-hidden">
+                    <div class="flex-1">
+                        <h3 class="text-slate-900 font-semibold text-xl mb-3">Keyboard first design</h3>
+                        <p class="text-sm text-slate-500 leading-relaxed mb-6">Navigate the entire interface without touching your mouse. Command palette, shortcuts, and quick actions are built-in.</p>
+                        <div class="flex gap-2">
+                            <span class="px-2 py-1 rounded bg-white border border-slate-200 shadow-sm text-slate-500 text-xs font-mono">⌘ K</span>
+                            <span class="px-2 py-1 rounded bg-white border border-slate-200 shadow-sm text-slate-500 text-xs font-mono">Shift + F</span>
+                            <span class="px-2 py-1 rounded bg-white border border-slate-200 shadow-sm text-slate-500 text-xs font-mono">/</span>
+                        </div>
+                    </div>
+                    <div class="flex-1 w-full flex justify-center">
+                        <div class="relative w-full max-w-sm h-48 bg-white rounded-lg border border-slate-200 p-4 shadow-xl shadow-slate-200/50">
+                            <div class="absolute top-4 left-4 right-4 h-10 bg-slate-50 rounded border border-slate-200 flex items-center px-3 gap-2">
+                                <iconify-icon icon="solar:magnifer-linear" class="text-slate-400"></iconify-icon>
+                                <span class="text-xs text-slate-400">Search for files...</span>
+                                <span class="ml-auto text-[10px] text-slate-500 border border-slate-200 bg-white px-1.5 rounded">ESC</span>
+                            </div>
+                            <div class="mt-14 space-y-2">
+                                <div class="h-8 w-full bg-indigo-50 border-l-2 border-indigo-500 px-3 flex items-center text-xs text-indigo-700 font-medium">
+                                    <iconify-icon icon="solar:file-code-linear" class="mr-2"></iconify-icon>
+                                    app.tsx
+                                </div>
+                                <div class="h-8 w-full px-3 flex items-center text-xs text-slate-500">
+                                    <iconify-icon icon="solar:file-text-linear" class="mr-2"></iconify-icon>
+                                    README.md
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="border-t border-slate-100 bg-slate-50 pt-16 pb-12">
+        <div class="max-w-6xl mx-auto px-6">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-8 mb-12">
+                <div class="col-span-2 md:col-span-1">
+                    <div class="flex items-center gap-2 mb-4">
+                        <div class="w-5 h-5 rounded bg-slate-900 flex items-center justify-center text-white text-[10px] font-bold">O</div>
+                        <span class="text-slate-900 font-semibold text-sm tracking-tight">orbit</span>
+                    </div>
+                    <p class="text-xs text-slate-500 leading-relaxed">
+                        Designed for the future of work. <br>
+                        San Francisco, CA.
+                    </p>
+                </div>
+                
+                <div>
+                    <h4 class="text-slate-900 text-xs font-semibold mb-4">Product</h4>
+                    <ul class="space-y-3 text-xs text-slate-500">
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Issues</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Roadmap</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Changelog</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Pricing</a></li>
+                    </ul>
+                </div>
+                
+                <div>
+                    <h4 class="text-slate-900 text-xs font-semibold mb-4">Company</h4>
+                    <ul class="space-y-3 text-xs text-slate-500">
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">About</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Careers</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Blog</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Contact</a></li>
+                    </ul>
+                </div>
+
+                <div>
+                    <h4 class="text-slate-900 text-xs font-semibold mb-4">Legal</h4>
+                    <ul class="space-y-3 text-xs text-slate-500">
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Privacy</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Terms</a></li>
+                        <li><a href="#" class="hover:text-slate-900 transition-colors">Security</a></li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="flex flex-col md:flex-row items-center justify-between pt-8 border-t border-slate-200">
+                <p class="text-[10px] text-slate-500">© 2024 Orbit Inc. All rights reserved.</p>
+                <div class="flex gap-4 mt-4 md:mt-0">
+                    <a href="#" class="text-slate-400 hover:text-slate-900 transition-colors">
+                        <iconify-icon icon="solar:brand-twitter-linear" width="16"></iconify-icon>
+                    </a>
+                    <a href="#" class="text-slate-400 hover:text-slate-900 transition-colors">
+                        <iconify-icon icon="solar:brand-github-linear" width="16"></iconify-icon>
+                    </a>
+                    <a href="#" class="text-slate-400 hover:text-slate-900 transition-colors">
+                        <iconify-icon icon="solar:brand-discord-linear" width="16"></iconify-icon>
+                    </a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+</body></html>
