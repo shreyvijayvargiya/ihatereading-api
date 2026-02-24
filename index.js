@@ -5,7 +5,7 @@ import { firestore, storage } from "./config/firebase.js";
 import chromium from "@sparticuz/chromium";
 import { supabase } from "./config/supabase.js";
 import { performance } from "perf_hooks";
-import { cpus } from "os";
+import { cpus, tmpdir } from "os";
 import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
@@ -17,10 +17,97 @@ import UserAgents from "user-agents";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { GoogleGenAI } from "@google/genai";
 import { Resend } from "resend";
-import { promises as fs } from "fs";
+import fs from "fs";
 import NodeCache from "node-cache";
 import { fetch } from "undici";
 import { z } from "zod";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+import path from "path";
+import ffmpeg from "fluent-ffmpeg";
+import { promises as fsp } from "fs";
+
+dotenv.config();
+
+// Safely parse JSON from an AI response that may include markdown fences or trailing text
+function parseAIJson(raw) {
+	if (!raw || typeof raw !== "string") {
+		throw new SyntaxError(`parseAIJson received invalid input: ${JSON.stringify(raw)}`);
+	}
+	let text = raw.trim();
+	// Strip markdown code fences
+	text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+	// Extract the first complete JSON object or array (handles trailing prose)
+	const start = text.search(/[{\[]/);
+	if (start === -1) {
+		throw new SyntaxError(`No JSON object found in AI response. Raw content: "${text.slice(0, 200)}"`);
+	}
+	const opener = text[start];
+	const closer = opener === "{" ? "}" : "]";
+	let depth = 0;
+	let end = -1;
+	for (let i = start; i < text.length; i++) {
+		if (text[i] === opener) depth++;
+		else if (text[i] === closer) {
+			depth--;
+			if (depth === 0) { end = i; break; }
+		}
+	}
+	if (end === -1) throw new SyntaxError("Unterminated JSON in AI response");
+	return JSON.parse(text.slice(start, end + 1));
+}
+
+// Wrapper around OpenRouter chat completions with error checking
+async function openRouterChat({ model = "openai/gpt-4o-mini", prompt, temperature = 0.7, label = "AI" }) {
+	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+		},
+		body: JSON.stringify({
+			model,
+			messages: [
+				{
+					role: "system",
+					content: "You are a JSON-only API. You MUST respond with valid JSON and nothing else. Never ask clarifying questions. Never add explanations. If information seems missing, use reasonable placeholder values.",
+				},
+				{ role: "user", content: prompt },
+			],
+			temperature,
+			response_format: { type: "json_object" },
+		}),
+	});
+
+	const data = await res.json();
+
+	if (data.error) {
+		throw new Error(`[${label}] OpenRouter error: ${data.error.message || JSON.stringify(data.error)}`);
+	}
+
+	const content = data.choices?.[0]?.message?.content;
+	if (!content) {
+		console.error(`[${label}] Unexpected OpenRouter response:`, JSON.stringify(data).slice(0, 500));
+		throw new Error(`[${label}] Empty or missing content in OpenRouter response`);
+	}
+
+	return parseAIJson(content);
+}
+
+const openai = new OpenAI({
+	baseURL: "https://openrouter.ai/api/v1",
+	apiKey: process.env.OPENROUTER_API_KEY,
+});
+const IMAGE_DIR = "./templates";
+const OUTPUT_FILE = "./templates.json";
+
+const VISION_MODEL = "openai/gpt-4o-mini";
+const EMBEDDING_MODEL = "text-embedding-3-small";
+
+async function loadExistingTemplates() {
+	if (!fs.existsSync(OUTPUT_FILE)) return [];
+	return JSON.parse(await fs.readFileSync(OUTPUT_FILE, "utf-8"));
+}
 
 const userAgents = new UserAgent();
 
@@ -1589,6 +1676,125 @@ async function scrapeWithOwnEndpoint(url, baseUrl) {
 	}
 }
 
+app.get("/generate-email-templates-embeddings", async (c) => {
+	const files = fs
+		.readdirSync(`${IMAGE_DIR}`)
+		.filter((f) => f.endsWith(".png"))
+		.sort((a, b) => {
+			const numA = parseInt(a.match(/\d+/)?.[0] || "0");
+			const numB = parseInt(b.match(/\d+/)?.[0] || "0");
+			return numA - numB;
+		});
+
+	let existing = await loadExistingTemplates();
+	const existingIds = new Set(existing.map((t) => t.id));
+
+	for (const file of files) {
+		const id = file.replace(".png", "");
+
+		// Skip already processed
+		if (existingIds.has(id)) {
+			console.log(`Skipping ${file}`);
+			continue;
+		}
+
+		console.log(`Processing ${file}`);
+
+		const imagePath = path.join(IMAGE_DIR, file);
+		const base64Image = fs.readFileSync(imagePath, "base64");
+
+		// 1️⃣ Vision → Metadata
+		const visionRes = await axios.post(
+			"https://openrouter.ai/api/v1/chat/completions",
+			{
+				model: VISION_MODEL,
+				messages: [
+					{
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `
+Analyze this email template design and return JSON only:
+
+{
+  "category": "",
+  "tone": "",
+  "color_scheme": "",
+  "layout": "",
+  "industry_fit": "",
+  "cta_type": "",
+  "summary": ""
+}
+
+Return valid JSON only.
+`,
+							},
+							{
+								type: "image_url",
+								image_url: {
+									url: `data:image/png;base64,${base64Image}`,
+								},
+							},
+						],
+					},
+				],
+			},
+			{
+				headers: {
+					Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+					"Content-Type": "application/json",
+				},
+			},
+		);
+
+		let metadata;
+		try {
+			metadata = JSON.parse(visionRes.data.choices[0].message.content.trim());
+		} catch (err) {
+			console.log("Invalid JSON for", file);
+			continue;
+		}
+
+		// 2️⃣ Create embedding
+		const embedRes = await axios.post(
+			"https://openrouter.ai/api/v1/embeddings",
+			{
+				model: EMBEDDING_MODEL,
+				input: `
+${metadata.category}
+${metadata.tone}
+${metadata.color_scheme}
+${metadata.layout}
+${metadata.industry_fit}
+${metadata.cta_type}
+${metadata.summary}
+`,
+			},
+			{
+				headers: {
+					Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+					"Content-Type": "application/json",
+				},
+			},
+		);
+
+		const embedding = embedRes.data.data[0].embedding;
+
+		existing.push({
+			id,
+			image: `/templates/images/${file}`,
+			metadata,
+			embedding,
+		});
+
+		// Save progressively (important if 259 images)
+		fs.writeFileSync(OUTPUT_FILE, JSON.stringify(existing, null, 2));
+	}
+
+	return c.json({ success: true, total: existing.length });
+});
+
 // Generate form from URL endpoint
 app.post("/generate-form-from-url", async (c) => {
 	try {
@@ -3032,7 +3238,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		const chromium = (await import("@sparticuz/chromium")).default;
 
 		const maxAttempts = useProxy ? 3 : 1;
-		let lastError;
+		
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			let selectedProxy = null;
@@ -5654,67 +5860,6 @@ Strict requirements:
 	});
 });
 
-const ddgSearchTool = {
-	name: "ddg_search",
-	description:
-		"Perform a DuckDuckGo web search to find relevant information based on a query.",
-	parameters: {
-		type: "object",
-		properties: {
-			query: {
-				type: "string",
-				description: "The search query for DuckDuckGo.",
-			},
-		},
-		required: ["query"],
-	},
-};
-
-const scrapUrlPuppeteerTool = {
-	name: "scrap_url_puppeteer",
-	description:
-		"Scrape content from a given URL using Puppeteer. Can extract semantic content, images, links, and metadata, and take screenshots.",
-	parameters: {
-		type: "object",
-		properties: {
-			url: {
-				type: "string",
-				description: "The URL to scrape.",
-			},
-			includeSemanticContent: {
-				type: "boolean",
-				description:
-					"Whether to extract semantic content (paragraphs, headings, lists, tables). Defaults to true.",
-				default: true,
-			},
-			includeImages: {
-				type: "boolean",
-				description:
-					"Whether to extract image URLs and their attributes. Defaults to true.",
-				default: true,
-			},
-			includeLinks: {
-				type: "boolean",
-				description: "Whether to extract internal links. Defaults to true.",
-				default: true,
-			},
-			extractMetadata: {
-				type: "boolean",
-				description:
-					"Whether to extract meta, Open Graph, and Twitter card tags. Defaults to true.",
-				default: true,
-			},
-			takeScreenshot: {
-				type: "boolean",
-				description:
-					"Whether to take a full-page screenshot of the URL and return its URL. Defaults to false.",
-				default: false,
-			},
-		},
-		required: ["url"],
-	},
-};
-
 // Helper to parse repo input (either "owner/repo" or full GitHub URL)
 const parseGithubRepoInput = (input) => {
 	if (!input || typeof input !== "string") return null;
@@ -6252,73 +6397,6 @@ Rules:
 	}
 });
 
-app.post("/profiler-users-send-email", async (c) => {
-	try {
-		const usersRef = firestore.collection("profiler-users");
-		const snapshot = await usersRef.get();
-
-		if (snapshot.empty) {
-			return c.json({
-				success: true,
-				emails: [],
-				message: "No users found in profiler-users collection.",
-			});
-		}
-
-		const emails = [];
-		snapshot.forEach((doc) => {
-			const userData = doc.data();
-			if (userData.email) {
-				emails.push(userData.email);
-			}
-		});
-
-		if (emails.length === 0) {
-			return c.json({
-				success: true,
-				emails: [],
-				message: "No emails found in profiler-users collection.",
-			});
-		}
-
-		const resend = new Resend(process.env.RESEND_API_KEY);
-		const emailHtml = await fs.readFile("email.html", "utf-8");
-
-		const sendPromises = emails.map(async (email) => {
-			try {
-				await resend.emails.send({
-					from: "connect@ihatereading.in",
-					to: email,
-					subject: "Exciting Updates from gettemplate.website!",
-					html: emailHtml,
-				});
-				return { email, status: "sent" };
-			} catch (sendError) {
-				console.error(`Failed to send email to ${email}:`, sendError);
-				return { email, status: "failed", error: sendError.message };
-			}
-		});
-
-		const results = await Promise.all(sendPromises);
-
-		return c.json({
-			success: true,
-			message: `Attempted to send emails to ${emails.length} users.`,
-			results,
-		});
-	} catch (error) {
-		console.error("Error in /profiler-users-send-email endpoint:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to process email sending request",
-				details: error.message,
-			},
-			500,
-		);
-	}
-});
-
 // Google News Scraping Endpoint
 app.post("/scrap-google-news", async (c) => {
 	const operationId = performanceMonitor.startOperation("scrap_google_news");
@@ -6763,6 +6841,298 @@ app.post("/get-roadmap", async (c) => {
 		return c.json({ error: "Failed to get roadmap data" }, 500);
 	}
 });
+
+// ─── Video helpers ────────────────────────────────────────────────────────────
+
+async function crawlWebsite(targetUrl) {
+	const res = await fetch("https://api.firecrawl.dev/v1/scrape", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
+		},
+		body: JSON.stringify({ url: targetUrl, formats: ["markdown", "screenshot"] }),
+	});
+	const data = await res.json();
+	const scrape = data.data || data;
+
+	const markdownImages = [];
+	const imgRegex = /!\[.*?\]\((https?:\/\/[^)]+)\)/g;
+	let match;
+	while ((match = imgRegex.exec(scrape.markdown || "")) !== null) {
+		markdownImages.push(match[1]);
+	}
+
+	const screenshots = [
+		...(scrape.screenshot ? [scrape.screenshot] : []),
+		...markdownImages,
+	].filter(Boolean);
+
+	return {
+		productName: scrape.metadata?.title || scrape.metadata?.ogTitle || "SaaS Product",
+		valueProp: (scrape.markdown || "").slice(0, 500),
+		screenshots,
+	};
+}
+
+async function generateScenes(websiteData) {
+	const prompt = `Create 6 short scenes for a SaaS explainer video.
+Product: ${websiteData.productName}
+Value Proposition: ${websiteData.valueProp}
+
+Return only raw JSON (no markdown fences):
+{
+  "scenes": [
+    { "headline": "", "narration": "", "duration": 6 }
+  ]
+}`;
+
+	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+		},
+		body: JSON.stringify({
+			model: "openai/gpt-4o",
+			messages: [{ role: "user", content: prompt }],
+			temperature: 0.7,
+		}),
+	});
+	const data = await res.json();
+	return parseAIJson(data.choices[0].message.content);
+}
+
+async function downloadImageToFile(url, destPath) {
+	const res = await fetch(url);
+	if (!res.ok) throw new Error(`Image download failed: ${url}`);
+	const buf = await res.arrayBuffer();
+	await fsp.writeFile(destPath, Buffer.from(buf));
+}
+
+async function buildVideoWithFFmpeg(scenes, screenshots, jobId) {
+	const tmpDir = path.join(tmpdir(), `video_${jobId}`);
+	await fsp.mkdir(tmpDir, { recursive: true });
+
+	const segmentPaths = [];
+
+	for (let i = 0; i < scenes.length; i++) {
+		const scene = scenes[i];
+		const segPath = path.join(tmpDir, `seg_${i}.mp4`);
+		const imageUrl = screenshots.length > 0 ? screenshots[i % screenshots.length] : null;
+		const imgPath = path.join(tmpDir, `img_${i}.jpg`);
+
+		let hasImage = false;
+		if (imageUrl) {
+			try {
+				await downloadImageToFile(imageUrl, imgPath);
+				hasImage = true;
+			} catch {
+				hasImage = false;
+			}
+		}
+
+		// Escape special chars for ffmpeg drawtext
+		const safeText = scene.headline
+			.replace(/\\/g, "\\\\")
+			.replace(/'/g, "\u2019")
+			.replace(/:/g, "\\:");
+
+		await new Promise((resolve, reject) => {
+			const cmd = ffmpeg();
+
+			if (hasImage) {
+				cmd.input(imgPath).inputOptions(["-loop 1"]);
+			} else {
+				cmd.input("color=black:size=1280x720:rate=25").inputFormat("lavfi");
+			}
+
+			cmd
+				.duration(scene.duration)
+				.videoFilters([
+					"scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
+					`drawtext=text='${safeText}':fontsize=52:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=(h-text_h)/2`,
+				])
+				.outputOptions(["-pix_fmt yuv420p", "-r 25", "-an"])
+				.output(segPath)
+				.on("end", resolve)
+				.on("error", reject)
+				.run();
+		});
+
+		segmentPaths.push(segPath);
+	}
+
+	// Concat all segments
+	const concatFile = path.join(tmpDir, "concat.txt");
+	await fsp.writeFile(concatFile, segmentPaths.map((f) => `file '${f}'`).join("\n"));
+
+	const outputPath = path.join(tmpDir, "output.mp4");
+	await new Promise((resolve, reject) => {
+		ffmpeg()
+			.input(concatFile)
+			.inputOptions(["-f concat", "-safe 0"])
+			.outputOptions(["-c copy"])
+			.output(outputPath)
+			.on("end", resolve)
+			.on("error", reject)
+			.run();
+	});
+
+	// Upload to Firebase Storage
+	const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+	const destination = `videos/${jobId}.mp4`;
+	await bucket.upload(outputPath, {
+		destination,
+		metadata: { contentType: "video/mp4" },
+	});
+	const file = bucket.file(destination);
+	await file.makePublic();
+	const videoUrl = `https://storage.googleapis.com/${bucket.name}/${destination}`;
+
+	await fsp.rm(tmpDir, { recursive: true, force: true });
+	return videoUrl;
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+app.post('/generate-launch-kit', async (c) => {
+  const { url, tone = "bold" } = await c.req.json()
+
+  /* ---------------------------------- */
+  /* 1️⃣ Crawl Website via Firecrawl   */
+  /* ---------------------------------- */
+  async function crawlWebsite(targetUrl) {
+    const res = await fetch('https://api.firecrawl.dev/v0/scrape', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`
+      },
+      body: JSON.stringify({
+        url: targetUrl,
+        formats: ['markdown'],
+      })
+    })
+
+    const data = await res.json()
+
+    return {
+      title: data.metadata?.title || '',
+      description: data.metadata?.description || '',
+      content: data.markdown || ''
+    }
+  }
+
+  /* ---------------------------------- */
+  /* 2️⃣ Structure SaaS Data            */
+  /* ---------------------------------- */
+  async function extractStructuredData(siteData) {
+    const prompt = `Extract SaaS structured data from this website content.
+
+Return JSON only:
+{
+  "product_name": "",
+  "target_audience": "",
+  "core_problem": "",
+  "solution_summary": "",
+  "features": [],
+  "benefits": [],
+  "pricing_model": ""
+}
+
+Website Content:
+${siteData.content.slice(0, 12000)}`
+
+    return openRouterChat({ prompt, temperature: 0.4, label: "extractStructuredData" })
+  }
+
+  /* ---------------------------------- */
+  /* 3️⃣ Generate LinkedIn Pack         */
+  /* ---------------------------------- */
+  async function generateLinkedInPack(structured) {
+    const prompt = `You are a SaaS founder writing on LinkedIn.
+Tone: ${tone}
+Generate 8 LinkedIn posts for launch.
+
+Each post:
+- Strong hook
+- Short lines
+- Clear CTA
+
+Return JSON:
+{
+  "posts": [
+    { "type": "launch", "content": "" }
+  ]
+}
+
+Product Info:
+${JSON.stringify(structured)}`
+
+    return openRouterChat({ prompt, temperature: 0.7, label: "generateLinkedInPack" })
+  }
+
+  /* ---------------------------------- */
+  /* 4️⃣ Generate Product Hunt Kit      */
+  /* ---------------------------------- */
+  async function generateProductHuntKit(structured) {
+    const prompt = `Generate Product Hunt launch content.
+
+Return JSON:
+{
+  "tagline": "",
+  "short_description": "",
+  "full_description": "",
+  "first_comment": "",
+  "features": [],
+  "faqs": []
+}
+
+Product Info:
+${JSON.stringify(structured)}`
+
+    return openRouterChat({ prompt, temperature: 0.6, label: "generateProductHuntKit" })
+  }
+
+  /* ---------------------------------- */
+  /* 5️⃣ Generate Email Sequence        */
+  /* ---------------------------------- */
+  async function generateEmailSequence(structured) {
+    const prompt = `Create 5 onboarding emails for this SaaS.
+
+Return JSON:
+{
+  "emails": [
+    { "subject": "", "body": "" }
+  ]
+}
+
+Product Info:
+${JSON.stringify(structured)}`
+
+    return openRouterChat({ prompt, temperature: 0.7, label: "generateEmailSequence" })
+  }
+
+  try {
+    const siteData = await crawlWebsite(url)
+    const structured = await extractStructuredData(siteData)
+    const linkedin = await generateLinkedInPack(structured)
+    const productHunt = await generateProductHuntKit(structured)
+    const emails = await generateEmailSequence(structured)
+
+    return c.json({
+      success: true,
+      structured,
+      linkedin,
+      productHunt,
+      emails
+    })
+  } catch (err) {
+    console.error(err)
+    return c.json({ success: false, error: 'Generation failed' }, 500)
+  }
+})
 
 // Start the server
 serve({
