@@ -32,15 +32,22 @@ dotenv.config();
 // Safely parse JSON from an AI response that may include markdown fences or trailing text
 function parseAIJson(raw) {
 	if (!raw || typeof raw !== "string") {
-		throw new SyntaxError(`parseAIJson received invalid input: ${JSON.stringify(raw)}`);
+		throw new SyntaxError(
+			`parseAIJson received invalid input: ${JSON.stringify(raw)}`,
+		);
 	}
 	let text = raw.trim();
 	// Strip markdown code fences
-	text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+	text = text
+		.replace(/^```(?:json)?\s*/i, "")
+		.replace(/\s*```$/, "")
+		.trim();
 	// Extract the first complete JSON object or array (handles trailing prose)
 	const start = text.search(/[{\[]/);
 	if (start === -1) {
-		throw new SyntaxError(`No JSON object found in AI response. Raw content: "${text.slice(0, 200)}"`);
+		throw new SyntaxError(
+			`No JSON object found in AI response. Raw content: "${text.slice(0, 200)}"`,
+		);
 	}
 	const opener = text[start];
 	const closer = opener === "{" ? "}" : "]";
@@ -50,7 +57,10 @@ function parseAIJson(raw) {
 		if (text[i] === opener) depth++;
 		else if (text[i] === closer) {
 			depth--;
-			if (depth === 0) { end = i; break; }
+			if (depth === 0) {
+				end = i;
+				break;
+			}
 		}
 	}
 	if (end === -1) throw new SyntaxError("Unterminated JSON in AI response");
@@ -58,7 +68,12 @@ function parseAIJson(raw) {
 }
 
 // Wrapper around OpenRouter chat completions with error checking
-async function openRouterChat({ model = "openai/gpt-4o-mini", prompt, temperature = 0.7, label = "AI" }) {
+async function openRouterChat({
+	model = "openai/gpt-4o-mini",
+	prompt,
+	temperature = 0.7,
+	label = "AI",
+}) {
 	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
 		method: "POST",
 		headers: {
@@ -70,7 +85,8 @@ async function openRouterChat({ model = "openai/gpt-4o-mini", prompt, temperatur
 			messages: [
 				{
 					role: "system",
-					content: "You are a JSON-only API. You MUST respond with valid JSON and nothing else. Never ask clarifying questions. Never add explanations. If information seems missing, use reasonable placeholder values.",
+					content:
+						"You are a JSON-only API. You MUST respond with valid JSON and nothing else. Never ask clarifying questions. Never add explanations. If information seems missing, use reasonable placeholder values.",
 				},
 				{ role: "user", content: prompt },
 			],
@@ -82,18 +98,24 @@ async function openRouterChat({ model = "openai/gpt-4o-mini", prompt, temperatur
 	const data = await res.json();
 
 	if (data.error) {
-		throw new Error(`[${label}] OpenRouter error: ${data.error.message || JSON.stringify(data.error)}`);
+		throw new Error(
+			`[${label}] OpenRouter error: ${data.error.message || JSON.stringify(data.error)}`,
+		);
 	}
 
 	const content = data.choices?.[0]?.message?.content;
 	if (!content) {
-		console.error(`[${label}] Unexpected OpenRouter response:`, JSON.stringify(data).slice(0, 500));
-		throw new Error(`[${label}] Empty or missing content in OpenRouter response`);
+		console.error(
+			`[${label}] Unexpected OpenRouter response:`,
+			JSON.stringify(data).slice(0, 500),
+		);
+		throw new Error(
+			`[${label}] Empty or missing content in OpenRouter response`,
+		);
 	}
 
 	return parseAIJson(content);
 }
-
 
 const IMAGE_DIR = "./templates";
 const OUTPUT_FILE = "./templates.json";
@@ -3235,7 +3257,6 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		const chromium = (await import("@sparticuz/chromium")).default;
 
 		const maxAttempts = useProxy ? 3 : 1;
-		
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			let selectedProxy = null;
@@ -3881,7 +3902,7 @@ app.post("/scrap-url-puppeteer", async (c) => {
 						let insertError = null;
 						if (!fetchError && (!existingRows || existingRows.length === 0)) {
 							const { error } = await supabase.from("universo").insert({
-								title: scrapedData.title || "No Title",
+								title: scrapedData?.title || "No Title",
 								url: url,
 								markdown: markdown,
 								scraped_at: new Date().toISOString(),
@@ -6839,67 +6860,6 @@ app.post("/get-roadmap", async (c) => {
 	}
 });
 
-// ─── Video helpers ────────────────────────────────────────────────────────────
-
-async function crawlWebsite(targetUrl) {
-	const res = await fetch("https://api.firecrawl.dev/v1/scrape", {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
-		},
-		body: JSON.stringify({ url: targetUrl, formats: ["markdown", "screenshot"] }),
-	});
-	const data = await res.json();
-	const scrape = data.data || data;
-
-	const markdownImages = [];
-	const imgRegex = /!\[.*?\]\((https?:\/\/[^)]+)\)/g;
-	let match;
-	while ((match = imgRegex.exec(scrape.markdown || "")) !== null) {
-		markdownImages.push(match[1]);
-	}
-
-	const screenshots = [
-		...(scrape.screenshot ? [scrape.screenshot] : []),
-		...markdownImages,
-	].filter(Boolean);
-
-	return {
-		productName: scrape.metadata?.title || scrape.metadata?.ogTitle || "SaaS Product",
-		valueProp: (scrape.markdown || "").slice(0, 500),
-		screenshots,
-	};
-}
-
-async function generateScenes(websiteData) {
-	const prompt = `Create 6 short scenes for a SaaS explainer video.
-Product: ${websiteData.productName}
-Value Proposition: ${websiteData.valueProp}
-
-Return only raw JSON (no markdown fences):
-{
-  "scenes": [
-    { "headline": "", "narration": "", "duration": 6 }
-  ]
-}`;
-
-	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-		},
-		body: JSON.stringify({
-			model: "openai/gpt-4o",
-			messages: [{ role: "user", content: prompt }],
-			temperature: 0.7,
-		}),
-	});
-	const data = await res.json();
-	return parseAIJson(data.choices[0].message.content);
-}
-
 async function downloadImageToFile(url, destPath) {
 	const res = await fetch(url);
 	if (!res.ok) throw new Error(`Image download failed: ${url}`);
@@ -6916,7 +6876,8 @@ async function buildVideoWithFFmpeg(scenes, screenshots, jobId) {
 	for (let i = 0; i < scenes.length; i++) {
 		const scene = scenes[i];
 		const segPath = path.join(tmpDir, `seg_${i}.mp4`);
-		const imageUrl = screenshots.length > 0 ? screenshots[i % screenshots.length] : null;
+		const imageUrl =
+			screenshots.length > 0 ? screenshots[i % screenshots.length] : null;
 		const imgPath = path.join(tmpDir, `img_${i}.jpg`);
 
 		let hasImage = false;
@@ -6962,7 +6923,10 @@ async function buildVideoWithFFmpeg(scenes, screenshots, jobId) {
 
 	// Concat all segments
 	const concatFile = path.join(tmpDir, "concat.txt");
-	await fsp.writeFile(concatFile, segmentPaths.map((f) => `file '${f}'`).join("\n"));
+	await fsp.writeFile(
+		concatFile,
+		segmentPaths.map((f) => `file '${f}'`).join("\n"),
+	);
 
 	const outputPath = path.join(tmpDir, "output.mp4");
 	await new Promise((resolve, reject) => {
@@ -6993,39 +6957,39 @@ async function buildVideoWithFFmpeg(scenes, screenshots, jobId) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.post('/generate-launch-kit', async (c) => {
-  const { url, tone = "bold" } = await c.req.json()
+app.post("/generate-launch-kit", async (c) => {
+	const { url, tone = "bold" } = await c.req.json();
 
-  /* ---------------------------------- */
-  /* 1️⃣ Crawl Website via Firecrawl   */
-  /* ---------------------------------- */
-  async function crawlWebsite(targetUrl) {
-    const res = await fetch('https://api.firecrawl.dev/v0/scrape', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`
-      },
-      body: JSON.stringify({
-        url: targetUrl,
-        formats: ['markdown'],
-      })
-    })
+	/* ---------------------------------- */
+	/* 1️⃣ Crawl Website via Firecrawl   */
+	/* ---------------------------------- */
+	async function crawlWebsite(targetUrl) {
+		const res = await fetch("https://api.firecrawl.dev/v0/scrape", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
+			},
+			body: JSON.stringify({
+				url: targetUrl,
+				formats: ["markdown"],
+			}),
+		});
 
-    const data = await res.json()
+		const data = await res.json();
 
-    return {
-      title: data.metadata?.title || '',
-      description: data.metadata?.description || '',
-      content: data.markdown || ''
-    }
-  }
+		return {
+			title: data.metadata?.title || "",
+			description: data.metadata?.description || "",
+			content: data.markdown || "",
+		};
+	}
 
-  /* ---------------------------------- */
-  /* 2️⃣ Structure SaaS Data            */
-  /* ---------------------------------- */
-  async function extractStructuredData(siteData) {
-    const prompt = `Extract SaaS structured data from this website content.
+	/* ---------------------------------- */
+	/* 2️⃣ Structure SaaS Data            */
+	/* ---------------------------------- */
+	async function extractStructuredData(siteData) {
+		const prompt = `Extract SaaS structured data from this website content.
 
 Return JSON only:
 {
@@ -7039,16 +7003,20 @@ Return JSON only:
 }
 
 Website Content:
-${siteData.content.slice(0, 12000)}`
+${siteData.content.slice(0, 12000)}`;
 
-    return openRouterChat({ prompt, temperature: 0.4, label: "extractStructuredData" })
-  }
+		return openRouterChat({
+			prompt,
+			temperature: 0.4,
+			label: "extractStructuredData",
+		});
+	}
 
-  /* ---------------------------------- */
-  /* 3️⃣ Generate LinkedIn Pack         */
-  /* ---------------------------------- */
-  async function generateLinkedInPack(structured) {
-    const prompt = `You are a SaaS founder writing on LinkedIn.
+	/* ---------------------------------- */
+	/* 3️⃣ Generate LinkedIn Pack         */
+	/* ---------------------------------- */
+	async function generateLinkedInPack(structured) {
+		const prompt = `You are a SaaS founder writing on LinkedIn.
 Tone: ${tone}
 Generate 8 LinkedIn posts for launch.
 
@@ -7065,16 +7033,20 @@ Return JSON:
 }
 
 Product Info:
-${JSON.stringify(structured)}`
+${JSON.stringify(structured)}`;
 
-    return openRouterChat({ prompt, temperature: 0.7, label: "generateLinkedInPack" })
-  }
+		return openRouterChat({
+			prompt,
+			temperature: 0.7,
+			label: "generateLinkedInPack",
+		});
+	}
 
-  /* ---------------------------------- */
-  /* 4️⃣ Generate Product Hunt Kit      */
-  /* ---------------------------------- */
-  async function generateProductHuntKit(structured) {
-    const prompt = `Generate Product Hunt launch content.
+	/* ---------------------------------- */
+	/* 4️⃣ Generate Product Hunt Kit      */
+	/* ---------------------------------- */
+	async function generateProductHuntKit(structured) {
+		const prompt = `Generate Product Hunt launch content.
 
 Return JSON:
 {
@@ -7087,16 +7059,20 @@ Return JSON:
 }
 
 Product Info:
-${JSON.stringify(structured)}`
+${JSON.stringify(structured)}`;
 
-    return openRouterChat({ prompt, temperature: 0.6, label: "generateProductHuntKit" })
-  }
+		return openRouterChat({
+			prompt,
+			temperature: 0.6,
+			label: "generateProductHuntKit",
+		});
+	}
 
-  /* ---------------------------------- */
-  /* 5️⃣ Generate Email Sequence        */
-  /* ---------------------------------- */
-  async function generateEmailSequence(structured) {
-    const prompt = `Create 5 onboarding emails for this SaaS.
+	/* ---------------------------------- */
+	/* 5️⃣ Generate Email Sequence        */
+	/* ---------------------------------- */
+	async function generateEmailSequence(structured) {
+		const prompt = `Create 5 onboarding emails for this SaaS.
 
 Return JSON:
 {
@@ -7106,30 +7082,34 @@ Return JSON:
 }
 
 Product Info:
-${JSON.stringify(structured)}`
+${JSON.stringify(structured)}`;
 
-    return openRouterChat({ prompt, temperature: 0.7, label: "generateEmailSequence" })
-  }
+		return openRouterChat({
+			prompt,
+			temperature: 0.7,
+			label: "generateEmailSequence",
+		});
+	}
 
-  try {
-    const siteData = await crawlWebsite(url)
-    const structured = await extractStructuredData(siteData)
-    const linkedin = await generateLinkedInPack(structured)
-    const productHunt = await generateProductHuntKit(structured)
-    const emails = await generateEmailSequence(structured)
+	try {
+		const siteData = await crawlWebsite(url);
+		const structured = await extractStructuredData(siteData);
+		const linkedin = await generateLinkedInPack(structured);
+		const productHunt = await generateProductHuntKit(structured);
+		const emails = await generateEmailSequence(structured);
 
-    return c.json({
-      success: true,
-      structured,
-      linkedin,
-      productHunt,
-      emails
-    })
-  } catch (err) {
-    console.error(err)
-    return c.json({ success: false, error: 'Generation failed' }, 500)
-  }
-})
+		return c.json({
+			success: true,
+			structured,
+			linkedin,
+			productHunt,
+			emails,
+		});
+	} catch (err) {
+		console.error(err);
+		return c.json({ success: false, error: "Generation failed" }, 500);
+	}
+});
 
 // Start the server
 serve({
