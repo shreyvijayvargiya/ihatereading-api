@@ -94,10 +94,7 @@ async function openRouterChat({ model = "openai/gpt-4o-mini", prompt, temperatur
 	return parseAIJson(content);
 }
 
-const openai = new OpenAI({
-	baseURL: "https://openrouter.ai/api/v1",
-	apiKey: process.env.OPENROUTER_API_KEY,
-});
+
 const IMAGE_DIR = "./templates";
 const OUTPUT_FILE = "./templates.json";
 
