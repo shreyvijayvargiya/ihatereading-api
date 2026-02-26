@@ -23,7 +23,6 @@ import NodeCache from "node-cache";
 import { fetch } from "undici";
 import { z } from "zod";
 import dotenv from "dotenv";
-import OpenAI from "openai";
 import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import { promises as fsp } from "fs";
@@ -1026,12 +1025,15 @@ function rateLimit(ip, limit, windowMs) {
 }
 
 // Periodically purge expired entries (every 5 minutes) to avoid memory leaks
-setInterval(() => {
-	const now = Date.now();
-	for (const [ip, record] of rateLimitMap.entries()) {
-		if (now > record.resetTime) rateLimitMap.delete(ip);
-	}
-}, 5 * 60 * 1000);
+setInterval(
+	() => {
+		const now = Date.now();
+		for (const [ip, record] of rateLimitMap.entries()) {
+			if (now > record.resetTime) rateLimitMap.delete(ip);
+		}
+	},
+	5 * 60 * 1000,
+);
 // ─────────────────────────────────────────────────────────────────────────────
 
 const commonViewports = [
@@ -1358,7 +1360,7 @@ app.post("/scrap-airbnb", async (c) => {
 	let scrapedData = {};
 
 	try {
-		const response = await fetch(`http://localhost:3001/scrap-url-puppeteer`, {
+		const response = await fetch(`http://localhost:3001/scrape`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -1642,7 +1644,7 @@ async function scrapeWithFirecrawl(url) {
 }
 
 /**
- * Scrape website content using internal scrap-url-puppeteer endpoint
+ * Scrape website content using internal scrape endpoint
  * @param {string} url - The URL to scrape
  * @param {string} baseUrl - The base URL for the API (e.g., http://localhost:3001)
  * @returns {Promise<{success: boolean, markdown?: string, error?: string}>}
@@ -1668,12 +1670,12 @@ async function scrapeWithOwnEndpoint(url, baseUrl) {
 			};
 		}
 
-		// Call internal scrap-url-puppeteer endpoint with timeout
+		// Call internal scrape endpoint with timeout
 		const controller = new AbortController();
 		const timeoutId = setTimeout(() => controller.abort(), 120000); // 120 second timeout
 
 		try {
-			const response = await fetch(`${baseUrl}/scrap-url-puppeteer`, {
+			const response = await fetch(`${baseUrl}/scrape`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
@@ -1893,7 +1895,7 @@ app.post("/generate-form-from-url", async (c) => {
 		const truncatedMarkdown =
 			markdownContent.length > 50000
 				? markdownContent.substring(0, 50000) +
-				"\n\n[Content truncated due to length...]"
+					"\n\n[Content truncated due to length...]"
 				: markdownContent;
 
 		// System prompt for generating form from website content
@@ -2122,7 +2124,7 @@ app.post("/generate-form-from-url-llm", async (c) => {
 		const truncatedMarkdown =
 			markdownContent.length > 50000
 				? markdownContent.substring(0, 50000) +
-				"\n\n[Content truncated due to length...]"
+					"\n\n[Content truncated due to length...]"
 				: markdownContent;
 
 		// System prompt for generating form from website content
@@ -2550,8 +2552,8 @@ app.post("/bing-search", async (c) => {
 		const page = await browser.newPage();
 		await page.setUserAgent(
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-			"AppleWebKit/537.36 (KHTML, like Gecko) " +
-			"Chrome/123.0.0.0 Safari/537.36",
+				"AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/123.0.0.0 Safari/537.36",
 		);
 
 		await page.setExtraHTTPHeaders({
@@ -2939,8 +2941,8 @@ app.post("/ddg-search", async (c) => {
 				ignoreDefaultArgs: ["--disable-extensions"],
 				...(selectedProxy
 					? [
-						`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-					]
+							`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+						]
 					: []),
 			});
 		} catch (chromiumError) {
@@ -2957,8 +2959,8 @@ app.post("/ddg-search", async (c) => {
 					"--disable-web-security",
 					...(selectedProxy
 						? [
-							`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-						]
+								`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+							]
 						: []),
 				],
 			});
@@ -3080,8 +3082,8 @@ app.post("/google-search", async (c) => {
 
 		await page.setUserAgent(
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-			"AppleWebKit/537.36 (KHTML, like Gecko) " +
-			"Chrome/123.0.0.0 Safari/537.36",
+				"AppleWebKit/537.36 (KHTML, like Gecko) " +
+				"Chrome/123.0.0.0 Safari/537.36",
 		);
 
 		await page.setExtraHTTPHeaders({
@@ -3210,22 +3212,367 @@ const scrapHtml = async (url) => {
 	return html;
 };
 
-// New Puppeteer-based URL scraping endpoint
-app.post("/scrap-url-puppeteer", async (c) => {
+/**
+ * Core scraping logic for a single URL. Returns result object or throws.
+ * Used by both /scrape and /scrap-urls-puppeteer.
+ */
+async function scrapeSingleUrlWithPuppeteer(
+	url,
+	{
+		selectors = {},
+		waitForSelector = null,
+		timeout = 30000,
+		includeSemanticContent = true,
+		includeImages = true,
+		includeLinks = true,
+		extractMetadata = true,
+		includeCache = false,
+		useProxy = false,
+		aiSummary = false,
+		takeScreenshot = false,
+	} = {},
+) {
+	let targetUrl = rewriteUrl(url) || url;
+
+	if (targetUrl.includes("format=json")) {
+		const data = await scrapJson(targetUrl);
+		return { success: true, data, markdown: null, summary: null, screenshot: null };
+	}
+	if (targetUrl.includes("format=html")) {
+		const html = await scrapHtml(targetUrl);
+		const data = dataExtractionFromHtml(html, {
+			includeSemanticContent,
+			includeImages,
+			includeLinks,
+			extractMetadata,
+		});
+		return { success: true, data, markdown: null, summary: null, screenshot: null };
+	}
+
+	let existingData;
+	if (includeCache) {
+		const { data, error: fetchError } = await supabase
+			.from("universo")
+			.select("scraped_data, scraped_at, markdown, screenshot")
+			.eq("url", targetUrl);
+		existingData = data?.[0];
+		if (fetchError || !existingData) {
+			throw new Error("Cache miss or fetch error");
+		}
+		if (existingData?.scraped_data) {
+			return {
+				success: true,
+				data: JSON.parse(existingData.scraped_data),
+				markdown: existingData?.markdown ?? null,
+				summary: null,
+				screenshot: existingData?.screenshot ?? null,
+			};
+		}
+	}
+
+	const maxAttempts = useProxy ? 3 : 1;
+	let lastError;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		let selectedProxy = null;
+		const { userAgent, extraHTTPHeaders, viewport } = generateRandomHeaders();
+
+		try {
+			if (useProxy) selectedProxy = proxyManager.getNextProxy();
+
+			const poolResult = await browserPool.withPage(async (page) => {
+				await page.setViewport(viewport);
+				await page.setUserAgent(userAgent);
+				await page.setExtraHTTPHeaders(extraHTTPHeaders);
+
+				if (useProxy && selectedProxy?.username) {
+					await page.authenticate({
+						username: selectedProxy.username,
+						password: selectedProxy.password,
+					});
+				}
+
+				await page.evaluateOnNewDocument(() => {
+					Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+					Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+					Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+					const orig = window.navigator.permissions.query;
+					window.navigator.permissions.query = (p) =>
+						p.name === "notifications"
+							? Promise.resolve({ state: Notification.permission })
+							: orig(p);
+				});
+
+				let blockedResources = { images: 0, fonts: 0, stylesheets: 0, media: 0 };
+				await page.setRequestInterception(true);
+				page.on("request", (request) => {
+					const resourceType = request.resourceType();
+					const reqUrl = request.url().toLowerCase();
+					if (
+						(reqUrl.includes("vercel") && (reqUrl.includes("security") || reqUrl.includes("checkpoint"))) ||
+						reqUrl.includes("cloudflare") ||
+						reqUrl.includes("bot-detection") ||
+						reqUrl.includes("challenge")
+					) {
+						request.abort();
+						return;
+					}
+					if (resourceType === "image") {
+						blockedResources.images++;
+						request.abort();
+						return;
+					}
+					const imgExts = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tiff", ".tif", ".heic", ".heif", ".avif"];
+					if (imgExts.some((ext) => reqUrl.includes(ext))) {
+						blockedResources.images++;
+						request.abort();
+						return;
+					}
+					const imgServices = ["cdn", "images", "img", "photo", "pic", "media", "assets"];
+					if (imgServices.some((s) => reqUrl.includes(s)) && [".jpg", ".png", ".gif"].some((e) => reqUrl.includes(e))) {
+						blockedResources.images++;
+						request.abort();
+						return;
+					}
+					if (reqUrl.startsWith("data:image/")) {
+						blockedResources.images++;
+						request.abort();
+						return;
+					}
+					if (resourceType === "stylesheet") {
+						blockedResources.stylesheets++;
+						request.respond({ status: 200, contentType: "text/css", body: "" });
+						return;
+					}
+					if (resourceType === "font") {
+						blockedResources.fonts++;
+						request.abort();
+						return;
+					}
+					if (resourceType === "media") {
+						blockedResources.media++;
+						request.abort();
+						return;
+					}
+					request.continue();
+				});
+
+				const navStart = Date.now();
+				if (targetUrl.includes("reddit.com")) {
+					const redditUrl = targetUrl.endsWith("/") ? targetUrl.slice(0, -1) + ".json" : targetUrl + "/.json";
+					await page.goto(redditUrl, { waitUntil: "domcontentloaded", timeout });
+					const jsonText = await page.$eval("pre", (el) => el.textContent);
+					const { markdown, posts } = parseRedditData(jsonText, targetUrl);
+					return {
+						summary: null,
+						scrapedData: { posts, url: targetUrl, title: "Reddit Posts", metadata: null },
+						markdown,
+						screenshotUrl: null,
+					};
+				}
+
+				await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout });
+				const navLatency = Date.now() - navStart;
+
+				if (waitForSelector) {
+					try {
+						await page.waitForSelector(waitForSelector, { timeout: 10000 });
+					} catch {}
+				}
+
+				let scrapedData = {};
+				if (includeSemanticContent) {
+					scrapedData = await page.evaluate(
+						async (opts) => {
+							const data = {
+								url: window.location.href,
+								title: document.title,
+								content: {},
+								metadata: {},
+								links: [],
+								images: [],
+								screenshot: null,
+								orderedContent: null,
+							};
+							const remove = ["header", "footer", "nav", "aside", ".header", ".top", ".navbar", "#header", ".footer", ".bottom", "#footer", ".sidebar", ".side", ".aside", "#sidebar", ".modal", ".popup", "#modal", ".overlay", ".ad", ".ads", ".advert", "#ad", ".lang-selector", ".language", "#language-selector", ".social", ".social-media", ".social-links", "#social", ".menu", ".navigation", "#nav", ".breadcrumbs", "#breadcrumbs", ".share", "#share", ".widget", "#widget", ".cookie", "#cookie", "script", "style", "noscript"];
+							remove.forEach((sel) => document.querySelectorAll(sel).forEach((el) => el.remove()));
+							["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
+								data.content[tag] = Array.from(document.querySelectorAll(tag)).map((h) => h.textContent.trim());
+							});
+							if (opts.extractMetadata) {
+								document.querySelectorAll("meta").forEach((meta) => {
+									const name = meta.getAttribute("name") || meta.getAttribute("property");
+									const content = meta.getAttribute("content");
+									if (name && content) data.metadata[name] = content;
+								});
+								document.querySelectorAll('meta[property^="og:"]').forEach((meta) => {
+									const p = meta.getAttribute("property");
+									const c = meta.getAttribute("content");
+									if (p && c) data.metadata[p] = c;
+								});
+								document.querySelectorAll('meta[name^="twitter:"]').forEach((meta) => {
+									const n = meta.getAttribute("name");
+									const c = meta.getAttribute("content");
+									if (n && c) data.metadata[n] = c;
+								});
+							}
+							if (opts.includeLinks) {
+								const currentUrl = new URL(window.location.href);
+								const seedDomain = currentUrl.hostname;
+								const seen = new Set();
+								data.links = Array.from(document.querySelectorAll("a[href]"))
+									.map((link) => ({ text: link.textContent.trim(), href: link.href, title: link.getAttribute("title") || "" }))
+									.filter((link) => {
+										if (!(link?.text?.length > 0 || link?.title?.length > 0)) return false;
+										try {
+											if (new URL(link.href).hostname !== seedDomain) return false;
+										} catch { return false; }
+										const key = `${link.text}|${link.href}|${link.title}`;
+										if (seen.has(key)) return false;
+										seen.add(key);
+										return true;
+									});
+							}
+							if (opts.includeSemanticContent) {
+								const ext = (sel, proc = (el) => el.textContent.trim()) =>
+									Array.from(document.querySelectorAll(sel)).map(proc);
+								const extTable = (t) =>
+									Array.from(t.querySelectorAll("tr")).map((r) =>
+										Array.from(r.querySelectorAll("td, th")).map((c) => c.textContent.trim()).filter(Boolean)
+									).filter((r) => r.length > 0);
+								const extList = (l) =>
+									Array.from(l.querySelectorAll("li")).map((li) => li.textContent.trim()).filter(Boolean);
+								data.content.semanticContent = {
+									articleContent: ext("article"),
+									divs: ext("div"),
+									paragraphs: ext("p"),
+									span: ext("span"),
+									blockquotes: ext("blockquote"),
+									codeBlocks: ext("code"),
+									preformatted: ext("pre"),
+									tables: ext("table", extTable),
+									unorderedLists: ext("ul", extList),
+									orderedLists: ext("ol", extList),
+								};
+							}
+							if (opts.includeImages) {
+								data.images = Array.from(document.querySelectorAll("img[src]"))
+									.filter((img) => !["data:image/", "blob:", "image:", "data:"].some((p) => img.src.startsWith(p)))
+									.map((img) => ({
+										src: img.src,
+										alt: img.alt || "",
+										title: img.title || "",
+										width: img.naturalWidth || img.width,
+										height: img.naturalHeight || img.height,
+									}));
+							}
+							if (opts.selectors && Object.keys(opts.selectors).length > 0) {
+								data.customSelectors = {};
+								for (const [key, selector] of Object.entries(opts.selectors)) {
+									try {
+										const els = document.querySelectorAll(selector);
+										data.customSelectors[key] = els.length === 1 ? els[0].textContent.trim() : Array.from(els).map((e) => e.textContent.trim());
+									} catch {
+										data.customSelectors[key] = null;
+									}
+								}
+							}
+							return data;
+						},
+						{ extractMetadata, includeImages, includeLinks, includeSemanticContent, selectors },
+					);
+				}
+
+				const pageHtml = await page.content();
+				const dom = new JSDOM(pageHtml);
+				const doc = dom.window.document;
+				const remove = ["header", "footer", "nav", "aside", ".header", ".top", ".navbar", "#header", ".footer", ".bottom", "#footer", ".sidebar", ".side", ".aside", "#sidebar", ".modal", ".popup", "#modal", ".overlay", ".ad", ".ads", ".advert", "#ad", ".lang-selector", ".language", "#language-selector", ".social", ".social-media", ".social-links", "#social", ".menu", ".navigation", "#nav", ".breadcrumbs", "#breadcrumbs", ".share", "#share", ".widget", "#widget", ".cookie", "#cookie", "script", "style", "noscript"];
+				remove.forEach((sel) => doc.querySelectorAll(sel).forEach((el) => el.remove()));
+				const { markdown } = extractSemanticContentWithFormattedMarkdown(doc.body);
+
+				let screenshotUrl = null;
+				if (takeScreenshot) {
+					try {
+						const buf = await page.screenshot({ fullPage: true });
+						const fname = `ihr-website-screenshot/screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
+						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+						const file = bucket.file(fname);
+						await file.save(buf, { metadata: { contentType: "image/png", cacheControl: "public, max-age=3600" } });
+						await file.makePublic();
+						screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+					} catch {}
+				}
+
+				if (useProxy && selectedProxy) proxyManager.recordProxyResult(selectedProxy.host, true, navLatency);
+
+				if (!includeCache) {
+					try {
+						const { data: existingRows, error: fetchError } = await supabase.from("universo").select("id").eq("url", targetUrl);
+						if (!fetchError && (!existingRows || existingRows.length === 0)) {
+							await supabase.from("universo").insert({
+								title: scrapedData?.title || "No Title",
+								url: targetUrl,
+								markdown,
+								scraped_at: new Date().toISOString(),
+								scraped_data: JSON.stringify(scrapedData),
+							});
+						}
+					} catch {}
+				}
+
+				if (includeSemanticContent && scrapedData?.content) removeEmptyKeys(scrapedData.content);
+
+				let summary = null;
+				if (aiSummary && markdown) {
+					try {
+						const splitter = RecursiveCharacterTextSplitter.fromLanguage("markdown", { separators: "\n\n", chunkSize: 1024, chunkOverlap: 128 });
+						const chunks = await splitter.splitText(markdown);
+						const chunked = chunks.slice(0, 3000).join("\n\n");
+						const aiResponse = await genai.models.generateContent({
+							model: "gemini-1.5-flash",
+							contents: [{ role: "user", parts: [{ text: `Summarize the following markdown: ${chunked}; The length or token count for the summary depend on the content but always lies between 100 to 1000 tokens` }] }],
+						});
+						summary = aiResponse.candidates[0].content.parts[0].text;
+					} catch {}
+				}
+
+				return { summary, scrapedData, markdown, screenshotUrl };
+			});
+
+			return {
+				success: true,
+				data: poolResult.scrapedData,
+				markdown: poolResult.markdown,
+				summary: poolResult.summary,
+				screenshot: poolResult.screenshotUrl,
+			};
+		} catch (attemptError) {
+			lastError = attemptError;
+			if (useProxy && selectedProxy) proxyManager.recordProxyResult(selectedProxy.host, false);
+			if (attempt < maxAttempts) {
+				await randomDelay(300, 1200);
+				continue;
+			}
+			throw lastError;
+		}
+	}
+
+	throw lastError || new Error("Scraping failed");
+}
+
+// New Puppeteer-based URL scraping endpoint (single URL)
+app.post("/scrape", async (c) => {
 	customLogger("Scraping URL with Puppeteer", await c.req.header());
 
-	// ── Rate limiting: 50 requests / IP / 10 minutes ────────────────────────
 	const RATE_LIMIT = 50;
-	const RATE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
-
+	const RATE_WINDOW_MS = 10 * 60 * 1000;
 	const clientIp =
 		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
 		c.req.header("x-real-ip") ||
-		c.req.header("cf-connecting-ip") || // Cloudflare
+		c.req.header("cf-connecting-ip") ||
 		"unknown";
 
 	const rl = rateLimit(clientIp, RATE_LIMIT, RATE_WINDOW_MS);
-
 	if (!rl.allowed) {
 		c.header("Retry-After", String(rl.retryAfter));
 		c.header("X-RateLimit-Limit", String(RATE_LIMIT));
@@ -3243,16 +3590,14 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		);
 	}
 
-	// Attach remaining quota to every successful response header
 	c.header("X-RateLimit-Limit", String(RATE_LIMIT));
 	c.header("X-RateLimit-Remaining", String(rl.remaining));
 	c.header("X-RateLimit-Window", "10 minutes");
-	// ─────────────────────────────────────────────────────────────────────────
 
 	let {
 		url,
-		selectors = {}, // Custom selectors for specific elements
-		waitForSelector = null, // Wait for specific element to load
+		selectors = {},
+		waitForSelector = null,
 		timeout = 30000,
 		includeSemanticContent = true,
 		includeImages = true,
@@ -3264,782 +3609,33 @@ app.post("/scrap-url-puppeteer", async (c) => {
 		takeScreenshot = false,
 	} = await c.req.json();
 
-	const isValidUrl = isValidURL(url);
-
-	if (!url || !isValidUrl) {
+	if (!url || !isValidURL(url)) {
 		return c.json({ error: "URL is required or invalid" }, 400);
 	}
 
-	let newUrl = rewriteUrl(url);
-	if (newUrl) {
-		url = newUrl;
-	}
-
-	if (newUrl.includes("format=json")) {
-		const data = await scrapJson(newUrl);
-		return c.json({
-			success: true,
-			data: data,
-		});
-	}
-	if (newUrl.includes("format=html")) {
-		const html = await scrapHtml(newUrl);
-		const data = dataExtractionFromHtml(html, {
+	try {
+		const result = await scrapeSingleUrlWithPuppeteer(url, {
+			selectors,
+			waitForSelector,
+			timeout,
 			includeSemanticContent,
 			includeImages,
 			includeLinks,
 			extractMetadata,
+			includeCache,
+			useProxy,
+			aiSummary,
+			takeScreenshot,
 		});
 		return c.json({
 			success: true,
-			data: data,
-		});
-	}
-
-	let existingData;
-	if (includeCache) {
-		// Check if URL already exists in Supabase using an 'eq' filter for exact match
-		const { data, error: fetchError } = await supabase
-			.from("universo")
-			.select("scraped_data, scraped_at, url, markdown, screenshot")
-			.eq("url", url);
-
-		existingData = data[0];
-		if (fetchError || !existingData) {
-			return c.json(
-				{
-					success: false,
-					error: "Internal server error",
-				},
-				500,
-			);
-		}
-	}
-
-	if (existingData && existingData.scraped_data) {
-		// Check if cached data matches current request parameters
-		const scrapedData = existingData.scraped_data;
-
-		return c.json({
-			success: true,
-			data: JSON.parse(scrapedData),
-			markdown: existingData?.markdown,
-			markdownContent: existingData?.markdownContent,
+			...result,
 			url: url,
-			scraped_at: existingData?.scraped_at,
+			timestamp: new Date().toISOString(),
+			poolStats: browserPool.stats,
 		});
-	}
-
-	let scrapedData = {};
-
-	try {
-		// ── Pool-based scraping: no cold browser launches ──
-		const maxAttempts = useProxy ? 3 : 1;
-
-		let lastError;
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			let selectedProxy = null;
-			const { userAgent, extraHTTPHeaders, viewport } = generateRandomHeaders();
-
-			try {
-				if (useProxy) {
-					selectedProxy = proxyManager.getNextProxy();
-				}
-
-				// Acquire a pre-warmed browser from the pool (page is auto-closed by pool)
-				const poolResult = await browserPool.withPage(async (page) => {
-
-					// Apply randomized profile
-					await page.setViewport(viewport);
-					await page.setUserAgent(userAgent);
-					await page.setExtraHTTPHeaders(extraHTTPHeaders);
-
-					// Per-request proxy auth
-					if (useProxy && selectedProxy?.username) {
-						await page.authenticate({
-							username: selectedProxy.username,
-							password: selectedProxy.password,
-						});
-					}
-
-					// Subtle evasions beyond stealth
-					await page.evaluateOnNewDocument(() => {
-						Object.defineProperty(navigator, "webdriver", {
-							get: () => undefined,
-						});
-						Object.defineProperty(navigator, "plugins", {
-							get: () => [1, 2, 3, 4, 5],
-						});
-						Object.defineProperty(navigator, "languages", {
-							get: () => ["en-US", "en"],
-						});
-						const originalQuery = window.navigator.permissions.query;
-						window.navigator.permissions.query = (parameters) =>
-							parameters.name === "notifications"
-								? Promise.resolve({ state: Notification.permission })
-								: originalQuery(parameters);
-					});
-
-					// Enhanced resource blocking for faster loading
-					let blockedResources = {
-						images: 0,
-						fonts: 0,
-						stylesheets: 0,
-						media: 0,
-					};
-
-					// Set request interception
-					await page.setRequestInterception(true);
-					page.on("request", (request) => {
-						const resourceType = request.resourceType();
-						const url = request.url().toLowerCase();
-
-						// Block Vercel security checkpoints and bot detection
-						if (
-							url.includes("vercel") &&
-							(url.includes("security") || url.includes("checkpoint"))
-						) {
-							request.abort();
-							return;
-						}
-
-						// Block Cloudflare and other bot detection services
-						if (
-							url.includes("cloudflare") ||
-							url.includes("bot-detection") ||
-							url.includes("challenge")
-						) {
-							request.abort();
-							return;
-						}
-
-						// Enhanced resource blocking when includeImages is false
-
-						// Block all image-related resources
-						if (resourceType === "image") {
-							blockedResources.images++;
-							request.abort();
-							return;
-						}
-
-						// Block image URLs by file extension
-						const imageExtensions = [
-							".jpg",
-							".jpeg",
-							".png",
-							".gif",
-							".bmp",
-							".webp",
-							".svg",
-							".ico",
-							".tiff",
-							".tif",
-							".heic",
-							".heif",
-							".avif",
-						];
-						const hasImageExtension = imageExtensions.some((ext) =>
-							url.includes(ext),
-						);
-						if (hasImageExtension) {
-							blockedResources.images++;
-							request.abort();
-							return;
-						}
-
-						// Block common image CDN and hosting services
-						const imageServices = [
-							"cdn",
-							"images",
-							"img",
-							"photo",
-							"pic",
-							"media",
-							"assets",
-						];
-						const hasImageService = imageServices.some((service) =>
-							url.includes(service),
-						);
-						if (
-							hasImageService &&
-							(url.includes(".jpg") ||
-								url.includes(".png") ||
-								url.includes(".gif"))
-						) {
-							blockedResources.images++;
-							request.abort();
-							return;
-						}
-
-						// Block data URLs (base64 encoded images)
-						if (url.startsWith("data:image/")) {
-							blockedResources.images++;
-							request.abort();
-							return;
-						}
-
-						// Always block fonts and handle stylesheets gracefully for faster loading
-						if (resourceType === "stylesheet") {
-							blockedResources.stylesheets++;
-							// Respond with empty CSS to avoid 'Could not parse CSS stylesheet' errors
-							request.respond({
-								status: 200,
-								contentType: "text/css",
-								body: "",
-							});
-							return;
-						}
-						if (resourceType === "font") {
-							blockedResources.fonts++;
-							request.abort();
-							return;
-						}
-
-						// Block media files (videos, audio) for faster loading
-						if (["media"].includes(resourceType)) {
-							blockedResources.media++;
-							request.abort();
-							return;
-						}
-
-						request.continue();
-					});
-
-					// Navigate to URL
-					const navStart = Date.now();
-					let redditUrl = null;
-					if (url.includes("reddit.com")) {
-						redditUrl = url.endsWith("/")
-							? url.slice(0, -1) + ".json"
-							: url + "/.json";
-						await page.goto(redditUrl, {
-							waitUntil: "domcontentloaded",
-							timeout: timeout,
-						});
-						const jsonText = await page.$eval("pre", (el) => el.textContent);
-						const parsedData = await parseRedditData(jsonText, url);
-						const { markdown, posts } = parsedData;
-
-						return c.json({
-							success: true,
-							url: url,
-							jsonText: jsonText,
-							markdown: markdown,
-							data: {
-								posts: posts,
-								url: url,
-								title: "Reddit Posts",
-								metadata: null,
-							},
-						});
-					}
-					await page.goto(url, {
-						waitUntil: "domcontentloaded",
-						timeout: timeout,
-					});
-					const navLatency = Date.now() - navStart;
-
-					// Wait for specific selector if provided
-					if (waitForSelector) {
-						try {
-							await page.waitForSelector(waitForSelector, { timeout: 10000 });
-						} catch (error) {
-							console.warn(
-								`Selector ${waitForSelector} not found within timeout`,
-							);
-						}
-					}
-
-					// Extract page content
-					if (includeSemanticContent) {
-						scrapedData = await page.evaluate(
-							async (options, preProcessedContent) => {
-								const data = {
-									url: window.location.href,
-									title: document.title,
-									content: {},
-									metadata: {},
-									links: [],
-									images: [],
-									screenshot: null,
-									orderedContent: preProcessedContent, // Use the pre-processed content
-								};
-
-								const selectorsToRemove = [
-									"header",
-									"footer",
-									"nav",
-									"aside",
-									".header",
-									".top",
-									".navbar",
-									"#header",
-									".footer",
-									".bottom",
-									"#footer",
-									".sidebar",
-									".side",
-									".aside",
-									"#sidebar",
-									".modal",
-									".popup",
-									"#modal",
-									".overlay",
-									".ad",
-									".ads",
-									".advert",
-									"#ad",
-									".lang-selector",
-									".language",
-									"#language-selector",
-									".social",
-									".social-media",
-									".social-links",
-									"#social",
-									".menu",
-									".navigation",
-									"#nav",
-									".breadcrumbs",
-									"#breadcrumbs",
-									".share",
-									"#share",
-									".widget",
-									"#widget",
-									".cookie",
-									"#cookie",
-									"script",
-									"style",
-									"noscript",
-								];
-
-								selectorsToRemove.forEach((sel) => {
-									document.querySelectorAll(sel).forEach((el) => el.remove());
-								});
-
-								[("h1", "h2", "h3", "h4", "h5", "h6")].forEach((tag) => {
-									data.content[tag] = Array.from(
-										document.querySelectorAll(tag),
-									).map((h) => h.textContent.trim());
-								});
-
-								// Extract metadata
-								if (options.extractMetadata) {
-									// Meta tags
-									const metaTags = document.querySelectorAll("meta");
-									metaTags.forEach((meta) => {
-										const name =
-											meta.getAttribute("name") || meta.getAttribute("property");
-										const content = meta.getAttribute("content");
-										if (name && content) {
-											data.metadata[name] = content;
-										}
-									});
-
-									// Open Graph tags
-									const ogTags = document.querySelectorAll(
-										'meta[property^="og:"]',
-									);
-									ogTags.forEach((meta) => {
-										const property = meta.getAttribute("property");
-										const content = meta.getAttribute("content");
-										if (property && content) {
-											data.metadata[property] = content;
-										}
-									});
-
-									// Twitter Card tags
-									const twitterTags = document.querySelectorAll(
-										'meta[name^="twitter:"]',
-									);
-									twitterTags.forEach((meta) => {
-										const name = meta.getAttribute("name");
-										const content = meta.getAttribute("content");
-										if (name && content) {
-											data.metadata[name] = content;
-										}
-									});
-								}
-
-								// Extract links
-								if (options.includeLinks) {
-									const links = document.querySelectorAll("a[href]");
-
-									const currentUrl = new URL(window.location.href);
-									const seedDomain = currentUrl.hostname;
-
-									const rawLinks = Array.from(links).map((link) => ({
-										text: link.textContent.trim(),
-										href: link.href,
-										title: link.getAttribute("title") || "",
-									}));
-
-									// Filter links by domain and remove duplicates
-									const seenLinks = new Set();
-									data.links = rawLinks.filter((link) => {
-										// Skip if no meaningful text or title
-										if (!(link?.text?.length > 0 || link?.title?.length > 0)) {
-											return false;
-										}
-
-										try {
-											// Check if link URL is valid and matches seed domain
-											const linkUrl = new URL(link.href);
-											if (linkUrl.hostname !== seedDomain) {
-												return false; // Skip external links
-											}
-										} catch (error) {
-											// Skip invalid URLs
-											return false;
-										}
-
-										// Remove duplicates based on text, href, or title
-										const key = `${link.text}|${link.href}|${link.title}`;
-										if (seenLinks.has(key)) return false;
-										seenLinks.add(key);
-										return true;
-									});
-								}
-
-								if (options.includeSemanticContent) {
-									// Extract semantic content with optimized methods - prioritizing important content
-									const extractSemanticContent = (
-										selector,
-										processor = (el) => el.textContent.trim(),
-									) => {
-										const elements = document.querySelectorAll(selector);
-										return elements.length > 0
-											? Array.from(elements).map(processor)
-											: [];
-									};
-
-									const extractTableContent = (table) => {
-										const rows = Array.from(table.querySelectorAll("tr"));
-										return rows
-											.map((row) => {
-												const cells = Array.from(
-													row.querySelectorAll("td, th"),
-												).map((cell) => cell.textContent.trim());
-												return cells.filter((cell) => cell.length > 0);
-											})
-											.filter((row) => row.length > 0);
-									};
-
-									const extractListContent = (list) => {
-										return Array.from(list.querySelectorAll("li"))
-											.map((li) => li.textContent.trim())
-											.filter((item) => item.length > 0);
-									};
-
-									// Prioritized semantic content - focus on main content, skip navigation/footer/repetitive elements
-									const rawSemanticContent = {
-										// High priority: Main content elements
-										articleContent: extractSemanticContent("article"),
-
-										divs: extractSemanticContent("div"),
-
-										// High priority: Core text content
-										paragraphs: extractSemanticContent("p"),
-										span: extractSemanticContent("span"),
-										blockquotes: extractSemanticContent("blockquote"),
-										codeBlocks: extractSemanticContent("code"),
-										preformatted: extractSemanticContent("pre"),
-										tables: extractSemanticContent("table", extractTableContent),
-										unorderedLists: extractSemanticContent(
-											"ul",
-											extractListContent,
-										),
-										orderedLists: extractSemanticContent(
-											"ol",
-											extractListContent,
-										),
-									};
-
-									// Remove duplicates from semantic content
-									const removeDuplicates = (array) => {
-										if (!Array.isArray(array)) return array;
-										const seen = new Set();
-										return array.filter((item) => {
-											if (typeof item === "string") {
-												const normalized = item.toLowerCase().trim();
-												if (seen.has(normalized)) return false;
-												seen.add(normalized);
-												return true;
-											} else if (typeof item === "object" && item !== null) {
-												// Handle complex objects like tables
-												const key = JSON.stringify(item);
-												if (seen.has(key)) return false;
-												seen.add(key);
-												return true;
-											}
-											return true;
-										});
-									};
-
-									// Apply duplicate removal to prioritized semantic content
-									data.content.semanticContent = Object.fromEntries(
-										Object.entries(rawSemanticContent).map(([key, value]) => [
-											key,
-											removeDuplicates(value),
-										]),
-									);
-								}
-
-								// Extract images
-								if (options.includeImages) {
-									const images = document.querySelectorAll("img[src]");
-									data.images = Array.from(images).filter((img) => {
-										if (
-											img.src.startsWith("data:image/") ||
-											img.src.startsWith("blob:") ||
-											img.src.startsWith("image:") ||
-											img.src.startsWith("data:")
-										) {
-											return;
-										}
-										return {
-											src: img.src,
-											alt: img.alt || "",
-											title: img.title || "",
-											width: img.naturalWidth || img.width,
-											height: img.naturalHeight || img.height,
-										};
-									});
-								}
-
-								// Extract custom selectors if provided
-								if (
-									options.selectors &&
-									Object.keys(options.selectors).length > 0
-								) {
-									data.customSelectors = {};
-									for (const [key, selector] of Object.entries(
-										options.selectors,
-									)) {
-										try {
-											const elements = document.querySelectorAll(selector);
-											if (elements.length === 1) {
-												data.customSelectors[key] =
-													elements[0].textContent.trim();
-											} else if (elements.length > 1) {
-												data.customSelectors[key] = Array.from(elements).map(
-													(el) => el.textContent.trim(),
-												);
-											}
-										} catch (error) {
-											data.customSelectors[key] = null;
-										}
-									}
-								}
-
-								return data;
-							},
-							{
-								extractMetadata,
-								includeImages,
-								includeLinks,
-								includeSemanticContent,
-								selectors,
-							},
-						);
-					}
-
-					// Get page content and process with JSDOM
-					const pageHtml = await page.content();
-					const dom = new JSDOM(pageHtml);
-					const document = dom.window.document;
-
-					// Remove unwanted elements from JSDOM document
-					const selectorsToRemove = [
-						"header",
-						"footer",
-						"nav",
-						"aside",
-						".header",
-						".top",
-						".navbar",
-						"#header",
-						".footer",
-						".bottom",
-						"#footer",
-						".sidebar",
-						".side",
-						".aside",
-						"#sidebar",
-						".modal",
-						".popup",
-						"#modal",
-						".overlay",
-						".ad",
-						".ads",
-						".advert",
-						"#ad",
-						".lang-selector",
-						".language",
-						"#language-selector",
-						".social",
-						".social-media",
-						".social-links",
-						"#social",
-						".menu",
-						".navigation",
-						"#nav",
-						".breadcrumbs",
-						"#breadcrumbs",
-						".share",
-						"#share",
-						".widget",
-						"#widget",
-						".cookie",
-						"#cookie",
-						"script",
-						"style",
-						"noscript",
-					];
-
-					selectorsToRemove.forEach((sel) => {
-						document.querySelectorAll(sel).forEach((el) => el.remove());
-					});
-
-					const { markdown } = extractSemanticContentWithFormattedMarkdown(
-						document.body,
-					);
-
-					// Optional screenshot capture and upload
-					let screenshotUrl = null;
-					if (takeScreenshot) {
-						try {
-							const screenshotBuffer = await page.screenshot({ fullPage: true });
-							const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(
-								/[^a-zA-Z0-9]/g,
-								"",
-							)}.png`;
-							const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-							const file = bucket.file(
-								`ihr-website-screenshot/${uniqueFileName}`,
-							);
-							await file.save(screenshotBuffer, {
-								metadata: {
-									contentType: "image/png",
-									cacheControl: "public, max-age=3600",
-								},
-							});
-							await file.makePublic();
-							screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
-						} catch (ssErr) {
-							console.error("❌ Error taking/uploading screenshot:", ssErr);
-						}
-					}
-
-					// page.close() is handled by browserPool.withPage automatically
-
-					// Record proxy performance
-					if (useProxy && selectedProxy) {
-						proxyManager.recordProxyResult(selectedProxy.host, true, navLatency);
-					}
-
-					// Store new data in Supabase
-					try {
-						if (!includeCache) {
-							// Check if the URL already exists in the "universo" table
-							const { data: existingRows, error: fetchError } = await supabase
-								.from("universo")
-								.select("id")
-								.eq("url", url);
-
-							let insertError = null;
-							if (!fetchError && (!existingRows || existingRows.length === 0)) {
-								const { error } = await supabase.from("universo").insert({
-									title: scrapedData?.title || "No Title",
-									url: url,
-									markdown: markdown,
-									scraped_at: new Date().toISOString(),
-									scraped_data: JSON.stringify(scrapedData),
-								});
-								insertError = error;
-							}
-
-							if (insertError) {
-								console.error("❌ Error storing data in Supabase:", insertError);
-								throw insertError;
-							}
-						}
-					} catch (supabaseError) {
-						console.error("❌ Supabase storage error:", supabaseError);
-					}
-
-					// Remove empty keys from content
-					if (includeSemanticContent && scrapedData?.content) {
-						removeEmptyKeys(scrapedData?.content);
-					}
-
-					let summary;
-					if (aiSummary) {
-						let MAX_TOKENS_LIMIT = 3000;
-						const splitter = RecursiveCharacterTextSplitter.fromLanguage(
-							"markdown",
-							{
-								separators: "\n\n",
-								chunkSize: 1024,
-								chunkOverlap: 128,
-							},
-						);
-						const chunkInput = await splitter.splitText(markdown);
-						const slicedChunkInput = chunkInput.slice(0, MAX_TOKENS_LIMIT);
-						const chunkedMarkdown = slicedChunkInput.join("\n\n");
-						const aiResponse = await genai.models.generateContent({
-							model: "gemini-1.5-flash",
-							contents: [
-								{
-									role: "user",
-									parts: [
-										{
-											text: `Summarize the following markdown: ${chunkedMarkdown};
-										The length or token count for the summary depend on the content but always lies between
-										100 to 1000 tokens
-										
-										`,
-										},
-									],
-								},
-							],
-						});
-						summary = aiResponse.candidates[0].content.parts[0].text;
-					}
-
-					return {
-						summary,
-						scrapedData,
-						markdown,
-						screenshotUrl,
-					};
-				}); // end browserPool.withPage
-
-				return c.json({
-					success: true,
-					summary: poolResult.summary,
-					data: poolResult.scrapedData,
-					url: url,
-					markdown: poolResult.markdown,
-					screenshot: poolResult.screenshotUrl,
-					timestamp: new Date().toISOString(),
-					poolStats: browserPool.stats,
-				});
-			} catch (attemptError) {
-				lastError = attemptError;
-				if (useProxy && selectedProxy) {
-					proxyManager.recordProxyResult(selectedProxy.host, false);
-				}
-				// Backoff before retrying (no browser.close needed — pool handles it)
-				if (attempt < maxAttempts) {
-					await randomDelay(300, 1200);
-					continue;
-				}
-				throw attemptError;
-			}
-		}
 	} catch (error) {
 		console.error("❌ Web scraping error (Puppeteer):", error);
-
 		return c.json(
 			{
 				success: false,
@@ -4050,12 +3646,128 @@ app.post("/scrap-url-puppeteer", async (c) => {
 			500,
 		);
 	}
-	// No finally browser.close() needed — browserPool.withPage() handles cleanup
 });
 
-// Browser pool diagnostics
-app.get("/pool-stats", (c) => {
-	return c.json({ browserPool: browserPool.stats });
+// Batch Puppeteer scraping: multiple URLs in parallel, never fails entire request
+app.post("/scrape-multiple", async (c) => {
+	customLogger("Scraping URLs (batch) with Puppeteer", await c.req.header());
+
+	const RATE_LIMIT = 100;
+	const RATE_WINDOW_MS = 10 * 60 * 1000;
+	const MAX_URLS = 20;
+
+	const clientIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+
+	const rl = rateLimit(clientIp, RATE_LIMIT, RATE_WINDOW_MS);
+	if (!rl.allowed) {
+		c.header("Retry-After", String(rl.retryAfter));
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: rl.retryAfter,
+			},
+			429,
+		);
+	}
+
+	c.header("X-RateLimit-Limit", String(RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(rl.remaining));
+
+	let {
+		urls,
+		selectors = {},
+		waitForSelector = null,
+		timeout = 30000,
+		includeSemanticContent = true,
+		includeImages = true,
+		includeLinks = true,
+		extractMetadata = true,
+		includeCache = false,
+		useProxy = false,
+		aiSummary = false,
+		takeScreenshot = false,
+	} = await c.req.json();
+
+	if (!Array.isArray(urls) || urls.length === 0) {
+		return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+	}
+
+	if (urls.length > MAX_URLS) {
+		return c.json(
+			{
+				success: false,
+				error: `Maximum ${MAX_URLS} URLs per request`,
+			},
+			400,
+		);
+	}
+
+	const options = {
+		selectors,
+		waitForSelector,
+		timeout,
+		includeSemanticContent,
+		includeImages,
+		includeLinks,
+		extractMetadata,
+		includeCache,
+		useProxy,
+		aiSummary,
+		takeScreenshot,
+	};
+
+	const results = await Promise.all(
+		urls.map(async (url) => {
+			const inputUrl = typeof url === "string" ? url : url?.url ?? url;
+			if (!inputUrl || !isValidURL(inputUrl)) {
+				return {
+					url: inputUrl || "invalid",
+					success: false,
+					error: "Invalid or missing URL",
+					data: {},
+					markdown: null,
+					summary: null,
+					screenshot: null,
+				};
+			}
+			try {
+				const result = await scrapeSingleUrlWithPuppeteer(inputUrl, options);
+				return {
+					url: inputUrl,
+					success: true,
+					data: result.data,
+					markdown: result.markdown,
+					summary: result.summary,
+					screenshot: result.screenshot,
+					error: null,
+				};
+			} catch (err) {
+				const msg = err?.message || "Scraping failed";
+				console.warn(`⚠️ Scrape failed for ${inputUrl}:`, msg);
+				return {
+					url: inputUrl,
+					success: false,
+					error: msg,
+					data: {},
+					markdown: null,
+					summary: null,
+					screenshot: null,
+				};
+			}
+		}),
+	);
+
+	return c.json({
+		success: true,
+		results,
+		timestamp: new Date().toISOString(),
+		poolStats: browserPool.stats,
+	});
 });
 
 // Take Screenshot API Endpoint
@@ -5395,7 +5107,7 @@ const parseRedditData = (data, url) => {
 	)}\n`;
 	markdown += `- **Average Upvote Ratio:** ${Math.round(
 		(posts.reduce((sum, post) => sum + post.upvoteRatio, 0) / posts.length) *
-		100,
+			100,
 	)}%\n`;
 
 	return { markdown, posts };
@@ -6106,11 +5818,11 @@ app.post("/generate-repo-docs", async (c) => {
 		const contents = contentsRes.ok ? await contentsRes.json() : [];
 		const keyFiles = Array.isArray(contents)
 			? contents.map((e) => ({
-				name: e.name,
-				path: e.path,
-				type: e.type,
-				size: e.size,
-			}))
+					name: e.name,
+					path: e.path,
+					type: e.type,
+					size: e.size,
+				}))
 			: [];
 
 		const repoBundle = {
@@ -6298,8 +6010,9 @@ app.post("/generate-repo-changelog", async (c) => {
 				until,
 				per_page: 100,
 			});
-			const commitsUrl = `https://api.github.com/repos/${owner}/${repoName}/commits${commitQP ? `?${commitQP}` : ""
-				}`;
+			const commitsUrl = `https://api.github.com/repos/${owner}/${repoName}/commits${
+				commitQP ? `?${commitQP}` : ""
+			}`;
 			const commitsRes = await fetch(commitsUrl, { headers: ghHeaders });
 			commits = commitsRes.ok ? await commitsRes.json() : [];
 		}
@@ -6314,8 +6027,9 @@ app.post("/generate-repo-changelog", async (c) => {
 				sort: "updated",
 				direction: "desc",
 			});
-			const issuesUrl = `https://api.github.com/repos/${owner}/${repoName}/issues${prsQP ? `?${prsQP}` : ""
-				}`;
+			const issuesUrl = `https://api.github.com/repos/${owner}/${repoName}/issues${
+				prsQP ? `?${prsQP}` : ""
+			}`;
 			const issuesRes = await fetch(issuesUrl, { headers: ghHeaders });
 			const issues = issuesRes.ok ? await issuesRes.json() : [];
 			const isWithin = (dateStr) => {
@@ -6397,12 +6111,13 @@ Rules:
 - Keep it factual, concise, and useful for developers.
 - If information is missing, omit rather than speculate.`;
 
-		const userPrompt = `Repository: ${owner}/${repoName}\nWindow: from=${since || "unknown"
-			} to=${until || "unknown"}\n\nData:\n${JSON.stringify(
-				changelogBundle,
-				null,
-				2,
-			)}\n\nReturn only the JSON.`;
+		const userPrompt = `Repository: ${owner}/${repoName}\nWindow: from=${
+			since || "unknown"
+		} to=${until || "unknown"}\n\nData:\n${JSON.stringify(
+			changelogBundle,
+			null,
+			2,
+		)}\n\nReturn only the JSON.`;
 
 		const aiResponse = await genai.models.generateContent({
 			model: "gemini-1.5-flash",
@@ -6439,8 +6154,9 @@ Rules:
 					},
 				],
 				contributors,
-				release_notes_markdown: `# Changelog\n\n- Fallback generated from commits (${(changelogBundle.commits || []).length
-					}) and PRs (${(changelogBundle.pull_requests || []).length}).`,
+				release_notes_markdown: `# Changelog\n\n- Fallback generated from commits (${
+					(changelogBundle.commits || []).length
+				}) and PRs (${(changelogBundle.pull_requests || []).length}).`,
 			};
 		}
 
@@ -6834,180 +6550,8 @@ app.get("/scrap-grokipedia", async (c) => {
 	}
 });
 
-const port = 3001;
-console.log(`Server is running on port ${port}`);
-
-app.post("/get-roadmap", async (c) => {
-	try {
-		const { roadmapId } = await c.req.json();
-		const roadmap = await firestore
-			.collection("Templates")
-			.doc(roadmapId)
-			.get();
-		const roadmapData = roadmap.data();
-
-		const threadsContent = roadmapData.editorThreads || [];
-
-		// For any thread of type 'page', fetch its child content from
-		// Templates/{roadmapId}/childrens/{childId} and merge into the item
-		const newContent = await Promise.all(
-			threadsContent.map(async (item) => {
-				if (item?.type !== "page" || !item?.data?.childId) {
-					return item;
-				}
-
-				try {
-					const childSnap = await firestore
-						.collection("Templates")
-						.doc(roadmapId)
-						.collection("childrens")
-						.doc(item.data.childId)
-						.get();
-					const childData = childSnap.exists ? childSnap.data() : null;
-
-					const mergedItem = {
-						...item,
-						...childData,
-					};
-
-					const passthroughKeys = [
-						"description",
-						"editorThreads",
-						"lastEditedAt",
-						"name",
-						"thumbnailIconName",
-						"title",
-					];
-
-					if (childData && typeof childData === "object") {
-						for (const key of passthroughKeys) {
-							if (childData[key] !== undefined) {
-								mergedItem[key] = childData[key];
-							}
-						}
-					}
-
-					return mergedItem;
-				} catch (e) {
-					// If fetch fails for a child, keep the original item
-					return item;
-				}
-			}),
-		);
-
-		await firestore
-			.collection("Templates")
-			.doc(roadmapId)
-			.update({
-				newContent: JSON.stringify(newContent),
-			});
-
-		return c.json({
-			newContent: newContent,
-		});
-	} catch (error) {
-		console.error(error.message);
-		return c.json({ error: "Failed to get roadmap data" }, 500);
-	}
-});
-
-async function downloadImageToFile(url, destPath) {
-	const res = await fetch(url);
-	if (!res.ok) throw new Error(`Image download failed: ${url}`);
-	const buf = await res.arrayBuffer();
-	await fsp.writeFile(destPath, Buffer.from(buf));
-}
-
-async function buildVideoWithFFmpeg(scenes, screenshots, jobId) {
-	const tmpDir = path.join(tmpdir(), `video_${jobId}`);
-	await fsp.mkdir(tmpDir, { recursive: true });
-
-	const segmentPaths = [];
-
-	for (let i = 0; i < scenes.length; i++) {
-		const scene = scenes[i];
-		const segPath = path.join(tmpDir, `seg_${i}.mp4`);
-		const imageUrl =
-			screenshots.length > 0 ? screenshots[i % screenshots.length] : null;
-		const imgPath = path.join(tmpDir, `img_${i}.jpg`);
-
-		let hasImage = false;
-		if (imageUrl) {
-			try {
-				await downloadImageToFile(imageUrl, imgPath);
-				hasImage = true;
-			} catch {
-				hasImage = false;
-			}
-		}
-
-		// Escape special chars for ffmpeg drawtext
-		const safeText = scene.headline
-			.replace(/\\/g, "\\\\")
-			.replace(/'/g, "\u2019")
-			.replace(/:/g, "\\:");
-
-		await new Promise((resolve, reject) => {
-			const cmd = ffmpeg();
-
-			if (hasImage) {
-				cmd.input(imgPath).inputOptions(["-loop 1"]);
-			} else {
-				cmd.input("color=black:size=1280x720:rate=25").inputFormat("lavfi");
-			}
-
-			cmd
-				.duration(scene.duration)
-				.videoFilters([
-					"scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
-					`drawtext=text='${safeText}':fontsize=52:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=(h-text_h)/2`,
-				])
-				.outputOptions(["-pix_fmt yuv420p", "-r 25", "-an"])
-				.output(segPath)
-				.on("end", resolve)
-				.on("error", reject)
-				.run();
-		});
-
-		segmentPaths.push(segPath);
-	}
-
-	// Concat all segments
-	const concatFile = path.join(tmpDir, "concat.txt");
-	await fsp.writeFile(
-		concatFile,
-		segmentPaths.map((f) => `file '${f}'`).join("\n"),
-	);
-
-	const outputPath = path.join(tmpDir, "output.mp4");
-	await new Promise((resolve, reject) => {
-		ffmpeg()
-			.input(concatFile)
-			.inputOptions(["-f concat", "-safe 0"])
-			.outputOptions(["-c copy"])
-			.output(outputPath)
-			.on("end", resolve)
-			.on("error", reject)
-			.run();
-	});
-
-	// Upload to Firebase Storage
-	const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-	const destination = `videos/${jobId}.mp4`;
-	await bucket.upload(outputPath, {
-		destination,
-		metadata: { contentType: "video/mp4" },
-	});
-	const file = bucket.file(destination);
-	await file.makePublic();
-	const videoUrl = `https://storage.googleapis.com/${bucket.name}/${destination}`;
-
-	await fsp.rm(tmpDir, { recursive: true, force: true });
-	return videoUrl;
-}
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-
 app.post("/generate-launch-kit", async (c) => {
 	const { url, tone = "bold" } = await c.req.json();
 
@@ -7015,15 +6559,13 @@ app.post("/generate-launch-kit", async (c) => {
 	/* 1️⃣ Crawl Website via Firecrawl   */
 	/* ---------------------------------- */
 	async function crawlWebsite(targetUrl) {
-		const res = await fetch("https://api.firecrawl.dev/v0/scrape", {
+		const res = await fetch("https://api.inkgest.com/scrape", {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
 			},
 			body: JSON.stringify({
 				url: targetUrl,
-				formats: ["markdown"],
 			}),
 		});
 
@@ -7161,6 +6703,10 @@ ${JSON.stringify(structured)}`;
 		return c.json({ success: false, error: "Generation failed" }, 500);
 	}
 });
+
+
+const port = 3002;
+console.log(`Server is running on port ${port}`);
 
 // Start the server
 serve({

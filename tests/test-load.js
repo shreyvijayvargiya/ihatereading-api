@@ -7,7 +7,7 @@ const startTime = performance.now();
 
 // Test configuration
 const testConfig = {
-	url: "http://localhost:3001/scrap-url-puppeteer", // Adjust port if different
+	url: "http://localhost:3001/scrape", // Adjust port if different
 	connections: 5, // Number of concurrent connections
 	amount: 100, // Exactly 100 requests
 	pipelining: 1, // Number of pipelined requests per connection
@@ -77,16 +77,16 @@ function logResourceUsage() {
 	console.log("\n💾 Resource Usage:");
 	console.log(`⏱️  Elapsed Time: ${elapsedTime.toFixed(2)}s`);
 	console.log(
-		`🧠 RSS Memory: ${(currentMemory.rss / 1024 / 1024).toFixed(2)} MB`
+		`🧠 RSS Memory: ${(currentMemory.rss / 1024 / 1024).toFixed(2)} MB`,
 	);
 	console.log(
-		`💻 Heap Used: ${(currentMemory.heapUsed / 1024 / 1024).toFixed(2)} MB`
+		`💻 Heap Used: ${(currentMemory.heapUsed / 1024 / 1024).toFixed(2)} MB`,
 	);
 	console.log(
-		`🗑️  Heap Total: ${(currentMemory.heapTotal / 1024 / 1024).toFixed(2)} MB`
+		`🗑️  Heap Total: ${(currentMemory.heapTotal / 1024 / 1024).toFixed(2)} MB`,
 	);
 	console.log(
-		`📊 External: ${(currentMemory.external / 1024 / 1024).toFixed(2)} MB`
+		`📊 External: ${(currentMemory.external / 1024 / 1024).toFixed(2)} MB`,
 	);
 
 	// Calculate memory growth
@@ -104,7 +104,7 @@ instance.on("tick", (results) => {
 				testConfig.amount
 			} requests, ${results.requests.average || 0} req/sec, ${
 				results.latency.average || 0
-			}ms latency`
+			}ms latency`,
 		);
 
 		// Log resources every 10 requests

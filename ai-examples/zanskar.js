@@ -52,7 +52,7 @@ const crawlUrlFnDecl = {
 	},
 };
 
-// One endpoint: LLM answers, and can call google-search and scrap-url-puppeteer as needed
+// One endpoint: LLM answers, and can call google-search and scrape as needed
 app.post("/ai-answer", async (c) => {
 	try {
 		const { prompt, numResults = 5 } = await c.req.json();
@@ -146,12 +146,12 @@ User prompt: ${prompt}`,
 				toolArtifacts.searchResults.push(...resultPayload);
 			} else if (name === "scrap_url") {
 				const scrapRes = await axios.post(
-					`${baseUrl}/scrap-url-puppeteer`,
+					`${baseUrl}/scrape`,
 					{ url: args?.url },
 					{
 						headers: { "Content-Type": "application/json" },
 						timeout: 60000,
-					}
+					},
 				);
 				resultPayload = {
 					url: args?.url,
@@ -163,7 +163,7 @@ User prompt: ${prompt}`,
 				const scrapMetadataRes = await axios.post(
 					`${baseUrl}/take-metadata`,
 					{ url: args?.url },
-					{ headers: { "Content-Type": "application/json" } }
+					{ headers: { "Content-Type": "application/json" } },
 				);
 				resultPayload = {
 					url: args?.url,
@@ -174,7 +174,7 @@ User prompt: ${prompt}`,
 				const crawlUrlRes = await axios.post(
 					`${baseUrl}/crawl-url`,
 					{ url: args?.url },
-					{ headers: { "Content-Type": "application/json" } }
+					{ headers: { "Content-Type": "application/json" } },
 				);
 				resultPayload = {
 					url: args?.url,
@@ -253,10 +253,10 @@ app.post("/ai-answer-ollama", async (c) => {
 			typeof queryGen?.content === "string"
 				? queryGen.content
 				: Array.isArray(queryGen?.content)
-				? queryGen.content
-						.map((p) => (typeof p === "string" ? p : JSON.stringify(p)))
-						.join("\n")
-				: String(queryGen || "");
+					? queryGen.content
+							.map((p) => (typeof p === "string" ? p : JSON.stringify(p)))
+							.join("\n")
+					: String(queryGen || "");
 		const jsonMatch = queryText.match(/\[[\s\S]*\]/);
 		if (jsonMatch) {
 			try {
@@ -282,7 +282,7 @@ app.post("/ai-answer-ollama", async (c) => {
 				const searchRes = await axios.post(
 					`${baseUrl}/ddg-search`,
 					{ query: q, num: numResults, language: "en", country: "in" },
-					{ headers: { "Content-Type": "application/json" } }
+					{ headers: { "Content-Type": "application/json" } },
 				);
 
 				const rows = searchRes.data?.results || [];
@@ -310,7 +310,7 @@ app.post("/ai-answer-ollama", async (c) => {
 		const chooserPrompt = `Given these search results, pick up to ${scrapeTopK} URLs that are most likely to contain authoritative, detailed content for answering the user's prompt. Respond with a JSON array of URLs only.\n\nSearch results:\n${JSON.stringify(
 			searchResults,
 			null,
-			2
+			2,
 		)}\n\nUser prompt:\n${prompt}`;
 		const chooseRes = await ollama.invoke(chooserPrompt);
 		const chooseText =
@@ -332,9 +332,9 @@ app.post("/ai-answer-ollama", async (c) => {
 		// Step 4: Scrape selected URLs for chunked markdown
 		const scrapsPromises = urlsToScrape.map(async (url) => {
 			const scrapRes = await axios.post(
-				`${baseUrl}/scrap-url-puppeteer`,
+				`${baseUrl}/scrape`,
 				{ url },
-				{ headers: { "Content-Type": "application/json" }, timeout: 60000 }
+				{ headers: { "Content-Type": "application/json" }, timeout: 60000 },
 			);
 			return {
 				url,
@@ -357,14 +357,14 @@ User prompt:\n${prompt}
 \n\nSearch results (title, link, description):\n${JSON.stringify(
 			searchResults,
 			null,
-			2
+			2,
 		)}\n\nScraped markdown (url + markdown chunks):\n${JSON.stringify(
 			scrapsResults.map(({ url, markdown }) => ({
 				url,
 				markdown,
 			})),
 			null,
-			2
+			2,
 		)}`;
 		const finalRes = await ollama.invoke(finalPrompt);
 		const finalText =
