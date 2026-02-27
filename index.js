@@ -12,6 +12,15 @@ import { JSDOM } from "jsdom";
 import axios from "axios";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
+import {
+	extractUrlsFromText,
+	scrapeUrlsViaApi,
+	ROUTER_SYSTEM_PROMPT,
+	parseAgentResponse,
+	SKILLS,
+	TASK_TYPES,
+	CREDITS,
+} from "./lib/inkgestAgent.js";
 import { logger } from "hono/logger";
 import UserAgents from "user-agents";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
@@ -3769,6 +3778,255 @@ app.post("/scrape-multiple", async (c) => {
 		poolStats: browserPool.stats,
 	});
 });
+
+// ─── Inkgest Agent: one LLM + scrape endpoints + extensible skills ────────
+const INKGEST_SCRAPE_BASE =
+	process.env.INKGEST_AGENT_SCRAPE_BASE_URL || "http://localhost:3002";
+
+async function openRouterChatMessages(apiKey, messages, maxTokens = 1200) {
+	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${apiKey}`,
+		},
+		body: JSON.stringify({
+			model: process.env.OPENROUTER_AGENT_MODEL || process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
+			messages,
+			temperature: 0.3,
+			max_tokens: maxTokens,
+		}),
+	});
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok) {
+		throw new Error(data?.error?.message || `OpenRouter error (${res.status})`);
+	}
+	const content = data?.choices?.[0]?.message?.content || "";
+	const usage = data?.usage
+		? {
+				prompt_tokens: data.usage.prompt_tokens ?? 0,
+				completion_tokens: data.usage.completion_tokens ?? 0,
+				total_tokens: data.usage.total_tokens ?? 0,
+			}
+		: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+	return { content, usage };
+}
+
+app.post("/inkgest-agent", async (c) => {
+	try {
+		const openRouterKey = process.env.OPENROUTER_API_KEY;
+		if (!openRouterKey) {
+			return c.json({ error: "OPENROUTER_API_KEY not configured" }, 500);
+		}
+
+		const { prompt = "", chatHistory = [], executeTasks = [] } = (await c.req.json().catch(() => ({}))) || {};
+		const userPrompt = String(prompt).trim();
+		const hasExecuteTasks = Array.isArray(executeTasks) && executeTasks.length > 0;
+
+		if (!userPrompt && !hasExecuteTasks) {
+			return c.json({ error: "Prompt or executeTasks required" }, 400);
+		}
+
+		const extractedUrls = hasExecuteTasks
+			? [...new Set(
+					executeTasks.flatMap((t) =>
+						(Array.isArray(t.params?.urls) ? t.params.urls : []).filter((u) =>
+							/^https?:\/\/\S+$/i.test(String(u)),
+						),
+					),
+				)]
+			: extractUrlsFromText(userPrompt);
+
+		const urlsToScrape = extractedUrls.slice(0, 10);
+		let scrapedSources = [];
+		let parsed = {};
+		let suggestedTasks = [];
+
+		const creditsDistribution = [];
+		let creditsUsed = 0;
+		const tokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
+		function addTokenUsage(usage) {
+			if (usage && typeof usage === "object") {
+				tokenUsage.prompt_tokens += usage.prompt_tokens || 0;
+				tokenUsage.completion_tokens += usage.completion_tokens || 0;
+				tokenUsage.total_tokens += usage.total_tokens || 0;
+			}
+		}
+
+		if (!hasExecuteTasks) {
+			const userContent = `User message: ${userPrompt}\n\nURLs found: ${urlsToScrape.length ? urlsToScrape.join(", ") : "none"}`;
+			const messages = [
+				{ role: "system", content: ROUTER_SYSTEM_PROMPT },
+				...chatHistory.slice(-6).map((m) => ({
+					role: m.role === "user" ? "user" : "assistant",
+					content: m.content,
+				})),
+				{ role: "user", content: userContent },
+			];
+
+			const [scraped, routerResult] = await Promise.all([
+				urlsToScrape.length > 0
+					? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urlsToScrape, { includeImages: true })
+					: Promise.resolve({ sources: [], errors: [] }),
+				openRouterChatMessages(openRouterKey, messages),
+			]);
+
+			scrapedSources = scraped.sources || [];
+			const raw = routerResult.content;
+			addTokenUsage(routerResult.usage);
+			creditsDistribution.push({ task: "thinking", credits: CREDITS.thinking });
+			creditsUsed += CREDITS.thinking;
+
+			try {
+				parsed = parseAgentResponse(raw);
+			} catch (e) {
+				return c.json({
+					error: "Agent could not parse your request. Try being more specific.",
+					raw: raw.slice(0, 500),
+					creditsUsed,
+					creditsDistribution,
+					tokenUsage,
+				}, 500);
+			}
+
+			suggestedTasks = (Array.isArray(parsed.suggestedTasks) ? parsed.suggestedTasks : []).map((t) => {
+				const taskUrls =
+					Array.isArray(t.params?.urls) && t.params.urls.length > 0
+						? t.params.urls.filter((u) => /^https?:\/\/\S+$/i.test(String(u)))
+						: urlsToScrape;
+				return { ...t, params: { ...t.params, urls: taskUrls } };
+			});
+		} else {
+			if (urlsToScrape.length > 0) {
+				const scraped = await scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urlsToScrape);
+				scrapedSources = scraped.sources || [];
+			}
+		}
+
+		const tasksToRun = hasExecuteTasks ? executeTasks : parsed.shouldExecute === true ? suggestedTasks : [];
+		const sourceByUrl = Object.fromEntries(
+			scrapedSources.map((s) => [
+				s.url,
+				{ url: s.url, markdown: s.markdown || "", title: s.title || "", links: s.links || [] },
+			]),
+		);
+
+		const executed = [];
+		const errors = [];
+
+		for (const task of tasksToRun) {
+			if (!task || !TASK_TYPES.includes(task.type)) continue;
+			const params = task.params || {};
+			const urls = (Array.isArray(params.urls) ? params.urls : []).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
+
+			try {
+				if (task.type === "scrape") {
+					if (urls.length === 0) {
+						errors.push({ task: task.label, error: "No valid URLs" });
+						continue;
+					}
+					const preScraped = urls.map((u) => sourceByUrl[u]).filter(Boolean);
+					let sources = preScraped;
+					if (sources.length < urls.length) {
+						const scraped = await scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urls, { includeImages: true });
+						sources = scraped.sources || [];
+					}
+					if (sources.length === 0) {
+						errors.push({ task: task.label, error: "Scrape failed for all URLs" });
+						continue;
+					}
+					const content = sources
+						.map((s, i) => `--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`)
+						.join("\n\n");
+					const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
+					const images = sources
+						.flatMap((s) => s.links || [])
+						.filter((l) => imgExts.test(typeof l === "string" ? l : l?.url || ""))
+						.map((l) => (typeof l === "string" ? l : l?.url || ""))
+						.filter(Boolean)
+						.slice(0, 20);
+					executed.push({
+						type: "scrape",
+						label: task.label,
+						content,
+						title: sources[0]?.title || urls[0],
+						images,
+						urls: sources.map((s) => s.url),
+					});
+					creditsDistribution.push({ task: "scrape", label: task.label, credits: CREDITS.scrape });
+					creditsUsed += CREDITS.scrape;
+					continue;
+				}
+
+				const skill = SKILLS[task.type];
+				if (!skill || task.type === "scrape") continue;
+
+				const preSources = urls.map((u) => sourceByUrl[u]).filter(Boolean);
+				const format = params.format || "substack";
+				const style = params.style || "casual";
+				const system = skill.buildSystemPrompt(format, style, preSources.length > 0);
+				const user = skill.buildUserContent(params.prompt || userPrompt, preSources);
+
+				const { content: rawContent, usage: skillUsage } = await openRouterChatMessages(
+					openRouterKey,
+					[
+						{ role: "system", content: system },
+						{ role: "user", content: user },
+					],
+					skill.maxTokens,
+				);
+				addTokenUsage(skillUsage);
+
+				const taskCredits = CREDITS[task.type] ?? 1;
+				creditsDistribution.push({ task: task.type, label: task.label, credits: taskCredits });
+				creditsUsed += taskCredits;
+
+				if (task.type === "table" && skill.parseResponse) {
+					const tableData = skill.parseResponse(rawContent);
+					executed.push({
+						type: "table",
+						label: task.label,
+						title: tableData.title,
+						description: tableData.description,
+						columns: tableData.columns,
+						rows: tableData.rows,
+						sourceUrls: urls,
+					});
+				} else {
+					executed.push({
+						type: task.type,
+						label: task.label,
+						content: rawContent.trim(),
+						format: task.type === "newsletter" ? format : undefined,
+						sources: preSources.map((s) => ({ url: s.url, title: s.title })),
+						params: { urls, prompt: params.prompt, format, style },
+					});
+				}
+			} catch (e) {
+				errors.push({ task: task.label, error: e?.message || "Task failed" });
+			}
+		}
+
+		return c.json({
+			success: true,
+			thinking: parsed.thinking || "",
+			message: hasExecuteTasks
+				? `Completed ${executed.length} task(s).`
+				: parsed.message || "Here's what I suggest.",
+			suggestedTasks,
+			executed,
+			errors: errors.length > 0 ? errors : undefined,
+			creditsUsed,
+			creditsDistribution,
+			tokenUsage,
+		});
+	} catch (error) {
+		console.error("[inkgest-agent]", error);
+		return c.json({ error: error?.message || "Agent failed" }, 500);
+	}
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Take Screenshot API Endpoint
 app.post("/take-screenshot", async (c) => {
