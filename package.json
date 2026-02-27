@@ -18,7 +18,8 @@
 		"pentest": "node tests/pentest-load.js",
 		"pentest:pool": "node tests/test-load.js",
 		"monitor": "node monitor-resources.js",
-		"test:with-monitor": "concurrently \"npm run monitor\" \"npm run test:load\""
+		"test:with-monitor": "concurrently \"npm run monitor\" \"npm run test:load\"",
+		"mcp:scrape": "node mcp-scrape-server.js"
 	},
 	"dependencies": {
 		"@google/genai": "^1.10.0",
@@ -29,6 +30,7 @@
 		"@langchain/core": "^0.3.68",
 		"@langchain/ollama": "^0.2.3",
 		"@langchain/textsplitters": "^0.1.0",
+		"@modelcontextprotocol/sdk": "^1.27.1",
 		"@mozilla/readability": "^0.6.0",
 		"@octokit/rest": "^22.0.0",
 		"@opentelemetry/api": "1.9.0",

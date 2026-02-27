@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ihatereading-scrape": {
+      "command": "node",
+      "args": ["mcp-scrape-server.js"],
+      "env": {}
+    }
+  }
+}
