@@ -33,10 +33,11 @@ import { fetch } from "undici";
 import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
-import ffmpeg from "fluent-ffmpeg";
-import { promises as fsp } from "fs";
+import { fileURLToPath } from "url";
 
-dotenv.config();
+// Load .env from project root (same dir as this file) so it works regardless of cwd or platform
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, ".env") });
 
 // Safely parse JSON from an AI response that may include markdown fences or trailing text
 function parseAIJson(raw) {
@@ -1848,7 +1849,7 @@ ${metadata.summary}
 			},
 			{
 				headers: {
-					Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+					Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
 					"Content-Type": "application/json",
 				},
 			},
@@ -3780,8 +3781,7 @@ app.post("/scrape-multiple", async (c) => {
 });
 
 // ─── Inkgest Agent: one LLM + scrape endpoints + extensible skills ────────
-const INKGEST_SCRAPE_BASE =
-	process.env.INKGEST_AGENT_SCRAPE_BASE_URL || "http://localhost:3002";
+const INKGEST_SCRAPE_BASE = process.env.INKGEST_SCRAPE_BASE_URL || process.env.SCRAPE_API_BASE_URL || "http://localhost:3002";
 
 async function openRouterChatMessages(apiKey, messages, maxTokens = 1200) {
 	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -3816,7 +3816,10 @@ app.post("/inkgest-agent", async (c) => {
 	try {
 		const openRouterKey = process.env.OPENROUTER_API_KEY;
 		if (!openRouterKey) {
-			return c.json({ error: "OPENROUTER_API_KEY not configured" }, 500);
+			return c.json({
+				error: "OPENROUTER_API_KEY not configured",
+				hint: "Set OPENROUTER_API_KEY in your .env file (local) or in Vercel → Project → Settings → Environment Variables (production), then redeploy if needed.",
+			}, 500);
 		}
 
 		const { prompt = "", chatHistory = [], executeTasks = [] } = (await c.req.json().catch(() => ({}))) || {};
