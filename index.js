@@ -5,7 +5,7 @@ import { firestore, storage } from "./config/firebase.js";
 import chromium from "@sparticuz/chromium";
 import { supabase } from "./config/supabase.js";
 import { performance } from "perf_hooks";
-import { cpus, tmpdir } from "os";
+import { cpus } from "os";
 import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
@@ -21,11 +21,11 @@ import {
 	TASK_TYPES,
 	CREDITS,
 } from "./lib/inkgestAgent.js";
+import { browserAgentRouter } from "./lib/inkgestBrowserAgent.js";
 import { logger } from "hono/logger";
 import UserAgents from "user-agents";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { GoogleGenAI } from "@google/genai";
-import { Resend } from "resend";
 import browserPool from "./browser-pool.js";
 import fs from "fs";
 import NodeCache from "node-cache";
@@ -127,11 +127,62 @@ async function openRouterChat({
 	return parseAIJson(content);
 }
 
-const IMAGE_DIR = "./templates";
 const OUTPUT_FILE = "./templates.json";
 
-const VISION_MODEL = "openai/gpt-4o-mini";
-const EMBEDDING_MODEL = "text-embedding-3-small";
+const EMAIL_DIR = path.join(__dirname, "./templates");
+const INDEX_FILE = path.join(__dirname, "../templates-index.json");
+
+async function getEmbedding(text) {
+	const res = await fetch("http://localhost:11434/api/embeddings", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			model: "mxbai-embed-large",
+			prompt: `Represent this sentence for searching relevant passages: ${text}`,
+		}),
+	});
+	const { embedding } = await res.json();
+	return embedding;
+}
+
+async function indexAll() {
+	const files = fs
+		.readdirSync(EMAIL_DIR)
+		.filter((f) => /\.(html|jsx|tsx)$/.test(f));
+	console.log(`Indexing ${files.length} emails...`);
+
+	const index = [];
+
+	for (let i = 0; i < files.length; i++) {
+		const file = files[i];
+		const html = fs.readFileSync(path.join(EMAIL_DIR, file), "utf8");
+
+		const base = path.basename(file, path.extname(file));
+		const category = base.split("-")[0];
+		const stripped = html
+			.replace(/<[^>]+>/g, " ")
+			.replace(/\s+/g, " ")
+			.slice(0, 800);
+		const subject = base.replace(/-/g, " ");
+
+		const embedding = await getEmbedding(`${subject} ${category} ${stripped}`);
+
+		index.push({
+			filename: file,
+			category,
+			subject,
+			description: stripped.slice(0, 200),
+			embedding, // just a number[] in JSON
+		});
+
+		console.log(`[${i + 1}/${files.length}] ${file}`);
+	}
+
+	fs.writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
+	console.log(`✅ email-index.json written (${index.length} entries)`);
+}
+
+indexAll().catch(console.error);
 
 async function loadExistingTemplates() {
 	if (!fs.existsSync(OUTPUT_FILE)) return [];
@@ -1057,6 +1108,26 @@ const commonViewports = [
 const pickRandomViewport = () =>
 	commonViewports[Math.floor(Math.random() * commonViewports.length)];
 
+/** CSS to hide ads, cookie banners, chat widgets, and password-manager overlays before screenshot */
+const BLOCK_DISTRACTIONS_CSS = `
+  [id*="cookie" i], [class*="cookie" i], [id*="consent" i], [class*="consent" i],
+  [id*="onetrust" i], [class*="onetrust" i], [id*="gdpr" i], [class*="gdpr" i], [data-consent],
+  .cc-banner, .cc-window, #cookie-notice, .cookie-notice, #truste-consent, [class*="optanon"],
+  #CybotCookiebotDialog, .cookiebot, [class*="cookie-banner" i], .cookie-law-info-bar,
+  .cky-consent-container, #cookielaw, [class*="tarteaucitron"],
+  [class*="intercom" i], #intercom-container, [class*="drift" i], .drift-frame,
+  [class*="zendesk" i], .zEWidget-launcher, [class*="crisp" i], #crisp-chatbox,
+  [class*="tawk" i], #tawk-bubble, [class*="livechat" i], #chat-widget, .chat-widget,
+  [class*="hubspot-messages" i], #hubspot-messages-iframe-container, .widget--chat,
+  [class*="tidio" i], .tidio-chat, [id*="chat-" i],
+  .ad, .ads, .advert, [id*="ad-" i], [class*="ad-container" i], .advertisement,
+  .ad-slot, .google-ad, ins.adsbygoogle, [id*="google_ads" i], .ad-banner, .sidebar-ad,
+  [class*="1Password" i], [id*="1password" i], .lastpass-overlay, #lp-iframe,
+  [class*="bitwarden" i], [class*="dashlane" i], [class*="password-manager" i],
+  iframe[src*="consent"], iframe[src*="cookie"], iframe[src*="intercom"], iframe[src*="drift"]
+  { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }
+`;
+
 const generateRandomHeaders = () => {
 	const acceptLanguages = [
 		"en-US,en;q=0.9",
@@ -1158,6 +1229,9 @@ app.get("/github-trending", async (c) => {
 
 // Health check endpoint
 app.get("/health", (c) => c.json({ ok: true, ts: Date.now() }));
+
+// Browser agent (Puppeteer ReAct loop for dynamic SPAs)
+app.route("/browser-agent", browserAgentRouter);
 
 app.post("/post-to-devto", async (c) => {
 	try {
@@ -1751,125 +1825,6 @@ async function scrapeWithOwnEndpoint(url, baseUrl) {
 		};
 	}
 }
-
-app.get("/generate-email-templates-embeddings", async (c) => {
-	const files = fs
-		.readdirSync(`${IMAGE_DIR}`)
-		.filter((f) => f.endsWith(".png"))
-		.sort((a, b) => {
-			const numA = parseInt(a.match(/\d+/)?.[0] || "0");
-			const numB = parseInt(b.match(/\d+/)?.[0] || "0");
-			return numA - numB;
-		});
-
-	let existing = await loadExistingTemplates();
-	const existingIds = new Set(existing.map((t) => t.id));
-
-	for (const file of files) {
-		const id = file.replace(".png", "");
-
-		// Skip already processed
-		if (existingIds.has(id)) {
-			console.log(`Skipping ${file}`);
-			continue;
-		}
-
-		console.log(`Processing ${file}`);
-
-		const imagePath = path.join(IMAGE_DIR, file);
-		const base64Image = fs.readFileSync(imagePath, "base64");
-
-		// 1️⃣ Vision → Metadata
-		const visionRes = await axios.post(
-			"https://openrouter.ai/api/v1/chat/completions",
-			{
-				model: VISION_MODEL,
-				messages: [
-					{
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: `
-Analyze this email template design and return JSON only:
-
-{
-  "category": "",
-  "tone": "",
-  "color_scheme": "",
-  "layout": "",
-  "industry_fit": "",
-  "cta_type": "",
-  "summary": ""
-}
-
-Return valid JSON only.
-`,
-							},
-							{
-								type: "image_url",
-								image_url: {
-									url: `data:image/png;base64,${base64Image}`,
-								},
-							},
-						],
-					},
-				],
-			},
-			{
-				headers: {
-					Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-					"Content-Type": "application/json",
-				},
-			},
-		);
-
-		let metadata;
-		try {
-			metadata = JSON.parse(visionRes.data.choices[0].message.content.trim());
-		} catch (err) {
-			console.log("Invalid JSON for", file);
-			continue;
-		}
-
-		// 2️⃣ Create embedding
-		const embedRes = await axios.post(
-			"https://openrouter.ai/api/v1/embeddings",
-			{
-				model: EMBEDDING_MODEL,
-				input: `
-${metadata.category}
-${metadata.tone}
-${metadata.color_scheme}
-${metadata.layout}
-${metadata.industry_fit}
-${metadata.cta_type}
-${metadata.summary}
-`,
-			},
-			{
-				headers: {
-					Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-					"Content-Type": "application/json",
-				},
-			},
-		);
-
-		const embedding = embedRes.data.data[0].embedding;
-
-		existing.push({
-			id,
-			image: `/templates/images/${file}`,
-			metadata,
-			embedding,
-		});
-
-		// Save progressively (important if 259 images)
-		fs.writeFileSync(OUTPUT_FILE, JSON.stringify(existing, null, 2));
-	}
-
-	return c.json({ success: true, total: existing.length });
-});
 
 // Generate form from URL endpoint
 app.post("/generate-form-from-url", async (c) => {
@@ -3232,7 +3187,7 @@ async function scrapeSingleUrlWithPuppeteer(
 		selectors = {},
 		waitForSelector = null,
 		timeout = 30000,
-		includeSemanticContent = true,
+		includeSemanticContent = false,
 		includeImages = true,
 		includeLinks = true,
 		extractMetadata = true,
@@ -3246,7 +3201,13 @@ async function scrapeSingleUrlWithPuppeteer(
 
 	if (targetUrl.includes("format=json")) {
 		const data = await scrapJson(targetUrl);
-		return { success: true, data, markdown: null, summary: null, screenshot: null };
+		return {
+			success: true,
+			data,
+			markdown: null,
+			summary: null,
+			screenshot: null,
+		};
 	}
 	if (targetUrl.includes("format=html")) {
 		const html = await scrapHtml(targetUrl);
@@ -3256,7 +3217,13 @@ async function scrapeSingleUrlWithPuppeteer(
 			includeLinks,
 			extractMetadata,
 		});
-		return { success: true, data, markdown: null, summary: null, screenshot: null };
+		return {
+			success: true,
+			data,
+			markdown: null,
+			summary: null,
+			screenshot: null,
+		};
 	}
 
 	let existingData;
@@ -3303,9 +3270,15 @@ async function scrapeSingleUrlWithPuppeteer(
 				}
 
 				await page.evaluateOnNewDocument(() => {
-					Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-					Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-					Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+					Object.defineProperty(navigator, "webdriver", {
+						get: () => undefined,
+					});
+					Object.defineProperty(navigator, "plugins", {
+						get: () => [1, 2, 3, 4, 5],
+					});
+					Object.defineProperty(navigator, "languages", {
+						get: () => ["en-US", "en"],
+					});
 					const orig = window.navigator.permissions.query;
 					window.navigator.permissions.query = (p) =>
 						p.name === "notifications"
@@ -3313,13 +3286,19 @@ async function scrapeSingleUrlWithPuppeteer(
 							: orig(p);
 				});
 
-				let blockedResources = { images: 0, fonts: 0, stylesheets: 0, media: 0 };
+				let blockedResources = {
+					images: 0,
+					fonts: 0,
+					stylesheets: 0,
+					media: 0,
+				};
 				await page.setRequestInterception(true);
 				page.on("request", (request) => {
 					const resourceType = request.resourceType();
 					const reqUrl = request.url().toLowerCase();
 					if (
-						(reqUrl.includes("vercel") && (reqUrl.includes("security") || reqUrl.includes("checkpoint"))) ||
+						(reqUrl.includes("vercel") &&
+							(reqUrl.includes("security") || reqUrl.includes("checkpoint"))) ||
 						reqUrl.includes("cloudflare") ||
 						reqUrl.includes("bot-detection") ||
 						reqUrl.includes("challenge")
@@ -3332,14 +3311,39 @@ async function scrapeSingleUrlWithPuppeteer(
 						request.abort();
 						return;
 					}
-					const imgExts = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tiff", ".tif", ".heic", ".heif", ".avif"];
+					const imgExts = [
+						".jpg",
+						".jpeg",
+						".png",
+						".gif",
+						".bmp",
+						".webp",
+						".svg",
+						".ico",
+						".tiff",
+						".tif",
+						".heic",
+						".heif",
+						".avif",
+					];
 					if (imgExts.some((ext) => reqUrl.includes(ext))) {
 						blockedResources.images++;
 						request.abort();
 						return;
 					}
-					const imgServices = ["cdn", "images", "img", "photo", "pic", "media", "assets"];
-					if (imgServices.some((s) => reqUrl.includes(s)) && [".jpg", ".png", ".gif"].some((e) => reqUrl.includes(e))) {
+					const imgServices = [
+						"cdn",
+						"images",
+						"img",
+						"photo",
+						"pic",
+						"media",
+						"assets",
+					];
+					if (
+						imgServices.some((s) => reqUrl.includes(s)) &&
+						[".jpg", ".png", ".gif"].some((e) => reqUrl.includes(e))
+					) {
 						blockedResources.images++;
 						request.abort();
 						return;
@@ -3369,13 +3373,23 @@ async function scrapeSingleUrlWithPuppeteer(
 
 				const navStart = Date.now();
 				if (targetUrl.includes("reddit.com")) {
-					const redditUrl = targetUrl.endsWith("/") ? targetUrl.slice(0, -1) + ".json" : targetUrl + "/.json";
-					await page.goto(redditUrl, { waitUntil: "domcontentloaded", timeout });
+					const redditUrl = targetUrl.endsWith("/")
+						? targetUrl.slice(0, -1) + ".json"
+						: targetUrl + "/.json";
+					await page.goto(redditUrl, {
+						waitUntil: "domcontentloaded",
+						timeout,
+					});
 					const jsonText = await page.$eval("pre", (el) => el.textContent);
 					const { markdown, posts } = parseRedditData(jsonText, targetUrl);
 					return {
 						summary: null,
-						scrapedData: { posts, url: targetUrl, title: "Reddit Posts", metadata: null },
+						scrapedData: {
+							posts,
+							url: targetUrl,
+							title: "Reddit Posts",
+							metadata: null,
+						},
 						markdown,
 						screenshotUrl: null,
 					};
@@ -3404,39 +3418,101 @@ async function scrapeSingleUrlWithPuppeteer(
 								screenshot: null,
 								orderedContent: null,
 							};
-							const remove = ["header", "footer", "nav", "aside", ".header", ".top", ".navbar", "#header", ".footer", ".bottom", "#footer", ".sidebar", ".side", ".aside", "#sidebar", ".modal", ".popup", "#modal", ".overlay", ".ad", ".ads", ".advert", "#ad", ".lang-selector", ".language", "#language-selector", ".social", ".social-media", ".social-links", "#social", ".menu", ".navigation", "#nav", ".breadcrumbs", "#breadcrumbs", ".share", "#share", ".widget", "#widget", ".cookie", "#cookie", "script", "style", "noscript"];
-							remove.forEach((sel) => document.querySelectorAll(sel).forEach((el) => el.remove()));
+							const remove = [
+								"header",
+								"footer",
+								"nav",
+								"aside",
+								".header",
+								".top",
+								".navbar",
+								"#header",
+								".footer",
+								".bottom",
+								"#footer",
+								".sidebar",
+								".side",
+								".aside",
+								"#sidebar",
+								".modal",
+								".popup",
+								"#modal",
+								".overlay",
+								".ad",
+								".ads",
+								".advert",
+								"#ad",
+								".lang-selector",
+								".language",
+								"#language-selector",
+								".social",
+								".social-media",
+								".social-links",
+								"#social",
+								".menu",
+								".navigation",
+								"#nav",
+								".breadcrumbs",
+								"#breadcrumbs",
+								".share",
+								"#share",
+								".widget",
+								"#widget",
+								".cookie",
+								"#cookie",
+								"script",
+								"style",
+								"noscript",
+							];
+							remove.forEach((sel) =>
+								document.querySelectorAll(sel).forEach((el) => el.remove()),
+							);
 							["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
-								data.content[tag] = Array.from(document.querySelectorAll(tag)).map((h) => h.textContent.trim());
+								data.content[tag] = Array.from(
+									document.querySelectorAll(tag),
+								).map((h) => h.textContent.trim());
 							});
 							if (opts.extractMetadata) {
 								document.querySelectorAll("meta").forEach((meta) => {
-									const name = meta.getAttribute("name") || meta.getAttribute("property");
+									const name =
+										meta.getAttribute("name") || meta.getAttribute("property");
 									const content = meta.getAttribute("content");
 									if (name && content) data.metadata[name] = content;
 								});
-								document.querySelectorAll('meta[property^="og:"]').forEach((meta) => {
-									const p = meta.getAttribute("property");
-									const c = meta.getAttribute("content");
-									if (p && c) data.metadata[p] = c;
-								});
-								document.querySelectorAll('meta[name^="twitter:"]').forEach((meta) => {
-									const n = meta.getAttribute("name");
-									const c = meta.getAttribute("content");
-									if (n && c) data.metadata[n] = c;
-								});
+								document
+									.querySelectorAll('meta[property^="og:"]')
+									.forEach((meta) => {
+										const p = meta.getAttribute("property");
+										const c = meta.getAttribute("content");
+										if (p && c) data.metadata[p] = c;
+									});
+								document
+									.querySelectorAll('meta[name^="twitter:"]')
+									.forEach((meta) => {
+										const n = meta.getAttribute("name");
+										const c = meta.getAttribute("content");
+										if (n && c) data.metadata[n] = c;
+									});
 							}
 							if (opts.includeLinks) {
 								const currentUrl = new URL(window.location.href);
 								const seedDomain = currentUrl.hostname;
 								const seen = new Set();
 								data.links = Array.from(document.querySelectorAll("a[href]"))
-									.map((link) => ({ text: link.textContent.trim(), href: link.href, title: link.getAttribute("title") || "" }))
+									.map((link) => ({
+										text: link.textContent.trim(),
+										href: link.href,
+										title: link.getAttribute("title") || "",
+									}))
 									.filter((link) => {
-										if (!(link?.text?.length > 0 || link?.title?.length > 0)) return false;
+										if (!(link?.text?.length > 0 || link?.title?.length > 0))
+											return false;
 										try {
-											if (new URL(link.href).hostname !== seedDomain) return false;
-										} catch { return false; }
+											if (new URL(link.href).hostname !== seedDomain)
+												return false;
+										} catch {
+											return false;
+										}
 										const key = `${link.text}|${link.href}|${link.title}`;
 										if (seen.has(key)) return false;
 										seen.add(key);
@@ -3447,11 +3523,17 @@ async function scrapeSingleUrlWithPuppeteer(
 								const ext = (sel, proc = (el) => el.textContent.trim()) =>
 									Array.from(document.querySelectorAll(sel)).map(proc);
 								const extTable = (t) =>
-									Array.from(t.querySelectorAll("tr")).map((r) =>
-										Array.from(r.querySelectorAll("td, th")).map((c) => c.textContent.trim()).filter(Boolean)
-									).filter((r) => r.length > 0);
+									Array.from(t.querySelectorAll("tr"))
+										.map((r) =>
+											Array.from(r.querySelectorAll("td, th"))
+												.map((c) => c.textContent.trim())
+												.filter(Boolean),
+										)
+										.filter((r) => r.length > 0);
 								const extList = (l) =>
-									Array.from(l.querySelectorAll("li")).map((li) => li.textContent.trim()).filter(Boolean);
+									Array.from(l.querySelectorAll("li"))
+										.map((li) => li.textContent.trim())
+										.filter(Boolean);
 								data.content.semanticContent = {
 									articleContent: ext("article"),
 									divs: ext("div"),
@@ -3467,7 +3549,12 @@ async function scrapeSingleUrlWithPuppeteer(
 							}
 							if (opts.includeImages) {
 								data.images = Array.from(document.querySelectorAll("img[src]"))
-									.filter((img) => !["data:image/", "blob:", "image:", "data:"].some((p) => img.src.startsWith(p)))
+									.filter(
+										(img) =>
+											!["data:image/", "blob:", "image:", "data:"].some((p) =>
+												img.src.startsWith(p),
+											),
+									)
 									.map((img) => ({
 										src: img.src,
 										alt: img.alt || "",
@@ -3481,7 +3568,10 @@ async function scrapeSingleUrlWithPuppeteer(
 								for (const [key, selector] of Object.entries(opts.selectors)) {
 									try {
 										const els = document.querySelectorAll(selector);
-										data.customSelectors[key] = els.length === 1 ? els[0].textContent.trim() : Array.from(els).map((e) => e.textContent.trim());
+										data.customSelectors[key] =
+											els.length === 1
+												? els[0].textContent.trim()
+												: Array.from(els).map((e) => e.textContent.trim());
 									} catch {
 										data.customSelectors[key] = null;
 									}
@@ -3489,16 +3579,71 @@ async function scrapeSingleUrlWithPuppeteer(
 							}
 							return data;
 						},
-						{ extractMetadata, includeImages, includeLinks, includeSemanticContent, selectors },
+						{
+							extractMetadata,
+							includeImages,
+							includeLinks,
+							includeSemanticContent,
+							selectors,
+						},
 					);
 				}
 
 				const pageHtml = await page.content();
 				const dom = new JSDOM(pageHtml);
 				const doc = dom.window.document;
-				const remove = ["header", "footer", "nav", "aside", ".header", ".top", ".navbar", "#header", ".footer", ".bottom", "#footer", ".sidebar", ".side", ".aside", "#sidebar", ".modal", ".popup", "#modal", ".overlay", ".ad", ".ads", ".advert", "#ad", ".lang-selector", ".language", "#language-selector", ".social", ".social-media", ".social-links", "#social", ".menu", ".navigation", "#nav", ".breadcrumbs", "#breadcrumbs", ".share", "#share", ".widget", "#widget", ".cookie", "#cookie", "script", "style", "noscript"];
-				remove.forEach((sel) => doc.querySelectorAll(sel).forEach((el) => el.remove()));
-				const { markdown } = extractSemanticContentWithFormattedMarkdown(doc.body);
+				const remove = [
+					"header",
+					"footer",
+					"nav",
+					"aside",
+					".header",
+					".top",
+					".navbar",
+					"#header",
+					".footer",
+					".bottom",
+					"#footer",
+					".sidebar",
+					".side",
+					".aside",
+					"#sidebar",
+					".modal",
+					".popup",
+					"#modal",
+					".overlay",
+					".ad",
+					".ads",
+					".advert",
+					"#ad",
+					".lang-selector",
+					".language",
+					"#language-selector",
+					".social",
+					".social-media",
+					".social-links",
+					"#social",
+					".menu",
+					".navigation",
+					"#nav",
+					".breadcrumbs",
+					"#breadcrumbs",
+					".share",
+					"#share",
+					".widget",
+					"#widget",
+					".cookie",
+					"#cookie",
+					"script",
+					"style",
+					"noscript",
+				];
+				remove.forEach((sel) =>
+					doc.querySelectorAll(sel).forEach((el) => el.remove()),
+				);
+				const { markdown } = extractSemanticContentWithFormattedMarkdown(
+					doc.body,
+				);
 
 				let screenshotUrl = null;
 				if (takeScreenshot) {
@@ -3507,17 +3652,26 @@ async function scrapeSingleUrlWithPuppeteer(
 						const fname = `ihr-website-screenshot/screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
 						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
 						const file = bucket.file(fname);
-						await file.save(buf, { metadata: { contentType: "image/png", cacheControl: "public, max-age=3600" } });
+						await file.save(buf, {
+							metadata: {
+								contentType: "image/png",
+								cacheControl: "public, max-age=3600",
+							},
+						});
 						await file.makePublic();
 						screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
 					} catch {}
 				}
 
-				if (useProxy && selectedProxy) proxyManager.recordProxyResult(selectedProxy.host, true, navLatency);
+				if (useProxy && selectedProxy)
+					proxyManager.recordProxyResult(selectedProxy.host, true, navLatency);
 
 				if (!includeCache) {
 					try {
-						const { data: existingRows, error: fetchError } = await supabase.from("universo").select("id").eq("url", targetUrl);
+						const { data: existingRows, error: fetchError } = await supabase
+							.from("universo")
+							.select("id")
+							.eq("url", targetUrl);
 						if (!fetchError && (!existingRows || existingRows.length === 0)) {
 							await supabase.from("universo").insert({
 								title: scrapedData?.title || "No Title",
@@ -3530,17 +3684,30 @@ async function scrapeSingleUrlWithPuppeteer(
 					} catch {}
 				}
 
-				if (includeSemanticContent && scrapedData?.content) removeEmptyKeys(scrapedData.content);
+				if (includeSemanticContent && scrapedData?.content)
+					removeEmptyKeys(scrapedData.content);
 
 				let summary = null;
 				if (aiSummary && markdown) {
 					try {
-						const splitter = RecursiveCharacterTextSplitter.fromLanguage("markdown", { separators: "\n\n", chunkSize: 1024, chunkOverlap: 128 });
+						const splitter = RecursiveCharacterTextSplitter.fromLanguage(
+							"markdown",
+							{ separators: "\n\n", chunkSize: 1024, chunkOverlap: 128 },
+						);
 						const chunks = await splitter.splitText(markdown);
 						const chunked = chunks.slice(0, 3000).join("\n\n");
 						const aiResponse = await genai.models.generateContent({
 							model: "gemini-1.5-flash",
-							contents: [{ role: "user", parts: [{ text: `Summarize the following markdown: ${chunked}; The length or token count for the summary depend on the content but always lies between 100 to 1000 tokens` }] }],
+							contents: [
+								{
+									role: "user",
+									parts: [
+										{
+											text: `Summarize the following markdown: ${chunked}; The length or token count for the summary depend on the content but always lies between 100 to 1000 tokens`,
+										},
+									],
+								},
+							],
 						});
 						summary = aiResponse.candidates[0].content.parts[0].text;
 					} catch {}
@@ -3558,7 +3725,8 @@ async function scrapeSingleUrlWithPuppeteer(
 			};
 		} catch (attemptError) {
 			lastError = attemptError;
-			if (useProxy && selectedProxy) proxyManager.recordProxyResult(selectedProxy.host, false);
+			if (useProxy && selectedProxy)
+				proxyManager.recordProxyResult(selectedProxy.host, false);
 			if (attempt < maxAttempts) {
 				await randomDelay(300, 1200);
 				continue;
@@ -3704,7 +3872,10 @@ app.post("/scrape-multiple", async (c) => {
 	} = await c.req.json();
 
 	if (!Array.isArray(urls) || urls.length === 0) {
-		return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+		return c.json(
+			{ success: false, error: "urls must be a non-empty array" },
+			400,
+		);
 	}
 
 	if (urls.length > MAX_URLS) {
@@ -3733,7 +3904,7 @@ app.post("/scrape-multiple", async (c) => {
 
 	const results = await Promise.all(
 		urls.map(async (url) => {
-			const inputUrl = typeof url === "string" ? url : url?.url ?? url;
+			const inputUrl = typeof url === "string" ? url : (url?.url ?? url);
 			if (!inputUrl || !isValidURL(inputUrl)) {
 				return {
 					url: inputUrl || "invalid",
@@ -3781,17 +3952,26 @@ app.post("/scrape-multiple", async (c) => {
 });
 
 // ─── Inkgest Agent: one LLM + scrape endpoints + extensible skills ────────
-const INKGEST_SCRAPE_BASE = process.env.INKGEST_SCRAPE_BASE_URL || process.env.SCRAPE_API_BASE_URL || "http://localhost:3002";
+const INKGEST_SCRAPE_BASE =
+	process.env.INKGEST_SCRAPE_BASE_URL ||
+	process.env.SCRAPE_API_BASE_URL ||
+	"http://localhost:3002";
+
+const OPENROUTER_TIMEOUT_MS = 90_000; // 90s for LLM responses
 
 async function openRouterChatMessages(apiKey, messages, maxTokens = 1200) {
 	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
 		method: "POST",
+		signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
 		headers: {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
 		},
 		body: JSON.stringify({
-			model: process.env.OPENROUTER_AGENT_MODEL || process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
+			model:
+				process.env.OPENROUTER_AGENT_MODEL ||
+				process.env.OPENROUTER_MODEL ||
+				"openai/gpt-4o-mini",
 			messages,
 			temperature: 0.3,
 			max_tokens: maxTokens,
@@ -3812,42 +3992,48 @@ async function openRouterChatMessages(apiKey, messages, maxTokens = 1200) {
 	return { content, usage };
 }
 
+const openRouterKey = process.env.OPENROUTER_API_KEY;
+
 app.post("/inkgest-agent", async (c) => {
 	try {
-		const openRouterKey = process.env.OPENROUTER_API_KEY;
-		if (!openRouterKey) {
-			return c.json({
-				error: "OPENROUTER_API_KEY not configured",
-				hint: "Set OPENROUTER_API_KEY in your .env file (local) or in Vercel → Project → Settings → Environment Variables (production), then redeploy if needed.",
-			}, 500);
-		}
-
-		const { prompt = "", chatHistory = [], executeTasks = [] } = (await c.req.json().catch(() => ({}))) || {};
+		const {
+			prompt = "",
+			chatHistory = [],
+			executeTasks = [],
+		} = (await c.req.json().catch(() => ({}))) || {};
 		const userPrompt = String(prompt).trim();
-		const hasExecuteTasks = Array.isArray(executeTasks) && executeTasks.length > 0;
+		const hasExecuteTasks =
+			Array.isArray(executeTasks) && executeTasks.length > 0;
 
 		if (!userPrompt && !hasExecuteTasks) {
 			return c.json({ error: "Prompt or executeTasks required" }, 400);
 		}
 
 		const extractedUrls = hasExecuteTasks
-			? [...new Set(
-					executeTasks.flatMap((t) =>
-						(Array.isArray(t.params?.urls) ? t.params.urls : []).filter((u) =>
-							/^https?:\/\/\S+$/i.test(String(u)),
+			? [
+					...new Set(
+						executeTasks.flatMap((t) =>
+							(Array.isArray(t.params?.urls) ? t.params.urls : []).filter((u) =>
+								/^https?:\/\/\S+$/i.test(String(u)),
+							),
 						),
 					),
-				)]
+				]
 			: extractUrlsFromText(userPrompt);
 
 		const urlsToScrape = extractedUrls.slice(0, 10);
 		let scrapedSources = [];
+		let scrapeErrors = [];
 		let parsed = {};
 		let suggestedTasks = [];
 
 		const creditsDistribution = [];
 		let creditsUsed = 0;
-		const tokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+		const tokenUsage = {
+			prompt_tokens: 0,
+			completion_tokens: 0,
+			total_tokens: 0,
+		};
 
 		function addTokenUsage(usage) {
 			if (usage && typeof usage === "object") {
@@ -3858,7 +4044,10 @@ app.post("/inkgest-agent", async (c) => {
 		}
 
 		if (!hasExecuteTasks) {
-			const userContent = `User message: ${userPrompt}\n\nURLs found: ${urlsToScrape.length ? urlsToScrape.join(", ") : "none"}`;
+			const urlLine = urlsToScrape.length
+				? `URLs found: ${urlsToScrape.join(", ")}`
+				: "URLs found: none. You MUST infer the URL from the user's message (e.g. 'scrape dev.to' → params.urls: [\"https://dev.to\"] or [\"https://dev.to/rss\"], 'dev.to RSS' → [\"https://dev.to/rss\"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.";
+			const userContent = `User message: ${userPrompt}\n\n${urlLine}`;
 			const messages = [
 				{ role: "system", content: ROUTER_SYSTEM_PROMPT },
 				...chatHistory.slice(-6).map((m) => ({
@@ -3870,12 +4059,15 @@ app.post("/inkgest-agent", async (c) => {
 
 			const [scraped, routerResult] = await Promise.all([
 				urlsToScrape.length > 0
-					? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urlsToScrape, { includeImages: true })
+					? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urlsToScrape, {
+							includeImages: true,
+						})
 					: Promise.resolve({ sources: [], errors: [] }),
 				openRouterChatMessages(openRouterKey, messages),
 			]);
 
 			scrapedSources = scraped.sources || [];
+			if (scraped.errors?.length) scrapeErrors.push(...scraped.errors);
 			const raw = routerResult.content;
 			addTokenUsage(routerResult.usage);
 			creditsDistribution.push({ task: "thinking", credits: CREDITS.thinking });
@@ -3884,16 +4076,22 @@ app.post("/inkgest-agent", async (c) => {
 			try {
 				parsed = parseAgentResponse(raw);
 			} catch (e) {
-				return c.json({
-					error: "Agent could not parse your request. Try being more specific.",
-					raw: raw.slice(0, 500),
-					creditsUsed,
-					creditsDistribution,
-					tokenUsage,
-				}, 500);
+				return c.json(
+					{
+						error:
+							"Agent could not parse your request. Try being more specific.",
+						raw: raw.slice(0, 500),
+						creditsUsed,
+						creditsDistribution,
+						tokenUsage,
+					},
+					500,
+				);
 			}
 
-			suggestedTasks = (Array.isArray(parsed.suggestedTasks) ? parsed.suggestedTasks : []).map((t) => {
+			suggestedTasks = (
+				Array.isArray(parsed.suggestedTasks) ? parsed.suggestedTasks : []
+			).map((t) => {
 				const taskUrls =
 					Array.isArray(t.params?.urls) && t.params.urls.length > 0
 						? t.params.urls.filter((u) => /^https?:\/\/\S+$/i.test(String(u)))
@@ -3902,136 +4100,468 @@ app.post("/inkgest-agent", async (c) => {
 			});
 		} else {
 			if (urlsToScrape.length > 0) {
-				const scraped = await scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urlsToScrape);
+				const scraped = await scrapeUrlsViaApi(
+					INKGEST_SCRAPE_BASE,
+					urlsToScrape,
+				);
 				scrapedSources = scraped.sources || [];
+				if (scraped.errors?.length) scrapeErrors.push(...scraped.errors);
 			}
 		}
 
-		const tasksToRun = hasExecuteTasks ? executeTasks : parsed.shouldExecute === true ? suggestedTasks : [];
+		const tasksToRun = hasExecuteTasks
+			? executeTasks
+			: parsed.shouldExecute === true
+				? suggestedTasks
+				: [];
 		const sourceByUrl = Object.fromEntries(
 			scrapedSources.map((s) => [
 				s.url,
-				{ url: s.url, markdown: s.markdown || "", title: s.title || "", links: s.links || [] },
+				{
+					url: s.url,
+					markdown: s.markdown || "",
+					title: s.title || "",
+					links: s.links || [],
+				},
 			]),
 		);
 
-		const executed = [];
-		const errors = [];
+		const validTasks = tasksToRun.filter(
+			(t) => t && TASK_TYPES.includes(t.type),
+		);
+		const state = {
+			tokenUsage: { ...tokenUsage },
+			creditsUsed,
+			creditsDistribution: [...creditsDistribution],
+			/** After crawl-url tasks run, filled with { url, markdown, title, links }[] for useCrawlResult content tasks */
+			crawlUrlSources: [],
+		};
 
-		for (const task of tasksToRun) {
-			if (!task || !TASK_TYPES.includes(task.type)) continue;
+		/** Build sources array from a crawl-url executed result for use in blog/table/article */
+		function buildSourcesFromCrawlResult(executed) {
+			const sources = [];
+			if (executed.homePageData && executed.homePageData.markdown != null) {
+				const hp = executed.homePageData;
+				sources.push({
+					url: executed.url || hp.url || "",
+					markdown: hp.markdown || "",
+					title: hp.data?.metadata?.title || hp.data?.title || "",
+					links: Array.isArray(hp.data?.links) ? hp.data.links : [],
+				});
+			}
+			(executed.nestedResults || []).forEach((r) => {
+				if (r.url) {
+					sources.push({
+						url: r.url,
+						markdown: r.markdown || "",
+						title: r.data?.metadata?.title || r.data?.title || "",
+						links: Array.isArray(r.data?.links) ? r.data.links : [],
+					});
+				}
+			});
+			return sources;
+		}
+
+		async function runOneTask(task) {
 			const params = task.params || {};
-			const urls = (Array.isArray(params.urls) ? params.urls : []).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
-
+			const urls = (Array.isArray(params.urls) ? params.urls : []).filter((u) =>
+				/^https?:\/\/\S+$/i.test(String(u)),
+			);
 			try {
 				if (task.type === "scrape") {
 					if (urls.length === 0) {
-						errors.push({ task: task.label, error: "No valid URLs" });
-						continue;
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: "No valid URLs",
+						};
 					}
 					const preScraped = urls.map((u) => sourceByUrl[u]).filter(Boolean);
 					let sources = preScraped;
 					if (sources.length < urls.length) {
-						const scraped = await scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urls, { includeImages: true });
+						const scraped = await scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urls, {
+							includeImages: true,
+						});
 						sources = scraped.sources || [];
 					}
 					if (sources.length === 0) {
-						errors.push({ task: task.label, error: "Scrape failed for all URLs" });
-						continue;
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: "Scrape failed for all URLs",
+						};
 					}
 					const content = sources
-						.map((s, i) => `--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`)
+						.map(
+							(s, i) =>
+								`--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`,
+						)
 						.join("\n\n");
 					const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
 					const images = sources
 						.flatMap((s) => s.links || [])
-						.filter((l) => imgExts.test(typeof l === "string" ? l : l?.url || ""))
+						.filter((l) =>
+							imgExts.test(typeof l === "string" ? l : l?.url || ""),
+						)
 						.map((l) => (typeof l === "string" ? l : l?.url || ""))
 						.filter(Boolean)
 						.slice(0, 20);
-					executed.push({
-						type: "scrape",
+					state.creditsDistribution.push({
+						task: "scrape",
 						label: task.label,
-						content,
-						title: sources[0]?.title || urls[0],
-						images,
-						urls: sources.map((s) => s.url),
+						credits: CREDITS.scrape,
 					});
-					creditsDistribution.push({ task: "scrape", label: task.label, credits: CREDITS.scrape });
-					creditsUsed += CREDITS.scrape;
-					continue;
+					state.creditsUsed += CREDITS.scrape;
+					return {
+						taskLabel: task.label,
+						success: true,
+						executed: {
+							type: "scrape",
+							label: task.label,
+							content,
+							title: sources[0]?.title || urls[0],
+							images,
+							urls: sources.map((s) => s.url),
+						},
+					};
+				}
+
+				if (task.type === "crawl-url") {
+					const seedUrl = params.url || urls[0];
+					if (!seedUrl || !/^https?:\/\//i.test(String(seedUrl))) {
+						return { taskLabel: task.label, success: false, error: "No valid URL for crawl-url" };
+					}
+					const takeScreenshot = params.takeScreenshot === true;
+					const scrapeContent = params.scrapeContent === true;
+					const timeoutMs = scrapeContent ? 10 * 60 * 1000 : 5 * 60 * 1000;
+					const res = await fetch(`${INKGEST_SCRAPE_BASE}/crawl-url`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							url: seedUrl,
+							takeScreenshot,
+							scrapeContent,
+							timeout: Math.min(timeoutMs, 300000),
+						}),
+						signal: AbortSignal.timeout(timeoutMs),
+					});
+					const data = await res.json().catch(() => ({}));
+					state.creditsDistribution.push({ task: "crawl-url", label: task.label, credits: CREDITS["crawl-url"] });
+					state.creditsUsed += CREDITS["crawl-url"];
+					if (!res.ok) {
+						return { taskLabel: task.label, success: false, error: data?.error || `HTTP ${res.status}` };
+					}
+					return {
+						taskLabel: task.label,
+						success: true,
+						executed: {
+							type: "crawl-url",
+							label: task.label,
+							url: seedUrl,
+							allUrls: data.allUrls || [],
+							homePageData: data.homePageData,
+							nestedResults: data.nestedResults,
+							screenshots: data.screenshots,
+						},
+					};
 				}
 
 				const skill = SKILLS[task.type];
-				if (!skill || task.type === "scrape") continue;
+				if (!skill || task.type === "scrape") {
+					return {
+						taskLabel: task.label,
+						success: false,
+						error: "Unknown task type",
+					};
+				}
 
-				const preSources = urls.map((u) => sourceByUrl[u]).filter(Boolean);
+				const useCrawlResult = params.useCrawlResult === true && state.crawlUrlSources?.length > 0;
+				const preSources = useCrawlResult
+					? state.crawlUrlSources
+					: urls.map((u) => sourceByUrl[u]).filter(Boolean);
 				const format = params.format || "substack";
 				const style = params.style || "casual";
-				const system = skill.buildSystemPrompt(format, style, preSources.length > 0);
-				const user = skill.buildUserContent(params.prompt || userPrompt, preSources);
-
-				const { content: rawContent, usage: skillUsage } = await openRouterChatMessages(
-					openRouterKey,
-					[
-						{ role: "system", content: system },
-						{ role: "user", content: user },
-					],
-					skill.maxTokens,
+				const system = skill.buildSystemPrompt(
+					format,
+					style,
+					preSources.length > 0,
 				);
+				const user = skill.buildUserContent(
+					params.prompt || userPrompt,
+					preSources,
+				);
+
+				const { content: rawContent, usage: skillUsage } =
+					await openRouterChatMessages(
+						openRouterKey,
+						[
+							{ role: "system", content: system },
+							{ role: "user", content: user },
+						],
+						skill.maxTokens,
+					);
 				addTokenUsage(skillUsage);
+				state.tokenUsage.prompt_tokens += skillUsage?.prompt_tokens || 0;
+				state.tokenUsage.completion_tokens +=
+					skillUsage?.completion_tokens || 0;
+				state.tokenUsage.total_tokens += skillUsage?.total_tokens || 0;
 
 				const taskCredits = CREDITS[task.type] ?? 1;
-				creditsDistribution.push({ task: task.type, label: task.label, credits: taskCredits });
-				creditsUsed += taskCredits;
+				state.creditsDistribution.push({
+					task: task.type,
+					label: task.label,
+					credits: taskCredits,
+				});
+				state.creditsUsed += taskCredits;
 
 				if (task.type === "table" && skill.parseResponse) {
 					const tableData = skill.parseResponse(rawContent);
-					executed.push({
-						type: "table",
-						label: task.label,
-						title: tableData.title,
-						description: tableData.description,
-						columns: tableData.columns,
-						rows: tableData.rows,
-						sourceUrls: urls,
-					});
-				} else {
-					executed.push({
+					return {
+						taskLabel: task.label,
+						success: true,
+						executed: {
+							type: "table",
+							label: task.label,
+							title: tableData.title,
+							description: tableData.description,
+							columns: tableData.columns,
+							rows: tableData.rows,
+							sourceUrls: urls,
+						},
+					};
+				}
+				return {
+					taskLabel: task.label,
+					success: true,
+					executed: {
 						type: task.type,
 						label: task.label,
 						content: rawContent.trim(),
 						format: task.type === "newsletter" ? format : undefined,
 						sources: preSources.map((s) => ({ url: s.url, title: s.title })),
 						params: { urls, prompt: params.prompt, format, style },
-					});
-				}
+					},
+				};
 			} catch (e) {
-				errors.push({ task: task.label, error: e?.message || "Task failed" });
+				return {
+					taskLabel: task.label,
+					success: false,
+					error: e?.message || "Task failed",
+				};
 			}
 		}
 
-		return c.json({
-			success: true,
-			thinking: parsed.thinking || "",
-			message: hasExecuteTasks
-				? `Completed ${executed.length} task(s).`
-				: parsed.message || "Here's what I suggest.",
-			suggestedTasks,
-			executed,
-			errors: errors.length > 0 ? errors : undefined,
-			creditsUsed,
-			creditsDistribution,
-			tokenUsage,
+		const encoder = new TextEncoder();
+		const send = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+
+		const stream = new ReadableStream({
+			async start(controller) {
+				controller.enqueue(
+					encoder.encode(
+						send({
+							type: "start",
+							success: true,
+							thinking: parsed.thinking || "",
+							message: hasExecuteTasks
+								? `Running ${validTasks.length} task(s) in parallel.`
+								: parsed.message || "Here's what I suggest.",
+							suggestedTasks,
+						}),
+					),
+				);
+
+				if (validTasks.length === 0) {
+					controller.enqueue(
+						encoder.encode(
+							send({
+								type: "end",
+								executed: [],
+								errors: undefined,
+								scrapeErrors:
+									scrapeErrors.length > 0 ? scrapeErrors : undefined,
+								creditsUsed,
+								creditsDistribution,
+								tokenUsage,
+							}),
+						),
+					);
+					controller.close();
+					return;
+				}
+
+				const crawlUrlTasks = validTasks.filter((t) => t.type === "crawl-url");
+				const otherTasks = validTasks.filter((t) => t.type !== "crawl-url");
+
+				(async () => {
+					const executed = [];
+					const errors = [];
+
+					// Phase 1: run crawl-url tasks first so we have crawlUrlSources for useCrawlResult content tasks
+					if (crawlUrlTasks.length > 0) {
+						const results = await Promise.all(crawlUrlTasks.map((t) => runOneTask(t)));
+						results.forEach((r, i) => {
+							controller.enqueue(encoder.encode(send({ type: "task", index: validTasks.indexOf(crawlUrlTasks[i]), ...r })));
+							if (r.success && r.executed) {
+								executed.push(r.executed);
+								if (r.executed.homePageData || (r.executed.nestedResults && r.executed.nestedResults.length)) {
+									state.crawlUrlSources.push(...buildSourcesFromCrawlResult(r.executed));
+								}
+							} else errors.push({ task: r.taskLabel, error: r.error });
+						});
+					}
+
+					// Phase 2: run remaining tasks (blog/article/table will use state.crawlUrlSources when useCrawlResult: true)
+					if (otherTasks.length > 0) {
+						const results = await Promise.all(otherTasks.map((t) => runOneTask(t)));
+						results.forEach((r, i) => {
+							controller.enqueue(encoder.encode(send({ type: "task", index: validTasks.indexOf(otherTasks[i]), ...r })));
+							if (r.success && r.executed) executed.push(r.executed);
+							else if (r.error) errors.push({ task: r.taskLabel, error: r.error });
+						});
+					}
+
+					controller.enqueue(
+						encoder.encode(
+							send({
+								type: "end",
+								executed,
+								errors: errors.length > 0 ? errors : undefined,
+								scrapeErrors: scrapeErrors.length > 0 ? scrapeErrors : undefined,
+								creditsUsed: state.creditsUsed,
+								creditsDistribution: state.creditsDistribution,
+								tokenUsage: state.tokenUsage,
+							}),
+						),
+					);
+					controller.close();
+				})();
+			},
+		});
+
+		return new Response(stream, {
+			status: 200,
+			headers: {
+				"Content-Type": "text/event-stream",
+				"Cache-Control": "no-cache",
+				Connection: "keep-alive",
+			},
 		});
 	} catch (error) {
 		console.error("[inkgest-agent]", error);
-		return c.json({ error: error?.message || "Agent failed" }, 500);
+		const message = error?.message || "Agent failed";
+		const cause = error?.cause;
+		const isAbort =
+			error?.name === "AbortError" || cause?.name === "AbortError";
+		const code = isAbort
+			? "TIMEOUT"
+			: cause?.code === "UND_ERR_HEADERS_TIMEOUT"
+				? "SCRAPE_HEADERS_TIMEOUT"
+				: cause?.code === "UND_ERR_BODY_TIMEOUT"
+					? "SCRAPE_BODY_TIMEOUT"
+					: message.includes("fetch failed") || cause
+						? "NETWORK_ERROR"
+						: "AGENT_ERROR";
+		return c.json(
+			{
+				error: isAbort
+					? "Request timed out. The LLM or scrape service took too long to respond."
+					: message,
+				code,
+				details: cause?.message || (cause ? String(cause) : undefined),
+			},
+			500,
+		);
 	}
 });
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Take Screenshot API Endpoint
+const SCREENSHOT_VIEWPORT_MAP = {
+	desktop: { width: 1920, height: 1080, scale: 1 },
+	tablet: { width: 1024, height: 768, scale: 1 },
+	mobile: { width: 375, height: 667, scale: 1 },
+};
+
+/**
+ * Capture one URL with a pooled page: viewport, goto (with waitUntil for SSR/SPA), optional waitForSelector,
+ * inject block-distractions CSS (ads, cookie banners, chat widgets), take screenshot. Returns buffer + metadata + markdown.
+ * Used by /take-screenshot and /take-screenshot-multiple.
+ */
+async function captureOneScreenshotWithPage(page, options) {
+	const {
+		url,
+		device = "desktop",
+		waitUntil = "domcontentloaded",
+		waitForSelector,
+		timeout = 50000,
+		fullPage = false,
+		coords,
+		blockDistractions = true,
+	} = options;
+
+	const viewport = SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop;
+	await page.setViewport(viewport);
+	await page.setUserAgent(userAgents.random().toString());
+	await page.setExtraHTTPHeaders({
+		dnt: "1",
+		"upgrade-insecure-requests": "1",
+		accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+		"sec-fetch-site": "none",
+		"sec-fetch-mode": "navigate",
+		"sec-fetch-user": "?1",
+		"sec-fetch-dest": "document",
+		"accept-language": "en-US,en;q=0.9",
+	});
+	await page.setRequestInterception(true);
+	await page.setJavaScriptEnabled(true);
+	page.on("request", (req) => req.continue());
+
+	await page.goto(url, { waitUntil, timeout });
+
+	if (waitForSelector) {
+		try {
+			await page.waitForSelector(waitForSelector, { timeout: 10000 });
+		} catch {}
+	}
+
+	if (blockDistractions && BLOCK_DISTRACTIONS_CSS) {
+		await page.addStyleTag({ content: BLOCK_DISTRACTIONS_CSS }).catch(() => {});
+		await new Promise((r) => setTimeout(r, 200));
+	}
+
+	let screenshotOptions = { optimizeForSpeed: true, encoding: "binary" };
+	if (fullPage) {
+		screenshotOptions.fullPage = true;
+	} else if (coords && typeof coords.x === "number" && typeof coords.y === "number" && typeof coords.width === "number" && typeof coords.height === "number") {
+		screenshotOptions.clip = { x: coords.x, y: coords.y, width: coords.width, height: coords.height };
+	} else {
+		screenshotOptions.clip = { x: 0, y: 0, width: viewport.width, height: viewport.height };
+	}
+	const buffer = await page.screenshot(screenshotOptions);
+
+	const pageHtml = await page.content();
+	const dom = new JSDOM(pageHtml);
+	const doc = dom.window.document;
+	const remove = ["script", "style", "noscript", ".ad", ".ads", "#ad", ".cookie", "#cookie", "[class*='consent']", "[id*='consent']", "[class*='intercom']", "[class*='chat-widget']"];
+	remove.forEach((sel) => doc.querySelectorAll(sel).forEach((el) => el.remove()));
+	const { markdown } = extractSemanticContentWithFormattedMarkdown(doc.body);
+
+	let metadata = {};
+	try {
+		metadata = await page.evaluate(() => {
+			const data = {};
+			document.querySelectorAll("meta").forEach((meta) => {
+				const n = meta.getAttribute("name") || meta.getAttribute("property");
+				const c = meta.getAttribute("content");
+				if (n && c) data[n] = c;
+			});
+			return data;
+		});
+	} catch {}
+
+	return { buffer, metadata, markdown, dimensions: { width: viewport.width, height: viewport.height } };
+}
+
+// Take Screenshot API Endpoint (uses browser pool)
 app.post("/take-screenshot", async (c) => {
 	try {
 		const {
@@ -4041,6 +4571,8 @@ app.post("/take-screenshot", async (c) => {
 			waitForSelector,
 			timeout = 50000,
 			device = "desktop",
+			waitUntil = "domcontentloaded",
+			blockDistractions = true,
 		} = await c.req.json();
 
 		if (!url) {
@@ -4066,301 +4598,38 @@ app.post("/take-screenshot", async (c) => {
 			);
 		}
 
-		// Capture website screenshot
-
-		try {
-			// Import puppeteer-core and chromium
-			const puppeteer = await import("puppeteer-core");
-			const chromium = (await import("@sparticuz/chromium")).default;
-
-			let browser;
-			let scrapedData;
-
-			// Try to launch browser with @sparticuz/chromium first
-			try {
-				const executablePath = await chromium.executablePath();
-
-				browser = await puppeteer.launch({
-					headless: true,
-					args: chromium.args,
-					executablePath: executablePath,
-					ignoreDefaultArgs: ["--disable-extensions"],
-				});
-			} catch (chromiumError) {
-				// Fallback: try to use system Chrome or let puppeteer find a browser
-				browser = await puppeteer.launch({
-					headless: true,
-					executablePath:
-						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-					args: [
-						"--no-sandbox",
-						"--disable-setuid-sandbox",
-						"--disable-dev-shm-usage",
-						"--disable-gpu",
-						"--disable-web-security",
-					],
-				});
-			}
-
-			const page = await browser.newPage();
-
-			const viewportMapping = {
-				desktop: {
-					width: 1920,
-					height: 1080,
-					scale: 1,
-				},
-				tablet: {
-					width: 1024,
-					height: 768,
-					scale: 1,
-				},
-				mobile: {
-					width: 375,
-					height: 667,
-					scale: 1,
-				},
-			};
-
-			const viewport = viewportMapping[device];
-
-			// Set viewport and user agent
-			await page.setViewport(viewport);
-			await page.setUserAgent(userAgents.random().toString());
-
-			// Set extra headers
-			await page.setExtraHTTPHeaders({
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-				"sec-fetch-site": "none",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				"accept-language": "en-US,en;q=0.9",
-			});
-
-			// Set request interception
-			await page.setRequestInterception(true);
-			await page.setJavaScriptEnabled(true);
-			page.on("request", (request) => {
-				request.continue();
-			});
-
-			// Navigate to URL
-			await page.goto(url, {
-				waitUntil: "domcontentloaded",
-				timeout: timeout,
-			});
-
-			// Wait for specific selector if provided
-			if (waitForSelector) {
-				try {
-					await page.waitForSelector(waitForSelector, { timeout: 10000 });
-				} catch (error) {
-					console.warn(`Selector ${waitForSelector} not found within timeout`);
-				}
-			}
-
-			// INSERT_YOUR_CODE
-			// Determine screenshot options based on input
-			let screenshotOptions = {
-				optimizeForSpeed: true,
-				encoding: "binary",
-			};
-
-			if (typeof fullPage !== "undefined" && fullPage) {
-				// If fullPage is present and true, set only fullPage, do not set clip
-				screenshotOptions.fullPage = true;
-			} else if (
-				typeof coords !== "undefined" &&
-				coords &&
-				typeof coords.x === "number" &&
-				typeof coords.y === "number" &&
-				typeof coords.width === "number" &&
-				typeof coords.height === "number"
-			) {
-				// If coords are present, set clip and do not set fullPage
-				screenshotOptions.clip = {
-					x: coords.x,
-					y: coords.y,
-					width: coords.width,
-					height: coords.height,
-				};
-			} else {
-				// Default to viewport screenshot
-				screenshotOptions.clip = {
-					x: 0,
-					y: 0,
-					width: viewport.width,
-					height: viewport.height,
-				};
-			}
-			const screenshotBuffer = await page.screenshot(screenshotOptions);
-
-			const pageHtml = await page.content();
-			const dom = new JSDOM(pageHtml);
-			const document = dom.window.document;
-
-			// Remove unwanted elements from JSDOM document
-			const selectorsToRemove = [
-				"header",
-				"footer",
-				"nav",
-				"aside",
-				".header",
-				".top",
-				".navbar",
-				"#header",
-				".footer",
-				".bottom",
-				"#footer",
-				".sidebar",
-				".side",
-				".aside",
-				"#sidebar",
-				".modal",
-				".popup",
-				"#modal",
-				".overlay",
-				".ad",
-				".ads",
-				".advert",
-				"#ad",
-				".lang-selector",
-				".language",
-				"#language-selector",
-				".social",
-				".social-media",
-				".social-links",
-				"#social",
-				".menu",
-				".navigation",
-				"#nav",
-				".breadcrumbs",
-				"#breadcrumbs",
-				".share",
-				"#share",
-				".widget",
-				"#widget",
-				".cookie",
-				"#cookie",
-				"script",
-				"style",
-				"noscript",
-			];
-
-			selectorsToRemove.forEach((sel) => {
-				document.querySelectorAll(sel).forEach((el) => el.remove());
-			});
-
-			const { markdown } = extractSemanticContentWithFormattedMarkdown(
-				document.body,
+		const { buffer, metadata, markdown, dimensions } =
+			await browserPool.withPage((page) =>
+				captureOneScreenshotWithPage(page, {
+					url,
+					device,
+					waitUntil,
+					waitForSelector,
+					timeout,
+					fullPage,
+					coords,
+					blockDistractions,
+				}),
 			);
 
-			// Extract page content
-			scrapedData = await page.evaluate(async () => {
-				const data = {
-					url: window.location.href,
-					metadata: {},
-				};
+		const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
+		const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+		const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
+		await file.save(buffer, {
+			metadata: { contentType: "image/png", cacheControl: "public, max-age=3600" },
+		});
+		await file.makePublic();
+		const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
 
-				// Meta tags
-				const metaTags = document.querySelectorAll("meta");
-				metaTags.forEach((meta) => {
-					const name =
-						meta.getAttribute("name") || meta.getAttribute("property");
-					const content = meta.getAttribute("content");
-					if (name && content) {
-						data.metadata[name] = content;
-					}
-				});
-
-				// Open Graph tags
-				const ogTags = document.querySelectorAll('meta[property^="og:"]');
-				ogTags.forEach((meta) => {
-					const property = meta.getAttribute("property");
-					const content = meta.getAttribute("content");
-					if (property && content) {
-						data.metadata[property] = content;
-					}
-				});
-
-				// Twitter Card tags
-				const twitterTags = document.querySelectorAll('meta[name^="twitter:"]');
-				twitterTags.forEach((meta) => {
-					const name = meta.getAttribute("name");
-					const content = meta.getAttribute("content");
-					if (name && content) {
-						data.metadata[name] = content;
-					}
-				});
-
-				return data;
-			});
-
-			await page.close();
-
-			// Generate a unique filename for Supabase storage
-			const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(
-				/[^a-zA-Z0-9]/g,
-				"",
-			)}.png`;
-
-			// Upload to Firebase storage
-			const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-			const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
-
-			try {
-				await file.save(screenshotBuffer, {
-					metadata: {
-						contentType: "image/png",
-						cacheControl: "public, max-age=3600",
-					},
-				});
-
-				// Make the file publicly accessible
-				await file.makePublic();
-
-				// Get the public URL
-				const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
-
-				return c.json(
-					{
-						success: true,
-						url: url,
-						markdown: markdown,
-						metadata: scrapedData.metadata,
-						screenshot: screenshotUrl,
-						timestamp: new Date().toISOString(),
-					},
-					200,
-				);
-			} catch (firebaseError) {
-				console.error("❌ Error uploading to Firebase storage:", firebaseError);
-
-				return c.json(
-					{
-						success: false,
-						error: "Failed to upload screenshot to Firebase storage",
-						details: firebaseError.message,
-					},
-					500,
-				);
-			}
-		} catch (captureError) {
-			console.error("❌ Error capturing screenshot:", captureError);
-
-			return c.json(
-				{
-					success: false,
-					error: "Failed to capture screenshot",
-					details: captureError.message,
-				},
-				500,
-			);
-		}
+		return c.json({
+			success: true,
+			url,
+			markdown,
+			metadata,
+			screenshot: screenshotUrl,
+			dimensions,
+			timestamp: new Date().toISOString(),
+		});
 	} catch (error) {
 		console.error("❌ Screenshot API error:", error);
 		return c.json(
@@ -4369,6 +4638,76 @@ app.post("/take-screenshot", async (c) => {
 				error: "Internal server error",
 				details: error.message,
 			},
+			500,
+		);
+	}
+});
+
+// Take Screenshot Multiple — parallel screenshots via browser pool (fast for crawl-url)
+app.post("/take-screenshot-multiple", async (c) => {
+	try {
+		const {
+			urls,
+			device = "desktop",
+			waitForSelector,
+			timeout = 45000,
+			waitUntil = "domcontentloaded",
+			blockDistractions = true,
+		} = await c.req.json();
+
+		if (!Array.isArray(urls) || urls.length === 0) {
+			return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+		}
+		const MAX_URLS = 50;
+		const list = urls.slice(0, MAX_URLS).filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
+		if (list.length === 0) {
+			return c.json({ success: false, error: "No valid URLs" }, 400);
+		}
+
+		const opts = { device, waitForSelector, timeout, waitUntil, blockDistractions };
+		const results = await Promise.all(
+			list.map((url) =>
+				browserPool
+					.withPage((page) => captureOneScreenshotWithPage(page, { ...opts, url }))
+					.then(async ({ buffer, metadata, markdown, dimensions }) => {
+						const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
+						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+						const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
+						await file.save(buffer, {
+							metadata: { contentType: "image/png", cacheControl: "public, max-age=3600" },
+						});
+						await file.makePublic();
+						const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+						return {
+							url,
+							screenshot: screenshotUrl,
+							metadata,
+							markdown,
+							success: true,
+							dimensions,
+						};
+					})
+					.catch((err) => ({
+						url,
+						screenshot: null,
+						metadata: null,
+						markdown: null,
+						success: false,
+						error: err?.message || "Screenshot failed",
+						dimensions: SCREENSHOT_VIEWPORT_MAP[opts.device] || SCREENSHOT_VIEWPORT_MAP.desktop,
+					})),
+			),
+		);
+
+		return c.json({
+			success: true,
+			results,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.error("❌ take-screenshot-multiple error:", error);
+		return c.json(
+			{ success: false, error: error?.message || "Internal server error" },
 			500,
 		);
 	}
@@ -4679,582 +5018,370 @@ app.post("/take-metadata", async (c) => {
 });
 
 app.post("/crawl-take-screenshots", async (c) => {
+	// Wrapper: forwards to /crawl-url with takeScreenshot: true and maps to legacy response shape
 	try {
-		const {
-			url,
-			maxUrls = 10,
-			waitForSelector,
-			timeout = 30000,
-		} = await c.req.json();
-
+		const body = await c.req.json().catch(() => ({}));
+		const { url, maxUrls = 10, waitForSelector, timeout = 30000 } = body;
 		if (!url) {
-			return c.json(
-				{
-					success: false,
-					error: "URL is required",
-				},
-				400,
-			);
+			return c.json({ success: false, error: "URL is required" }, 400);
 		}
-
-		// Validate URL format
-		let seedUrl;
-		try {
-			seedUrl = new URL(url);
-		} catch (error) {
-			return c.json(
-				{
-					success: false,
-					error: "Invalid URL format",
-				},
-				400,
-			);
+		// Build fake request for getScrapeBaseUrl by using current request
+		const crawlBody = {
+			url,
+			maxUrls,
+			waitForSelector,
+			timeout,
+			useSitemap: true,
+			scrapeContent: false,
+			takeScreenshot: true,
+			screenshotDevice: "desktop",
+		};
+		const scrapeBase = getScrapeBaseUrl(c);
+		const res = await fetch(`${scrapeBase}/crawl-url`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(crawlBody),
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok) {
+			return c.json(data, res.status);
 		}
-
-		const domain = seedUrl.hostname;
-		const crawledUrls = new Set();
-
-		try {
-			// Import puppeteer-core and chromium
-			const puppeteer = await import("puppeteer-core");
-			const chromium = (await import("@sparticuz/chromium")).default;
-
-			let browser;
-			let page;
-
-			// Try to launch browser with @sparticuz/chromium first
-			try {
-				const executablePath = await chromium.executablePath();
-
-				browser = await puppeteer.launch({
-					headless: true,
-					args: chromium.args,
-					executablePath: executablePath,
-					ignoreDefaultArgs: ["--disable-extensions"],
-				});
-			} catch (chromiumError) {
-				// Fallback: try to use system Chrome or let puppeteer find a browser
-				browser = await puppeteer.launch({
-					headless: true,
-					executablePath:
-						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-					args: [
-						"--no-sandbox",
-						"--disable-setuid-sandbox",
-						"--disable-dev-shm-usage",
-						"--disable-gpu",
-						"--disable-web-security",
-					],
-				});
-			}
-
-			page = await browser.newPage();
-
-			// Set viewport and user agent
-			await page.setViewport({ width: 1920, height: 1080 });
-			await page.setUserAgent(userAgents.random().toString());
-
-			// Set extra headers
-			await page.setExtraHTTPHeaders({
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-				"sec-fetch-site": "none",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				"accept-language": "en-US,en;q=0.9",
-			});
-
-			// Set request interception
-			await page.setRequestInterception(true);
-			await page.setJavaScriptEnabled(true);
-			page.on("request", (request) => {
-				request.continue();
-			});
-
-			// Function to crawl and collect URLs
-			const crawlPage = async (currentUrl) => {
-				if (crawledUrls.size >= maxUrls) return;
-
-				try {
-					await page.goto(currentUrl, {
-						waitUntil: "domcontentloaded",
-						timeout: timeout,
-					});
-
-					// Wait for specific selector if provided
-					if (waitForSelector) {
-						try {
-							await page.waitForSelector(waitForSelector, { timeout: 10000 });
-						} catch (error) {
-							console.warn(
-								`Selector ${waitForSelector} not found within timeout`,
-							);
-						}
-					}
-
-					// Extract all links from the page
-					const links = await page.evaluate((domain) => {
-						const anchors = Array.from(document.querySelectorAll("a[href]"));
-						const urls = new Set();
-
-						// Define extensions and patterns to exclude
-						const excludedExtensions = [
-							".pdf",
-							".doc",
-							".docx",
-							".xls",
-							".xlsx",
-							".ppt",
-							".pptx",
-							".zip",
-							".rar",
-							".7z",
-							".tar",
-							".gz",
-							".jpg",
-							".jpeg",
-							".png",
-							".gif",
-							".bmp",
-							".svg",
-							".webp",
-							".ico",
-							".mp4",
-							".avi",
-							".mov",
-							".wmv",
-							".flv",
-							".webm",
-							".mp3",
-							".wav",
-							".flac",
-							".aac",
-							".ogg",
-							".css",
-							".js",
-							".json",
-							".xml",
-							".txt",
-							".csv",
-							".exe",
-							".dmg",
-							".pkg",
-							".deb",
-							".rpm",
-							".apk",
-							".ipa",
-							".app",
-							".bin",
-						];
-
-						anchors.forEach((anchor) => {
-							try {
-								const href = anchor.getAttribute("href");
-								if (!href) return;
-
-								// Skip data URLs and javascript URLs
-								if (
-									href.startsWith("data:") ||
-									href.startsWith("javascript:") ||
-									href.startsWith("mailto:") ||
-									href.startsWith("tel:")
-								) {
-									return;
-								}
-
-								// Handle relative URLs
-								const url = new URL(href, window.location.href);
-
-								// Only include URLs from the same domain
-								if (url.hostname !== domain) return;
-
-								// Skip URLs with excluded extensions
-								const pathname = url.pathname.toLowerCase();
-								const hasExcludedExtension = excludedExtensions.some((ext) =>
-									pathname.endsWith(ext),
-								);
-								if (hasExcludedExtension) return;
-
-								// Skip URLs with fragments only (same page anchors)
-								if (url.pathname === "" && url.search === "" && url.hash !== "")
-									return;
-
-								urls.add(url.href);
-							} catch (e) {
-								// Skip invalid URLs
-							}
-						});
-
-						return Array.from(urls);
-					}, domain);
-
-					// Add current URL to crawled set
-					crawledUrls.add(currentUrl);
-
-					// Add new URLs to crawl queue (up to maxUrls)
-					for (const link of links) {
-						if (crawledUrls.size >= maxUrls) break;
-						if (!crawledUrls.has(link)) {
-							crawledUrls.add(link);
-						}
-					}
-
-					return links;
-				} catch (error) {
-					console.error(`Error crawling ${currentUrl}:`, error);
-					return [];
-				}
-			};
-
-			// Start crawling from the seed URL
-			await crawlPage(url);
-
-			// Take screenshots of all crawled URLs
-			const screenshotPromises = Array.from(crawledUrls).map(
-				async (crawlUrl) => {
-					try {
-						const response = await fetch(`${origin}/take-screenshot`, {
-							method: "POST",
-							headers: { "Content-Type": "application/json" },
-							body: JSON.stringify({
-								url: crawlUrl,
-								waitForSelector: waitForSelector,
-								timeout: timeout,
-							}),
-						});
-
-						const data = await response.json();
-
-						return {
-							url: crawlUrl,
-							screenshot: data.screenshot,
-							metadata: data.metadata,
-							markdown: data.markdown,
-							success: data.success,
-						};
-					} catch (error) {
-						console.error(`Error taking screenshot for ${crawlUrl}:`, error);
-						return {
-							url: crawlUrl,
-							screenshot: null,
-							metadata: null,
-							success: false,
-							error: error.message,
-						};
-					}
-				},
-			);
-
-			// Wait for all screenshots to complete
-			const screenshotResults = await Promise.all(screenshotPromises);
-
-			await page.close();
-			await browser.close();
-
-			return c.json({
-				success: true,
-				seedUrl: url,
-				domain: domain,
-				crawledUrls: Array.from(crawledUrls),
-				totalUrls: crawledUrls.size,
-				results: screenshotResults,
-				timestamp: new Date().toISOString(),
-			});
-		} catch (captureError) {
-			console.error("❌ Error in crawl-screenshots:", captureError);
-
-			return c.json(
-				{
-					success: false,
-					crawledUrls: crawledUrls,
-					error: "Failed to crawl and take screenshots",
-					details: captureError.message,
-				},
-				500,
-			);
-		}
-	} catch (error) {
-		console.error("❌ Crawl-screenshots API error:", error);
+		// Map to legacy shape: crawledUrls, results (screenshots)
+		return c.json({
+			success: data.success,
+			seedUrl: data.seedUrl,
+			domain: data.domain,
+			crawledUrls: data.allUrls || [],
+			totalUrls: data.totalUrls || 0,
+			results: (data.screenshots || []).map((s) => ({
+				url: s.url,
+				screenshot: s.screenshot,
+				metadata: s.metadata,
+				markdown: s.markdown,
+				success: s.success,
+				error: s.error,
+				dimensions: s.dimensions,
+			})),
+			timestamp: data.timestamp,
+		});
+	} catch (err) {
 		return c.json(
-			{
-				success: false,
-				error: "Internal server error",
-				details: error.message,
-			},
+			{ success: false, error: err?.message || "Internal server error" },
 			500,
 		);
 	}
 });
 
+// Base URL for /scrape and /scrape-multiple (same server or env)
+function getScrapeBaseUrl(c) {
+	try {
+		const u = new URL(c.req.url);
+		if (u.origin && u.origin !== "null") return u.origin;
+	} catch {}
+	return (
+		process.env.SCRAPE_API_BASE_URL ||
+		process.env.INKGEST_SCRAPE_BASE_URL ||
+		`http://localhost:${process.env.PORT || 3001}`
+	);
+}
+
+/** Fetch sitemap XML and extract same-domain <loc> URLs. Tries sitemap index (first 3 child sitemaps). */
+async function fetchSitemapUrls(origin, domain, maxUrls = 500) {
+	const urls = new Set();
+	const tried = new Set();
+
+	async function parseSitemapXml(xmlUrl) {
+		if (tried.has(xmlUrl) || urls.size >= maxUrls) return;
+		tried.add(xmlUrl);
+		let text;
+		try {
+			const res = await fetch(xmlUrl, {
+				signal: AbortSignal.timeout(15000),
+				headers: { "User-Agent": "Mozilla/5.0 (compatible; CrawlBot/1.0)" },
+			});
+			if (!res.ok) return;
+			text = await res.text();
+		} catch {
+			return;
+		}
+		const locRegex = /<loc>\s*([^<]+)\s*<\/loc>/gi;
+		let match;
+		const locs = [];
+		while ((match = locRegex.exec(text)) !== null) locs.push(match[1].trim());
+		const isIndex = /<sitemap\s/i.test(text);
+		if (isIndex && locs.length > 0) {
+			for (const loc of locs.slice(0, 3)) {
+				try {
+					const u = new URL(loc);
+					if (u.hostname === domain || u.origin === origin) await parseSitemapXml(loc);
+				} catch {}
+			}
+			return;
+		}
+		for (const loc of locs) {
+			try {
+				const u = new URL(loc);
+				if (u.hostname !== domain && u.origin !== origin) continue;
+				urls.add(loc);
+				if (urls.size >= maxUrls) return;
+			} catch {}
+		}
+	}
+
+	await parseSitemapXml(`${origin}/sitemap.xml`);
+	if (urls.size === 0) await parseSitemapXml(`${origin}/sitemap_index.xml`);
+	if (urls.size === 0) await parseSitemapXml(`${origin}/sitemap/sitemap.xml`);
+	return urls;
+}
+
+/** Normalize and filter same-domain links from scrape data.links (array of { href } or string). */
+function extractSameDomainLinks(links, origin, domain) {
+	const out = new Set();
+	if (!Array.isArray(links)) return out;
+	for (const item of links) {
+		const href = typeof item === "string" ? item : item?.href || item?.url;
+		if (!href || typeof href !== "string") continue;
+		try {
+			const u = new URL(href, origin);
+			if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+			if (u.hostname !== domain) continue;
+			out.add(u.href);
+		} catch {}
+	}
+	return out;
+}
+
+/** True if URL is a sitemap (e.g. /sitemap.xml, /sitemap/, /sitemap_index.xml). Exclude these from crawl output. */
+function isSitemapUrl(urlString) {
+	try {
+		const u = new URL(urlString);
+		const path = u.pathname.toLowerCase();
+		if (path.endsWith(".xml") && /sitemap|rss|feed/.test(path)) return true;
+		if (/\/sitemap(\/|_|$)/.test(path)) return true;
+		return false;
+	} catch {
+		return false;
+	}
+}
+
 app.post("/crawl-url", async (c) => {
 	try {
 		const {
 			url,
-			maxUrls = 5,
-			allowSeedDomains = false,
-			waitForSelector,
+			maxUrls = 100,
 			timeout = 60000,
+			useSitemap = true,
+			scrapeContent = false,
+			takeScreenshot = false,
+			waitForSelector,
+			screenshotDevice = "desktop",
+			// Screenshot fanout can be expensive; cap by default to stay fast.
+			screenshotMaxUrls = 10,
+			screenshotWaitUntil = "domcontentloaded",
+			screenshotTimeout = 20000,
 		} = await c.req.json();
 
+		// Desktop dimensions by default (same as /take-screenshot)
+		const SCREENSHOT_DIMENSIONS = {
+			desktop: { width: 1920, height: 1080 },
+			tablet: { width: 1024, height: 768 },
+			mobile: { width: 375, height: 667 },
+		};
+		const dimensions = SCREENSHOT_DIMENSIONS[screenshotDevice] || SCREENSHOT_DIMENSIONS.desktop;
+
 		if (!url) {
-			return c.json(
-				{
-					success: false,
-					error: "URL is required",
-				},
-				400,
-			);
+			return c.json({ success: false, error: "URL is required" }, 400);
 		}
 
-		// Validate URL format
 		let seedUrl;
 		try {
 			seedUrl = new URL(url);
-		} catch (error) {
-			return c.json(
-				{
-					success: false,
-					error: "Invalid URL format",
-				},
-				400,
-			);
+		} catch {
+			return c.json({ success: false, error: "Invalid URL format" }, 400);
 		}
 
 		const domain = seedUrl.hostname;
-		const crawledUrls = new Set();
+		const origin = seedUrl.origin;
+		const homePage = seedUrl.href;
+		const scrapeBase = getScrapeBaseUrl(c);
+		const SCRAPE_MULTIPLE_BATCH = 20; // scrape-multiple max per request
+		const maxNested = Math.min(Number(maxUrls) || 100, 500);
 
+		const allUrlsSet = new Set();
+		allUrlsSet.add(homePage);
+		let homeResult = null;
+
+		// 1) Always scrape home page first for link discovery (and homePageData)
 		try {
-			// Import puppeteer-core and chromium
-			const puppeteer = await import("puppeteer-core");
-			const chromium = (await import("@sparticuz/chromium")).default;
-
-			let browser;
-			let page;
-
-			// Try to launch browser with @sparticuz/chromium first
-			try {
-				const executablePath = await chromium.executablePath();
-
-				browser = await puppeteer.launch({
-					headless: true,
-					args: chromium.args,
-					executablePath: executablePath,
-					ignoreDefaultArgs: ["--disable-extensions"],
-				});
-			} catch (chromiumError) {
-				// Fallback: try to use system Chrome or let puppeteer find a browser
-				browser = await puppeteer.launch({
-					headless: true,
-					executablePath:
-						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-					args: [
-						"--no-sandbox",
-						"--disable-setuid-sandbox",
-						"--disable-dev-shm-usage",
-						"--disable-gpu",
-						"--disable-web-security",
-					],
-				});
-			}
-
-			page = await browser.newPage();
-
-			// Set viewport and user agent
-			await page.setViewport({ width: 1920, height: 1080 });
-			await page.setUserAgent(userAgents.random().toString());
-
-			// Set extra headers
-			await page.setExtraHTTPHeaders({
-				dnt: "1",
-				"upgrade-insecure-requests": "1",
-				accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-				"sec-fetch-site": "none",
-				"sec-fetch-mode": "navigate",
-				"sec-fetch-user": "?1",
-				"sec-fetch-dest": "document",
-				"accept-language": "en-US,en;q=0.9",
+			const scrapeRes = await fetch(`${scrapeBase}/scrape`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				signal: AbortSignal.timeout(timeout),
+				body: JSON.stringify({
+					url: homePage,
+					timeout: Math.min(timeout, 30000),
+					includeLinks: true,
+					// NOTE: in /scrape implementation, links are extracted inside the
+					// semanticContent evaluate block. So we must enable it here even when
+					// scrapeContent is false, otherwise we only discover the homepage URL.
+					includeSemanticContent: true,
+					includeImages: false,
+					extractMetadata: false,
+					takeScreenshot: false,
+				}),
 			});
-
-			// Set request interception
-			await page.setRequestInterception(true);
-			await page.setJavaScriptEnabled(true);
-			page.on("request", (request) => {
-				request.continue();
-			});
-
-			// Function to crawl and collect URLs
-			const crawlPage = async (currentUrl) => {
-				if (crawledUrls.size >= maxUrls) return;
-
-				try {
-					await page.goto(currentUrl, {
-						waitUntil: "domcontentloaded",
-						timeout: timeout,
-					});
-
-					// Wait for specific selector if provided
-					if (waitForSelector) {
-						try {
-							await page.waitForSelector(waitForSelector, { timeout: 10000 });
-						} catch (error) {
-							console.warn(
-								`Selector ${waitForSelector} not found within timeout`,
-							);
-						}
-					}
-
-					// Extract all links from the page
-					const links = await page.evaluate((domain) => {
-						const anchors = Array.from(document.querySelectorAll("a[href]"));
-						const urls = new Set();
-
-						// Define extensions and patterns to exclude
-						const excludedExtensions = [
-							".pdf",
-							".doc",
-							".docx",
-							".xls",
-							".xlsx",
-							".ppt",
-							".pptx",
-							".zip",
-							".rar",
-							".7z",
-							".tar",
-							".gz",
-							".jpg",
-							".jpeg",
-							".png",
-							".gif",
-							".bmp",
-							".svg",
-							".webp",
-							".ico",
-							".mp4",
-							".avi",
-							".mov",
-							".wmv",
-							".flv",
-							".webm",
-							".mp3",
-							".wav",
-							".flac",
-							".aac",
-							".ogg",
-							".css",
-							".js",
-							".json",
-							".xml",
-							".txt",
-							".csv",
-							".exe",
-							".dmg",
-							".pkg",
-							".deb",
-							".rpm",
-							".apk",
-							".ipa",
-							".app",
-							".bin",
-						];
-
-						anchors.forEach((anchor) => {
-							try {
-								const href = anchor.getAttribute("href");
-								if (!href) return;
-
-								// Skip data URLs and javascript URLs
-								if (
-									href.startsWith("data:") ||
-									href.startsWith("javascript:") ||
-									href.startsWith("mailto:") ||
-									href.startsWith("tel:")
-								) {
-									return;
-								}
-
-								// Handle relative URLs
-								const url = new URL(href, window.location.href);
-
-								// Only include URLs from the same domain
-								if (url.hostname !== domain && allowSeedDomains) return;
-
-								// Skip URLs with excluded extensions
-								const pathname = url.pathname.toLowerCase();
-								// const hasExcludedExtension = excludedExtensions.some((ext) =>
-								// 	pathname.endsWith(ext)
-								// );
-								// if (hasExcludedExtension) return;
-
-								// Skip URLs with fragments only (same page anchors)
-								if (url.pathname === "" && url.search === "" && url.hash !== "")
-									return;
-
-								urls.add(url.href);
-							} catch (e) {
-								// Skip invalid URLs
-							}
-						});
-
-						return Array.from(urls);
-					}, domain);
-
-					// Add current URL to crawled set
-					crawledUrls.add(currentUrl);
-
-					// Add new URLs to crawl queue (up to maxUrls)
-					for (const link of links) {
-						if (crawledUrls.size >= maxUrls) break;
-						if (!crawledUrls.has(link)) {
-							crawledUrls.add(link);
-						}
-					}
-
-					return links;
-				} catch (error) {
-					console.error(`Error crawling ${currentUrl}:`, error);
-					return [];
+			const scrapeData = await scrapeRes.json().catch(() => ({}));
+			if (scrapeData.success) {
+				homeResult = scrapeData;
+				if (scrapeData.data?.links) {
+					const nested = extractSameDomainLinks(
+						scrapeData.data.links,
+						origin,
+						domain,
+					);
+					nested.forEach((u) => allUrlsSet.add(u));
 				}
-			};
-
-			// Start crawling from the seed URL
-			await crawlPage(url);
-
-			await page.close();
-			await browser.close();
-
-			return c.json({
-				success: true,
-				seedUrl: url,
-				domain: domain,
-				crawledUrls: Array.from(crawledUrls),
-				totalUrls: crawledUrls.size,
-				timestamp: new Date().toISOString(),
-			});
-		} catch (captureError) {
-			console.error("❌ Error in crawl-screenshots:", captureError);
-
-			return c.json(
-				{
-					success: false,
-					crawledUrls: crawledUrls,
-					error: "Failed to crawl and take screenshots",
-					details: captureError.message,
-				},
-				500,
-			);
+			}
+		} catch (err) {
+			console.warn("[crawl-url] Home scrape failed:", err?.message);
 		}
+
+		// 2) Optionally add sitemap URLs (supplement; sitemap often only has updated URLs)
+		if (useSitemap) {
+			const sitemapUrls = await fetchSitemapUrls(origin, domain, maxNested);
+			sitemapUrls.forEach((u) => allUrlsSet.add(u));
+		}
+
+		// 3) Remove sitemap URLs from output (no domain/sitemap/ or *.xml sitemap links)
+		for (const u of Array.from(allUrlsSet)) {
+			if (isSitemapUrl(u)) allUrlsSet.delete(u);
+		}
+
+		const allUrls = Array.from(allUrlsSet).slice(0, maxNested + 1);
+		const nestedUrls = allUrls.filter((u) => u !== homePage);
+
+		// Optional: take screenshots (browser pool, parallel, capped)
+		let screenshots = [];
+		if (takeScreenshot && allUrls.length > 0) {
+			const screenshotUrls = allUrls.slice(
+				0,
+				Math.max(1, Math.min(Number(screenshotMaxUrls) || 10, allUrls.length)),
+			);
+			try {
+				const res = await fetch(`${scrapeBase}/take-screenshot-multiple`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					// NOTE: /take-screenshot-multiple is limited by browserPool throughput,
+					// so the total wall time can exceed the per-page timeout. Don't abort
+					// the whole request at 60s when many URLs are queued.
+					signal: AbortSignal.timeout(Math.max(timeout, 5 * 60 * 1000)),
+					body: JSON.stringify({
+						urls: screenshotUrls,
+						device: screenshotDevice,
+						waitForSelector: waitForSelector || undefined,
+						timeout: Math.min(Number(screenshotTimeout) || 20000, 60000),
+						waitUntil: screenshotWaitUntil || "domcontentloaded",
+						blockDistractions: true,
+					}),
+				});
+				const data = await res.json().catch(() => ({}));
+				if (data.success && Array.isArray(data.results)) {
+					screenshots = data.results.map((r) => ({
+						url: r.url,
+						screenshot: r.screenshot || null,
+						metadata: r.metadata || null,
+						markdown: r.markdown || null,
+						success: !!r.success,
+						error: r.error || null,
+						dimensions: r.dimensions || { ...dimensions },
+					}));
+				}
+			} catch (err) {
+				screenshots = screenshotUrls.map((u) => ({
+					url: u,
+					screenshot: null,
+					metadata: null,
+					markdown: null,
+					success: false,
+					error: err?.message || "Screenshot failed",
+					dimensions: { ...dimensions },
+				}));
+			}
+		}
+
+		const payload = {
+			success: true,
+			seedUrl: homePage,
+			domain,
+			allUrls,
+			totalUrls: allUrls.length,
+			usedSitemap: useSitemap,
+			homePageData: homeResult
+				? {
+						success: homeResult.success,
+						markdown: homeResult.markdown,
+						data: homeResult.data,
+						url: homePage,
+					}
+				: null,
+			screenshots: takeScreenshot ? screenshots : undefined,
+			timestamp: new Date().toISOString(),
+		};
+
+		if (!scrapeContent) {
+			return c.json({ ...payload, nestedResults: [] });
+		}
+
+		// scrapeContent: true — normal JSON response (can take minutes)
+		const chunks = [];
+		for (let i = 0; i < nestedUrls.length; i += SCRAPE_MULTIPLE_BATCH) {
+			chunks.push(nestedUrls.slice(i, i + SCRAPE_MULTIPLE_BATCH));
+		}
+
+		// Batch requests in parallel; pool/puppeteer will backpressure internally.
+		const nestedTimeoutMs = Math.max(Number(timeout) || 60000, 5 * 60 * 1000);
+		const settled = await Promise.allSettled(
+			chunks.map(async (chunk) => {
+				const res = await fetch(`${scrapeBase}/scrape-multiple`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					signal: AbortSignal.timeout(nestedTimeoutMs),
+					body: JSON.stringify({
+						urls: chunk,
+						// Per-URL scrape timeout inside /scrape-multiple
+						timeout: Math.min(nestedTimeoutMs, 60000),
+						includeLinks: false,
+						includeSemanticContent: true,
+						includeImages: false,
+						extractMetadata: true,
+					}),
+				});
+				const data = await res.json().catch(() => ({}));
+				return data.results || [];
+			}),
+		);
+
+		const nestedResults = settled.flatMap((r, idx) => {
+			if (r.status === "fulfilled") return r.value;
+			const chunk = chunks[idx] || [];
+			return chunk.map((u) => ({
+				url: u,
+				success: false,
+				error: r.reason?.message || "Scrape failed",
+			}));
+		});
+
+		return c.json({
+			...payload,
+			nestedResults,
+		});
 	} catch (error) {
-		console.error("❌ Crawl-screenshots API error:", error);
+		console.error("❌ crawl-url API error:", error);
 		return c.json(
 			{
 				success: false,
 				error: "Internal server error",
-				details: error.message,
+				details: error?.message,
 			},
 			500,
 		);
@@ -5262,7 +5389,6 @@ app.post("/crawl-url", async (c) => {
 });
 
 const parseRedditData = (data, url) => {
-	console.log(data, "data");
 	if (!data || !data.data || !data.data.children) {
 		return { markdown: "No Reddit data found", posts: [] };
 	}
@@ -6634,6 +6760,309 @@ app.post("/scrap-google-news", async (c) => {
 	}
 });
 
+app.post("/fetch-metadata", async (c) => {
+	try {
+		const { url } = await c.req.json();
+
+		if (!url) {
+			return c.json(
+				{
+					success: false,
+					error: "URL is required",
+				},
+				400
+			);
+		}
+
+		// Validate URL format
+		try {
+			new URL(url);
+		} catch (error) {
+			return c.json(
+				{
+					success: false,
+					error: "Invalid URL format",
+				},
+				400
+			);
+		}
+
+		try {
+			// Fetch the webpage content
+			const response = await axios.get(url, {
+				headers: {
+					"User-Agent": userAgents.random().toString(),
+					Accept:
+						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+					"Accept-Language": "en-US,en;q=0.9",
+					"Accept-Encoding": "gzip, deflate, br",
+					DNT: "1",
+					Connection: "keep-alive",
+					"Upgrade-Insecure-Requests": "1",
+				},
+				timeout: 30000,
+				maxRedirects: 5,
+			});
+
+			// Load HTML content with Cheerio
+			const $ = load(response.data);
+
+			// Extract basic metadata
+			const metadata = {
+				url: url,
+				title: $("title").text().trim() || $("h1").first().text().trim(),
+				description: "",
+				author: "",
+				pubDate: "",
+				image: "",
+				robots: "",
+				keywords: "",
+				language: "",
+				viewport: "",
+				favicon: "",
+				openGraph: {},
+				twitterCard: {},
+				allMetaTags: {},
+			};
+
+			// Extract description from various meta tags
+			metadata.description =
+				$('meta[name="description"]').attr("content") ||
+				$('meta[property="og:description"]').attr("content") ||
+				$('meta[name="twitter:description"]').attr("content") ||
+				$('meta[name="summary"]').attr("content") ||
+				"";
+
+			// Extract author
+			metadata.author =
+				$('meta[name="author"]').attr("content") ||
+				$('meta[property="article:author"]').attr("content") ||
+				$('meta[name="twitter:creator"]').attr("content") ||
+				$('link[rel="author"]').attr("href") ||
+				"";
+
+			// Extract publication date
+			metadata.pubDate =
+				$('meta[property="article:published_time"]').attr("content") ||
+				$('meta[name="date"]').attr("content") ||
+				$('meta[name="pubdate"]').attr("content") ||
+				$('meta[name="DC.date.issued"]').attr("content") ||
+				$("time[datetime]").first().attr("datetime") ||
+				"";
+
+			// Extract main image
+			metadata.image =
+				$('meta[property="og:image"]').attr("content") ||
+				$('meta[name="twitter:image"]').attr("content") ||
+				$('meta[name="image"]').attr("content") ||
+				$("img").first().attr("src") ||
+				"";
+
+			if (
+				metadata.image.startsWith("http") ||
+				metadata.image.startsWith("//") ||
+				metadata.image.startsWith("data:image/") ||
+				metadata.image.startsWith("blob:") ||
+				metadata.image.startsWith("file:") ||
+				metadata.image.startsWith("mailto:")
+			) {
+				metadata.image = "";
+			}
+			// Extract robots meta
+			metadata.robots = $('meta[name="robots"]').attr("content") || "";
+
+			// Extract keywords
+			metadata.keywords = $('meta[name="keywords"]').attr("content") || "";
+
+			// Extract language
+			metadata.language =
+				$("html").attr("lang") ||
+				$('meta[http-equiv="content-language"]').attr("content") ||
+				$('meta[name="language"]').attr("content") ||
+				"";
+
+			// Extract viewport
+			metadata.viewport = $('meta[name="viewport"]').attr("content") || "";
+
+			// Extract charset
+			metadata.charset =
+				$("meta[charset]").attr("charset") ||
+				$('meta[http-equiv="content-type"]').attr("content") ||
+				"";
+
+			// Extract theme color
+			metadata.themeColor = $('meta[name="theme-color"]').attr("content") || "";
+
+			// Extract all meta tags
+			$("meta").each((i, element) => {
+				const $meta = $(element);
+				const name =
+					$meta.attr("name") ||
+					$meta.attr("property") ||
+					$meta.attr("http-equiv");
+				const content = $meta.attr("content");
+				if (name && content) {
+					metadata.allMetaTags[name] = content;
+				}
+			});
+
+			// Extract Open Graph tags
+			$('meta[property^="og:"]').each((i, element) => {
+				const $meta = $(element);
+				const property = $meta.attr("property");
+				const content = $meta.attr("content");
+				if (property && content) {
+					// If the content starts with "http", "blob:", "image:", or "data:", set the value to an empty string
+					if (
+						content.startsWith("http") ||
+						content.startsWith("blob:") ||
+						content.startsWith("image:") ||
+						content.startsWith("data:")
+					) {
+						return;
+					} else {
+						metadata.openGraph[property] = content;
+					}
+				}
+			});
+
+			// Extract Twitter Card tags
+			$('meta[name^="twitter:"]').each((i, element) => {
+				const $meta = $(element);
+				const name = $meta.attr("name");
+				const content = $meta.attr("content");
+				if (name && content) {
+					if (
+						content.startsWith("http") ||
+						content.startsWith("blob:") ||
+						content.startsWith("image:") ||
+						content.startsWith("data:")
+					) {
+						return;
+					} else {
+						metadata.twitterCard[name] = content;
+					}
+				}
+			});
+
+			// Extract favicon
+			metadata.favicon =
+				$('link[rel="icon"]').attr("href") ||
+				$('link[rel="shortcut icon"]').attr("href") ||
+				$('link[rel="favicon"]').attr("href") ||
+				"";
+
+			return c.json({
+				success: true,
+				metadata: metadata,
+				timestamp: new Date().toISOString(),
+			});
+		} catch (fetchError) {
+			console.error("❌ Error fetching URL:", fetchError);
+
+			// Handle specific HTTP status codes
+			if (fetchError.response) {
+				const status = fetchError.response.status;
+
+				// Handle page not found (404) and other client errors
+				if (status === 404) {
+					return c.json(
+						{
+							success: true,
+							metadata: null,
+							message: "Page not found - the requested URL does not exist",
+							status: 404,
+							timestamp: new Date().toISOString(),
+						},
+						200
+					);
+				}
+
+				// Handle other client errors (4xx)
+				if (status >= 400 && status < 500) {
+					return c.json(
+						{
+							success: true,
+							metadata: null,
+							message: `Client error - the server returned status ${status}`,
+							status: status,
+							timestamp: new Date().toISOString(),
+						},
+						200
+					);
+				}
+
+				// Handle server errors (5xx)
+				if (status >= 500) {
+					return c.json(
+						{
+							success: true,
+							metadata: null,
+							message: `Server error - the target server returned status ${status}`,
+							status: status,
+							timestamp: new Date().toISOString(),
+						},
+						200
+					);
+				}
+			}
+
+			// Handle network errors (DNS, connection issues, etc.)
+			if (
+				fetchError.code === "ENOTFOUND" ||
+				fetchError.code === "ECONNREFUSED" ||
+				fetchError.code === "ETIMEDOUT"
+			) {
+				return c.json(
+					{
+						success: true,
+						metadata: null,
+						message: "Network error - unable to reach the requested URL",
+						error: fetchError.code,
+						timestamp: new Date().toISOString(),
+					},
+					200
+				);
+			}
+
+			// Handle timeout errors
+			if (fetchError.code === "ECONNABORTED") {
+				return c.json(
+					{
+						success: true,
+						metadata: null,
+						message: "Request timeout - the server took too long to respond",
+						timestamp: new Date().toISOString(),
+					},
+					200
+				);
+			}
+
+			// Handle other errors
+			return c.json(
+				{
+					success: true,
+					metadata: null,
+					message: "Unable to fetch metadata from the requested URL",
+					error: fetchError.message,
+					timestamp: new Date().toISOString(),
+				},
+				200
+			);
+		}
+	} catch (error) {
+		console.error("❌ Metadata API error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Internal server error",
+				details: error.message,
+			},
+			500
+		);
+	}
+});
+
 app.get("/scrap-grokipedia", async (c) => {
 	try {
 		const city = await c.req.query("city");
@@ -6645,8 +7074,17 @@ app.get("/scrap-grokipedia", async (c) => {
 
 		// Construct Grokipedia URL: page/Kota%2C_Rajasthan format
 		// Format: city and state, separated by %2C_ (comma and underscore)
-		const formattedCity = city.trim().replace(/\s+/g, "_");
-		const formattedState = state.trim().replace(/\s+/g, "_");
+		const toTitleCase = (s) =>
+			String(s || "")
+				.trim()
+				.replace(/\s+/g, " ")
+				.split(" ")
+				.filter(Boolean)
+				.map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+				.join(" ");
+
+		const formattedCity = toTitleCase(city).replace(/\s+/g, "_");
+		const formattedState = toTitleCase(state).replace(/\s+/g, "_");
 		const url = `https://grokipedia.com/page/${formattedCity}%2C_${formattedState}`;
 
 		console.log("Grokipedia URL:", url);
@@ -6811,7 +7249,6 @@ app.get("/scrap-grokipedia", async (c) => {
 	}
 });
 
-
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.post("/generate-launch-kit", async (c) => {
 	const { url, tone = "bold" } = await c.req.json();
@@ -6964,7 +7401,6 @@ ${JSON.stringify(structured)}`;
 		return c.json({ success: false, error: "Generation failed" }, 500);
 	}
 });
-
 
 const port = 3002;
 console.log(`Server is running on port ${port}`);
