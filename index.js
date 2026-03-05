@@ -4039,11 +4039,16 @@ app.post("/inkgest-agent", async (c) => {
 		const extractedUrls = hasExecuteTasks
 			? [
 					...new Set(
-						executeTasks.flatMap((t) =>
-							(Array.isArray(t.params?.urls) ? t.params.urls : []).filter((u) =>
-								/^https?:\/\/\S+$/i.test(String(u)),
-							),
-						),
+						executeTasks.flatMap((t) => {
+							const fromParams = (Array.isArray(t.params?.urls)
+								? t.params.urls
+								: []
+							).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
+							const fromPrompt = extractUrlsFromText(
+								t.params?.prompt || "",
+							);
+							return [...fromParams, ...fromPrompt];
+						}),
 					),
 				]
 			: extractUrlsFromText(userPrompt);
@@ -4128,7 +4133,13 @@ app.post("/inkgest-agent", async (c) => {
 			]);
 
 			scrapedSources = scraped.sources || [];
-			if (scraped.errors?.length) scrapeErrors.push(...scraped.errors);
+			if (scraped.errors?.length) {
+				scrapeErrors.push(...scraped.errors);
+				console.error(
+					"[inkgest-agent] Scrape errors (router path):",
+					scraped.errors,
+				);
+			}
 			const raw = routerResult.content;
 			addTokenUsage(routerResult.usage);
 			creditsDistribution.push({ task: "thinking", credits: CREDITS.thinking });
@@ -4178,20 +4189,62 @@ app.post("/inkgest-agent", async (c) => {
 					...(youtubeScraped.sources || []),
 					...(redditScraped.sources || []),
 				];
-				if (regularScraped.errors?.length)
+				if (regularScraped.errors?.length) {
 					scrapeErrors.push(...regularScraped.errors);
-				if (youtubeScraped.errors?.length)
+					console.error(
+						"[inkgest-agent] Scrape errors (execute path):",
+						regularScraped.errors,
+					);
+				}
+				if (youtubeScraped.errors?.length) {
 					scrapeErrors.push(...youtubeScraped.errors);
-				if (redditScraped.errors?.length)
+					console.error(
+						"[inkgest-agent] YouTube scrape errors:",
+						youtubeScraped.errors,
+					);
+				}
+				if (redditScraped.errors?.length) {
 					scrapeErrors.push(...redditScraped.errors);
+					console.error(
+						"[inkgest-agent] Reddit scrape errors:",
+						redditScraped.errors,
+					);
+				}
 			}
 		}
 
-		const tasksToRun = hasExecuteTasks
+		let tasksToRun = hasExecuteTasks
 			? executeTasks
 			: parsed.shouldExecute === true
 				? suggestedTasks
 				: [];
+
+		// Fallback: when only scrape is suggested but user wants a deliverable (summarise, blog, etc.), add article task
+		const wantsDeliverable = /summarise|summarize|blog|article|create a|write a|from this (link|tweet|post|url)/i.test(
+			userPrompt,
+		);
+		const onlyScrape =
+			tasksToRun.length === 1 &&
+			tasksToRun[0]?.type === "scrape" &&
+			urlsToScrape.length > 0;
+		if (onlyScrape && wantsDeliverable) {
+			const format = /blog/i.test(userPrompt) ? "blog" : "article";
+			tasksToRun = [
+				...tasksToRun,
+				{
+					type: format,
+					label: `Create ${format} from scraped content`,
+					params: {
+						urls: urlsToScrape,
+						prompt:
+							format === "blog"
+								? "Create a blog post from this content"
+								: "Summarize the key points and takeaways",
+					},
+				},
+			];
+		}
+
 		const sourceByUrl = Object.fromEntries(
 			scrapedSources.map((s) => [
 				s.url,
@@ -4207,6 +4260,52 @@ app.post("/inkgest-agent", async (c) => {
 		const validTasks = tasksToRun.filter(
 			(t) => t && TASK_TYPES.includes(t.type),
 		);
+
+		// CRITICAL: When URLs are provided to scrape and scraping fails, do NOT create any asset.
+		// End the task immediately — never fall back to AI-only content when scrape was expected.
+		const CONTENT_TYPES_NEEDING_SOURCES = [
+			"blog",
+			"article",
+			"newsletter",
+			"substack",
+			"linkedin",
+			"twitter",
+			"table",
+			"landing-page-generator",
+			"image-gallery-creator",
+			"infographics-svg-generator",
+		];
+		const contentTasksNeedingScrape = validTasks.filter(
+			(t) =>
+				CONTENT_TYPES_NEEDING_SOURCES.includes(t.type) &&
+				!t.params?.useCrawlResult,
+		);
+		if (
+			urlsToScrape.length > 0 &&
+			scrapedSources.length === 0 &&
+			contentTasksNeedingScrape.length > 0
+		) {
+			const errPayload = {
+				error:
+					"Scraping failed for all provided URLs. Cannot create content without source data. The AI will not generate assets when URLs are provided and scrape fails.",
+				scrapeErrors:
+					scrapeErrors.length > 0
+						? scrapeErrors
+						: ["No content could be extracted from the URLs."],
+				creditsUsed,
+				creditsDistribution,
+				tokenUsage,
+			};
+			console.error(
+				"[inkgest-agent] Aborting: scrape failed for URLs, not running content tasks.",
+				"urls:",
+				urlsToScrape,
+				"scrapeErrors:",
+				errPayload.scrapeErrors,
+			);
+			return c.json(errPayload, 422);
+		}
+
 		const state = {
 			tokenUsage: { ...tokenUsage },
 			creditsUsed,
@@ -4285,6 +4384,10 @@ app.post("/inkgest-agent", async (c) => {
 						];
 					}
 					if (sources.length === 0) {
+						console.error(
+							"[inkgest-agent] Scrape task failed: no content for URLs",
+							urls,
+						);
 						return {
 							taskLabel: task.label,
 							success: false,
@@ -4426,6 +4529,29 @@ app.post("/inkgest-agent", async (c) => {
 				const preSources = useCrawlResult
 					? state.crawlUrlSources
 					: urls.map((u) => sourceByUrl[u]).filter(Boolean);
+
+				// CRITICAL: Do NOT create content when URLs were provided but scrape failed.
+				if (
+					urls.length > 0 &&
+					!useCrawlResult &&
+					preSources.length === 0
+				) {
+					const errMsg =
+						"Scraping failed for provided URLs. Cannot create content without source data.";
+					console.error(
+						"[inkgest-agent] Content task aborted (no scraped sources):",
+						task.type,
+						task.label,
+						"urls:",
+						urls,
+					);
+					return {
+						taskLabel: task.label,
+						success: false,
+						error: errMsg,
+					};
+				}
+
 				const format = params.format || "substack";
 				const style = params.style || "casual";
 				const system = skill.buildSystemPrompt(
@@ -4610,7 +4736,15 @@ app.post("/inkgest-agent", async (c) => {
 										...buildSourcesFromCrawlResult(r.executed),
 									);
 								}
-							} else errors.push({ task: r.taskLabel, error: r.error });
+							} else {
+								console.error(
+									"[inkgest-agent] Task failed:",
+									r.taskLabel,
+									"error:",
+									r.error,
+								);
+								errors.push({ task: r.taskLabel, error: r.error });
+							}
 						});
 					}
 
@@ -4630,8 +4764,15 @@ app.post("/inkgest-agent", async (c) => {
 								),
 							);
 							if (r.success && r.executed) executed.push(r.executed);
-							else if (r.error)
+							else if (r.error) {
+								console.error(
+									"[inkgest-agent] Task failed:",
+									r.taskLabel,
+									"error:",
+									r.error,
+								);
 								errors.push({ task: r.taskLabel, error: r.error });
+							}
 						});
 					}
 
@@ -4699,6 +4840,8 @@ app.post("/inkgest-agent", async (c) => {
 		);
 	}
 });
+
+// give me simple git repo 
 
 
 const SCREENSHOT_VIEWPORT_MAP = {
