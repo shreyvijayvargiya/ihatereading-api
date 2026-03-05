@@ -4104,6 +4104,7 @@ app.post("/inkgest-agent", async (c) => {
 						regularUrls.length > 0
 							? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, regularUrls, {
 									includeImages: true,
+									aiSummary: true,
 								})
 							: { sources: [], errors: [] },
 						youtubeUrls.length > 0
@@ -4175,7 +4176,9 @@ app.post("/inkgest-agent", async (c) => {
 				const [regularScraped, youtubeScraped, redditScraped] =
 					await Promise.all([
 						regularUrls.length > 0
-							? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, regularUrls)
+							? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, regularUrls, {
+									aiSummary: true,
+								})
 							: { sources: [], errors: [] },
 						youtubeUrls.length > 0
 							? scrapeYoutubeViaApi(apiBase, youtubeUrls)
@@ -4367,6 +4370,7 @@ app.post("/inkgest-agent", async (c) => {
 								missingRegular.length > 0
 									? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, missingRegular, {
 											includeImages: true,
+											aiSummary: true,
 										})
 									: { sources: [], errors: [] },
 								missingYoutube.length > 0
@@ -4526,9 +4530,11 @@ app.post("/inkgest-agent", async (c) => {
 
 				const useCrawlResult =
 					params.useCrawlResult === true && state.crawlUrlSources?.length > 0;
-				const preSources = useCrawlResult
+				let preSources = useCrawlResult
 					? state.crawlUrlSources
 					: urls.map((u) => sourceByUrl[u]).filter(Boolean);
+
+				// Scrape API uses aiSummary: true — returns condensed summary + links/images, no extra LLM needed
 
 				// CRITICAL: Do NOT create content when URLs were provided but scrape failed.
 				if (
