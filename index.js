@@ -15,6 +15,10 @@ import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemant
 import {
 	extractUrlsFromText,
 	scrapeUrlsViaApi,
+	scrapeYoutubeViaApi,
+	scrapeRedditViaApi,
+	isYoutubeUrl,
+	isRedditUrl,
 	ROUTER_SYSTEM_PROMPT,
 	parseAgentResponse,
 	SKILLS,
@@ -34,6 +38,10 @@ import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+	fetchTranscript,
+	YoutubeTranscriptNotAvailableLanguageError,
+} from "youtube-transcript-plus";
 
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -3959,7 +3967,12 @@ const INKGEST_SCRAPE_BASE =
 
 const OPENROUTER_TIMEOUT_MS = 90_000; // 90s for LLM responses
 
-async function openRouterChatMessages(apiKey, messages, maxTokens = 1200, options = {}) {
+async function openRouterChatMessages(
+	apiKey,
+	messages,
+	maxTokens = 1200,
+	options = {},
+) {
 	const body = {
 		model:
 			process.env.OPENROUTER_AGENT_MODEL ||
@@ -4024,6 +4037,13 @@ app.post("/inkgest-agent", async (c) => {
 			: extractUrlsFromText(userPrompt);
 
 		const urlsToScrape = extractedUrls.slice(0, 10);
+		const redditUrls = urlsToScrape.filter(isRedditUrl);
+		const youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
+		const regularUrls = urlsToScrape.filter(
+			(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
+		);
+		const apiBase =
+			process.env.API_BASE_URL || new URL(c.req.url).origin;
 		let scrapedSources = [];
 		let scrapeErrors = [];
 		let parsed = {};
@@ -4048,7 +4068,7 @@ app.post("/inkgest-agent", async (c) => {
 		if (!hasExecuteTasks) {
 			const urlLine = urlsToScrape.length
 				? `URLs found: ${urlsToScrape.join(", ")}`
-				: "URLs found: none. You MUST infer the URL from the user's message (e.g. 'scrape dev.to' → params.urls: [\"https://dev.to\"] or [\"https://dev.to/rss\"], 'dev.to RSS' → [\"https://dev.to/rss\"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.";
+				: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
 			const userContent = `User message: ${userPrompt}\n\n${urlLine}`;
 			const messages = [
 				{ role: "system", content: ROUTER_SYSTEM_PROMPT },
@@ -4059,12 +4079,39 @@ app.post("/inkgest-agent", async (c) => {
 				{ role: "user", content: userContent },
 			];
 
+			async function scrapeAllUrls() {
+				if (urlsToScrape.length === 0)
+					return { sources: [], errors: [] };
+				const [regularScraped, youtubeScraped, redditScraped] =
+					await Promise.all([
+						regularUrls.length > 0
+							? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, regularUrls, {
+									includeImages: true,
+								})
+							: { sources: [], errors: [] },
+						youtubeUrls.length > 0
+							? scrapeYoutubeViaApi(apiBase, youtubeUrls)
+							: { sources: [], errors: [] },
+						redditUrls.length > 0
+							? scrapeRedditViaApi(apiBase, redditUrls)
+							: { sources: [], errors: [] },
+					]);
+				return {
+					sources: [
+						...(regularScraped.sources || []),
+						...(youtubeScraped.sources || []),
+						...(redditScraped.sources || []),
+					],
+					errors: [
+						...(regularScraped.errors || []),
+						...(youtubeScraped.errors || []),
+						...(redditScraped.errors || []),
+					],
+				};
+			}
+
 			const [scraped, routerResult] = await Promise.all([
-				urlsToScrape.length > 0
-					? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urlsToScrape, {
-							includeImages: true,
-						})
-					: Promise.resolve({ sources: [], errors: [] }),
+				urlsToScrape.length > 0 ? scrapeAllUrls() : { sources: [], errors: [] },
 				openRouterChatMessages(openRouterKey, messages),
 			]);
 
@@ -4102,12 +4149,29 @@ app.post("/inkgest-agent", async (c) => {
 			});
 		} else {
 			if (urlsToScrape.length > 0) {
-				const scraped = await scrapeUrlsViaApi(
-					INKGEST_SCRAPE_BASE,
-					urlsToScrape,
-				);
-				scrapedSources = scraped.sources || [];
-				if (scraped.errors?.length) scrapeErrors.push(...scraped.errors);
+				const [regularScraped, youtubeScraped, redditScraped] =
+					await Promise.all([
+						regularUrls.length > 0
+							? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, regularUrls)
+							: { sources: [], errors: [] },
+						youtubeUrls.length > 0
+							? scrapeYoutubeViaApi(apiBase, youtubeUrls)
+							: { sources: [], errors: [] },
+						redditUrls.length > 0
+							? scrapeRedditViaApi(apiBase, redditUrls)
+							: { sources: [], errors: [] },
+					]);
+				scrapedSources = [
+					...(regularScraped.sources || []),
+					...(youtubeScraped.sources || []),
+					...(redditScraped.sources || []),
+				];
+				if (regularScraped.errors?.length)
+					scrapeErrors.push(...regularScraped.errors);
+				if (youtubeScraped.errors?.length)
+					scrapeErrors.push(...youtubeScraped.errors);
+				if (redditScraped.errors?.length)
+					scrapeErrors.push(...redditScraped.errors);
 			}
 		}
 
@@ -4181,10 +4245,32 @@ app.post("/inkgest-agent", async (c) => {
 					const preScraped = urls.map((u) => sourceByUrl[u]).filter(Boolean);
 					let sources = preScraped;
 					if (sources.length < urls.length) {
-						const scraped = await scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, urls, {
-							includeImages: true,
-						});
-						sources = scraped.sources || [];
+						const missingUrls = urls.filter((u) => !sourceByUrl[u]);
+						const missingYoutube = missingUrls.filter(isYoutubeUrl);
+						const missingReddit = missingUrls.filter(isRedditUrl);
+						const missingRegular = missingUrls.filter(
+							(u) => !isYoutubeUrl(u) && !isRedditUrl(u),
+						);
+						const [regularScraped, youtubeScraped, redditScraped] =
+							await Promise.all([
+								missingRegular.length > 0
+									? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, missingRegular, {
+											includeImages: true,
+										})
+									: { sources: [], errors: [] },
+								missingYoutube.length > 0
+									? scrapeYoutubeViaApi(apiBase, missingYoutube)
+									: { sources: [], errors: [] },
+								missingReddit.length > 0
+									? scrapeRedditViaApi(apiBase, missingReddit)
+									: { sources: [], errors: [] },
+							]);
+						sources = [
+							...preScraped,
+							...(regularScraped.sources || []),
+							...(youtubeScraped.sources || []),
+							...(redditScraped.sources || []),
+						];
 					}
 					if (sources.length === 0) {
 						return {
@@ -4232,7 +4318,11 @@ app.post("/inkgest-agent", async (c) => {
 				if (task.type === "crawl-url") {
 					const seedUrl = params.url || urls[0];
 					if (!seedUrl || !/^https?:\/\//i.test(String(seedUrl))) {
-						return { taskLabel: task.label, success: false, error: "No valid URL for crawl-url" };
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: "No valid URL for crawl-url",
+						};
 					}
 					const takeScreenshot = params.takeScreenshot === true;
 					const scrapeContent = params.scrapeContent === true;
@@ -4249,10 +4339,18 @@ app.post("/inkgest-agent", async (c) => {
 						signal: AbortSignal.timeout(timeoutMs),
 					});
 					const data = await res.json().catch(() => ({}));
-					state.creditsDistribution.push({ task: "crawl-url", label: task.label, credits: CREDITS["crawl-url"] });
+					state.creditsDistribution.push({
+						task: "crawl-url",
+						label: task.label,
+						credits: CREDITS["crawl-url"],
+					});
 					state.creditsUsed += CREDITS["crawl-url"];
 					if (!res.ok) {
-						return { taskLabel: task.label, success: false, error: data?.error || `HTTP ${res.status}` };
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: data?.error || `HTTP ${res.status}`,
+						};
 					}
 					const crawlExecuted = {
 						type: "crawl-url",
@@ -4281,7 +4379,9 @@ app.post("/inkgest-agent", async (c) => {
 						const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
 						crawlExecuted.images = crawlSources
 							.flatMap((s) => s.links || [])
-							.filter((l) => imgExts.test(typeof l === "string" ? l : l?.url || ""))
+							.filter((l) =>
+								imgExts.test(typeof l === "string" ? l : l?.url || ""),
+							)
 							.map((l) => (typeof l === "string" ? l : l?.url || ""))
 							.filter(Boolean)
 							.slice(0, 20);
@@ -4309,7 +4409,8 @@ app.post("/inkgest-agent", async (c) => {
 					};
 				}
 
-				const useCrawlResult = params.useCrawlResult === true && state.crawlUrlSources?.length > 0;
+				const useCrawlResult =
+					params.useCrawlResult === true && state.crawlUrlSources?.length > 0;
 				const preSources = useCrawlResult
 					? state.crawlUrlSources
 					: urls.map((u) => sourceByUrl[u]).filter(Boolean);
@@ -4362,14 +4463,20 @@ app.post("/inkgest-agent", async (c) => {
 					};
 					if (task.type === "table") executed.sourceUrls = urls;
 					// Ensure client has content for rendering: infographics and image-gallery need structured data
-					if (task.type === "infographics-svg-generator" && Array.isArray(executed.infographics)) {
+					if (
+						task.type === "infographics-svg-generator" &&
+						Array.isArray(executed.infographics)
+					) {
 						executed.content = JSON.stringify(executed.infographics);
 					}
 					if (task.type === "image-gallery-creator") {
 						executed.content = Array.isArray(executed.images)
 							? JSON.stringify(executed.images)
 							: "[]";
-						executed.result = { images: executed.images || [], content: executed.content };
+						executed.result = {
+							images: executed.images || [],
+							content: executed.content,
+						};
 					}
 					return {
 						taskLabel: task.label,
@@ -4383,7 +4490,12 @@ app.post("/inkgest-agent", async (c) => {
 				// Strip markdown code fences from HTML so client can render (LLMs often wrap in ```html ... ```)
 				if (task.type === "landing-page-generator") {
 					const m = content.match(/^\s*```(?:html)?\s*\n?([\s\S]*?)\n?```\s*$/);
-					content = m ? m[1].trim() : content.replace(/^```(?:html)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+					content = m
+						? m[1].trim()
+						: content
+								.replace(/^```(?:html)?\s*\n?/, "")
+								.replace(/\n?```\s*$/, "")
+								.trim();
 				}
 				const executed = {
 					type: task.type,
@@ -4396,7 +4508,11 @@ app.post("/inkgest-agent", async (c) => {
 				// So client can render: landing page HTML, raw content (flat + nested for task.html / task.result?.html)
 				if (task.type === "landing-page-generator") {
 					executed.html = content;
-					executed.result = { html: content, content, sources: executed.sources };
+					executed.result = {
+						html: content,
+						content,
+						sources: executed.sources,
+					};
 				}
 				return {
 					taskLabel: task.label,
@@ -4459,13 +4575,28 @@ app.post("/inkgest-agent", async (c) => {
 
 					// Phase 1: run crawl-url tasks first so we have crawlUrlSources for useCrawlResult content tasks
 					if (crawlUrlTasks.length > 0) {
-						const results = await Promise.all(crawlUrlTasks.map((t) => runOneTask(t)));
+						const results = await Promise.all(
+							crawlUrlTasks.map((t) => runOneTask(t)),
+						);
 						results.forEach((r, i) => {
-							controller.enqueue(encoder.encode(send({ type: "task", index: validTasks.indexOf(crawlUrlTasks[i]), ...r })));
+							controller.enqueue(
+								encoder.encode(
+									send({
+										type: "task",
+										index: validTasks.indexOf(crawlUrlTasks[i]),
+										...r,
+									}),
+								),
+							);
 							if (r.success && r.executed) {
 								executed.push(r.executed);
-								if (r.executed.homePageData || (r.executed.nestedResults && r.executed.nestedResults.length)) {
-									state.crawlUrlSources.push(...buildSourcesFromCrawlResult(r.executed));
+								if (
+									r.executed.homePageData ||
+									(r.executed.nestedResults && r.executed.nestedResults.length)
+								) {
+									state.crawlUrlSources.push(
+										...buildSourcesFromCrawlResult(r.executed),
+									);
 								}
 							} else errors.push({ task: r.taskLabel, error: r.error });
 						});
@@ -4473,11 +4604,22 @@ app.post("/inkgest-agent", async (c) => {
 
 					// Phase 2: run remaining tasks (blog/article/table will use state.crawlUrlSources when useCrawlResult: true)
 					if (otherTasks.length > 0) {
-						const results = await Promise.all(otherTasks.map((t) => runOneTask(t)));
+						const results = await Promise.all(
+							otherTasks.map((t) => runOneTask(t)),
+						);
 						results.forEach((r, i) => {
-							controller.enqueue(encoder.encode(send({ type: "task", index: validTasks.indexOf(otherTasks[i]), ...r })));
+							controller.enqueue(
+								encoder.encode(
+									send({
+										type: "task",
+										index: validTasks.indexOf(otherTasks[i]),
+										...r,
+									}),
+								),
+							);
 							if (r.success && r.executed) executed.push(r.executed);
-							else if (r.error) errors.push({ task: r.taskLabel, error: r.error });
+							else if (r.error)
+								errors.push({ task: r.taskLabel, error: r.error });
 						});
 					}
 
@@ -4487,7 +4629,8 @@ app.post("/inkgest-agent", async (c) => {
 								type: "end",
 								executed,
 								errors: errors.length > 0 ? errors : undefined,
-								scrapeErrors: scrapeErrors.length > 0 ? scrapeErrors : undefined,
+								scrapeErrors:
+									scrapeErrors.length > 0 ? scrapeErrors : undefined,
 								creditsUsed: state.creditsUsed,
 								creditsDistribution: state.creditsDistribution,
 								tokenUsage: state.tokenUsage,
@@ -4559,13 +4702,15 @@ async function captureOneScreenshotWithPage(page, options) {
 		blockDistractions = true,
 	} = options;
 
-	const viewport = SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop;
+	const viewport =
+		SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop;
 	await page.setViewport(viewport);
 	await page.setUserAgent(userAgents.random().toString());
 	await page.setExtraHTTPHeaders({
 		dnt: "1",
 		"upgrade-insecure-requests": "1",
-		accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+		accept:
+			"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
 		"sec-fetch-site": "none",
 		"sec-fetch-mode": "navigate",
 		"sec-fetch-user": "?1",
@@ -4592,18 +4737,49 @@ async function captureOneScreenshotWithPage(page, options) {
 	let screenshotOptions = { optimizeForSpeed: true, encoding: "binary" };
 	if (fullPage) {
 		screenshotOptions.fullPage = true;
-	} else if (coords && typeof coords.x === "number" && typeof coords.y === "number" && typeof coords.width === "number" && typeof coords.height === "number") {
-		screenshotOptions.clip = { x: coords.x, y: coords.y, width: coords.width, height: coords.height };
+	} else if (
+		coords &&
+		typeof coords.x === "number" &&
+		typeof coords.y === "number" &&
+		typeof coords.width === "number" &&
+		typeof coords.height === "number"
+	) {
+		screenshotOptions.clip = {
+			x: coords.x,
+			y: coords.y,
+			width: coords.width,
+			height: coords.height,
+		};
 	} else {
-		screenshotOptions.clip = { x: 0, y: 0, width: viewport.width, height: viewport.height };
+		screenshotOptions.clip = {
+			x: 0,
+			y: 0,
+			width: viewport.width,
+			height: viewport.height,
+		};
 	}
 	const buffer = await page.screenshot(screenshotOptions);
 
 	const pageHtml = await page.content();
 	const dom = new JSDOM(pageHtml);
 	const doc = dom.window.document;
-	const remove = ["script", "style", "noscript", ".ad", ".ads", "#ad", ".cookie", "#cookie", "[class*='consent']", "[id*='consent']", "[class*='intercom']", "[class*='chat-widget']"];
-	remove.forEach((sel) => doc.querySelectorAll(sel).forEach((el) => el.remove()));
+	const remove = [
+		"script",
+		"style",
+		"noscript",
+		".ad",
+		".ads",
+		"#ad",
+		".cookie",
+		"#cookie",
+		"[class*='consent']",
+		"[id*='consent']",
+		"[class*='intercom']",
+		"[class*='chat-widget']",
+	];
+	remove.forEach((sel) =>
+		doc.querySelectorAll(sel).forEach((el) => el.remove()),
+	);
 	const { markdown } = extractSemanticContentWithFormattedMarkdown(doc.body);
 
 	let metadata = {};
@@ -4619,7 +4795,12 @@ async function captureOneScreenshotWithPage(page, options) {
 		});
 	} catch {}
 
-	return { buffer, metadata, markdown, dimensions: { width: viewport.width, height: viewport.height } };
+	return {
+		buffer,
+		metadata,
+		markdown,
+		dimensions: { width: viewport.width, height: viewport.height },
+	};
 }
 
 // Take Screenshot API Endpoint (uses browser pool)
@@ -4677,7 +4858,10 @@ app.post("/take-screenshot", async (c) => {
 		const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
 		const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
 		await file.save(buffer, {
-			metadata: { contentType: "image/png", cacheControl: "public, max-age=3600" },
+			metadata: {
+				contentType: "image/png",
+				cacheControl: "public, max-age=3600",
+			},
 		});
 		await file.makePublic();
 		const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
@@ -4717,25 +4901,43 @@ app.post("/take-screenshot-multiple", async (c) => {
 		} = await c.req.json();
 
 		if (!Array.isArray(urls) || urls.length === 0) {
-			return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+			return c.json(
+				{ success: false, error: "urls must be a non-empty array" },
+				400,
+			);
 		}
 		const MAX_URLS = 50;
-		const list = urls.slice(0, MAX_URLS).filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
+		const list = urls
+			.slice(0, MAX_URLS)
+			.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
 		if (list.length === 0) {
 			return c.json({ success: false, error: "No valid URLs" }, 400);
 		}
 
-		const opts = { device, waitForSelector, timeout, waitUntil, blockDistractions };
+		const opts = {
+			device,
+			waitForSelector,
+			timeout,
+			waitUntil,
+			blockDistractions,
+		};
 		const results = await Promise.all(
 			list.map((url) =>
 				browserPool
-					.withPage((page) => captureOneScreenshotWithPage(page, { ...opts, url }))
+					.withPage((page) =>
+						captureOneScreenshotWithPage(page, { ...opts, url }),
+					)
 					.then(async ({ buffer, metadata, markdown, dimensions }) => {
 						const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
 						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-						const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
+						const file = bucket.file(
+							`ihr-website-screenshot/${uniqueFileName}`,
+						);
 						await file.save(buffer, {
-							metadata: { contentType: "image/png", cacheControl: "public, max-age=3600" },
+							metadata: {
+								contentType: "image/png",
+								cacheControl: "public, max-age=3600",
+							},
 						});
 						await file.makePublic();
 						const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
@@ -4755,7 +4957,9 @@ app.post("/take-screenshot-multiple", async (c) => {
 						markdown: null,
 						success: false,
 						error: err?.message || "Screenshot failed",
-						dimensions: SCREENSHOT_VIEWPORT_MAP[opts.device] || SCREENSHOT_VIEWPORT_MAP.desktop,
+						dimensions:
+							SCREENSHOT_VIEWPORT_MAP[opts.device] ||
+							SCREENSHOT_VIEWPORT_MAP.desktop,
 					})),
 			),
 		);
@@ -5174,7 +5378,8 @@ async function fetchSitemapUrls(origin, domain, maxUrls = 500) {
 			for (const loc of locs.slice(0, 3)) {
 				try {
 					const u = new URL(loc);
-					if (u.hostname === domain || u.origin === origin) await parseSitemapXml(loc);
+					if (u.hostname === domain || u.origin === origin)
+						await parseSitemapXml(loc);
 				} catch {}
 			}
 			return;
@@ -5248,7 +5453,8 @@ app.post("/crawl-url", async (c) => {
 			tablet: { width: 1024, height: 768 },
 			mobile: { width: 375, height: 667 },
 		};
-		const dimensions = SCREENSHOT_DIMENSIONS[screenshotDevice] || SCREENSHOT_DIMENSIONS.desktop;
+		const dimensions =
+			SCREENSHOT_DIMENSIONS[screenshotDevice] || SCREENSHOT_DIMENSIONS.desktop;
 
 		if (!url) {
 			return c.json({ success: false, error: "URL is required" }, 400);
@@ -5450,14 +5656,19 @@ app.post("/crawl-url", async (c) => {
 });
 
 const parseRedditData = (data, url) => {
-	if (!data || !data.data || !data.data.children) {
+	// Reddit comments page returns array [postListing, commentsListing]; subreddit returns single object
+	let listing = data;
+	if (Array.isArray(data) && data.length > 0) {
+		listing = data[0];
+	}
+	if (!listing || !listing.data || !listing.data.children) {
 		return { markdown: "No Reddit data found", posts: [] };
 	}
 
 	const posts = [];
 	let markdown = `# Reddit Posts from ${url}\n\n`;
 
-	data.data.children.forEach((child, index) => {
+	listing.data.children.forEach((child, index) => {
 		if (child.kind === "t3" && child.data) {
 			const post = child.data;
 
@@ -5561,11 +5772,67 @@ const parseRedditData = (data, url) => {
 	return { markdown, posts };
 };
 
-app.post("/scrap-reddit", async (c) => {
+/** Extract comments from Reddit JSON. Comments page returns [postListing, commentsListing]. */
+function parseRedditComments(data) {
+	const comments = [];
+	if (!data) return comments;
+
+	// Comments page: data is array, comments are in data[1]
+	let commentsListing = null;
+	if (Array.isArray(data) && data.length > 1) {
+		commentsListing = data[1];
+	} else if (data?.data?.children) {
+		// Subreddit listing has no separate comments
+		return comments;
+	}
+
+	if (!commentsListing?.data?.children) return comments;
+
+	function extractFromChild(child, depth = 0) {
+		if (!child?.data) return;
+		if (child.kind === "t1") {
+			return {
+				id: child.data.id,
+				author: child.data.author || "[deleted]",
+				body: child.data.body || "",
+				score: child.data.score ?? 0,
+				created: child.data.created_utc
+					? new Date(child.data.created_utc * 1000).toISOString()
+					: "",
+				depth,
+				permalink: child.data.permalink
+					? `https://reddit.com${child.data.permalink}`
+					: "",
+			};
+		}
+		return null;
+	}
+
+	function walkReplies(children, depth = 0) {
+		if (!Array.isArray(children)) return;
+		for (const child of children) {
+			if (child.kind === "t1" && child.data) {
+				const c = extractFromChild(child, depth);
+				if (c) comments.push(c);
+				const replies = child.data.replies;
+				if (replies?.data?.children) {
+					walkReplies(replies.data.children, depth + 1);
+				}
+			} else if (child.kind === "more") {
+				// "load more" placeholder - skip
+			}
+		}
+	}
+
+	walkReplies(commentsListing.data.children, 0);
+	return comments;
+}
+
+app.post("/scrape-reddit", async (c) => {
 	try {
 		const { url } = await c.req.json();
 
-		const proxy = proxyManager.getNextProxy();
+		console.log(url);
 		if (!url) {
 			return c.json({ success: false, error: "Reddit URL is required" }, 400);
 		}
@@ -5581,55 +5848,14 @@ app.post("/scrap-reddit", async (c) => {
 			jsonUrl = url.endsWith("/") ? url.slice(0, -1) + ".json" : url + "/.json";
 		}
 
-		// Parse Reddit JSON and create LLM-friendly markdown
-		const parsedData = await parseRedditData(jsonUrl, url);
-
 		try {
-			// Fetch Reddit JSON data with enhanced bot detection bypass and proxy support
+			// Fetch Reddit JSON — minimal headers (no User-Agent) to avoid bot blocking
 			const response = await axios.get(jsonUrl, {
 				headers: {
-					"User-Agent":
-						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-					Accept: "application/json, text/plain, */*",
-					"Accept-Language": "en-US,en;q=0.9",
-					"Accept-Encoding": "gzip, deflate, br",
-					"Cache-Control": "no-cache",
-					Pragma: "no-cache",
-					"Sec-Ch-Ua":
-						'"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-					"Sec-Ch-Ua-Mobile": "?0",
-					"Sec-Ch-Ua-Platform": '"Windows"',
-					"Sec-Fetch-Dest": "empty",
-					"Sec-Fetch-Mode": "cors",
-					"Sec-Fetch-Site": "same-origin",
-					DNT: "1",
-					Connection: "keep-alive",
-					Referer: "https://www.reddit.com/",
-					Origin: "https://www.reddit.com",
-					"X-Requested-With": "XMLHttpRequest",
-					"X-Forwarded-For": "192.168.1.1",
-					"X-Real-IP": "192.168.1.1",
-					"CF-Connecting-IP": "192.168.1.1",
-					"X-Forwarded-Proto": "https",
-					"X-Forwarded-Host": "www.reddit.com",
+					Accept: "application/json",
 				},
 				timeout: 30000,
 				maxRedirects: 5,
-
-				proxy: {
-					protocol: "http",
-					host: proxy.host,
-					port: proxy.port,
-					auth: {
-						username: proxy.username,
-						password: proxy.password,
-					},
-				},
-				// Proxy configuration
-				// Alternative proxy configuration for different proxy types
-				// proxy: false, // Disable proxy
-				// proxy: 'http://proxy-server.com:8080', // Simple proxy
-				// proxy: 'socks5://proxy-server.com:1080', // SOCKS5 proxy
 			});
 
 			const redditData = response.data;
@@ -5805,17 +6031,23 @@ app.post("/scrap-reddit", async (c) => {
 			removeEmptyKeys(metadata);
 
 			redditMetadata = metadata.allMetaTags;
-			const { markdown, posts } = parsedData(redditData);
-
-			const allLinks = posts.map((post) => post.url);
-			const allImages = posts.map((post) => post.image);
+			const { markdown, posts } = parseRedditData(redditData, url);
+			const comments = parseRedditComments(redditData);
+			const commentsMarkdown =
+				comments.length > 0
+					? `\n\n## Comments\n\n${comments.map((c) => `**u/${c.author}** (${c.score} pts):\n${c.body}\n`).join("\n")}`
+					: "";
+			const allLinks = posts.map((post) => post.url).filter(Boolean);
+			const allImages = posts.map((post) => post.image).filter(Boolean);
 
 			return c.json({
 				success: true,
-				markdown: markdown,
+				markdown: markdown + commentsMarkdown,
+				rawJson: redditData,
 				data: {
 					url: url,
 					posts: posts,
+					comments: comments,
 					title: metadata.title,
 					links: allLinks,
 					images: allImages,
@@ -5831,38 +6063,29 @@ app.post("/scrap-reddit", async (c) => {
 				try {
 					console.log("🔄 JSON API blocked, trying alternative approach...");
 
-					// Try with different user agent and simpler headers + proxy
+					// Fallback: retry with minimal headers (no User-Agent)
 					const fallbackResponse = await axios.get(jsonUrl, {
-						headers: {
-							"User-Agent":
-								"Mozilla/5.0 (compatible; RedditBot/1.0; +https://www.reddit.com/robots.txt)",
-							Accept: "application/json",
-							"X-Forwarded-For": "192.168.1.1",
-							"X-Real-IP": "192.168.1.1",
-						},
+						headers: { Accept: "application/json" },
 						timeout: 30000,
-						// Proxy configuration for fallback
-						proxy: {
-							protocol: "https",
-							host: "proxy-server.com",
-							port: 8080,
-							auth: {
-								username: "proxy-user",
-								password: "proxy-pass",
-							},
-						},
 					});
 
 					const redditData = fallbackResponse.data;
-					const { markdown, posts } = parseRedditData(redditData);
+					const { markdown, posts } = parseRedditData(redditData, url);
+					const comments = parseRedditComments(redditData);
+					const commentsMarkdown =
+						comments.length > 0
+							? `\n\n## Comments\n\n${comments.map((c) => `**u/${c.author}** (${c.score} pts):\n${c.body}\n`).join("\n")}`
+							: "";
 
 					return c.json({
 						success: true,
-						url: url,
-						markdown: markdown,
+						markdown: markdown + commentsMarkdown,
+						rawJson: redditData,
 						data: {
-							metadata: null,
+							url: url,
 							posts: posts,
+							comments: comments,
+							metadata: null,
 						},
 						timestamp: new Date().toISOString(),
 					});
@@ -5906,7 +6129,44 @@ app.post("/scrap-reddit", async (c) => {
 	}
 });
 
-app.post("/scrap-git", async (c) => {
+app.post("/scrape-youtube", async (c) => {
+	const { id } = await c.req.json();
+	if (!id) {
+		return c.json({ success: false, error: "Video id or URL is required" }, 400);
+	}
+	try {
+		let transcript = [];
+		try {
+			transcript = await fetchTranscript(id, { lang: "en" });
+		} catch (langError) {
+			// Fallback: try without lang to get first available transcript (e.g. if "en" not available)
+			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
+				transcript = await fetchTranscript(id);
+			} else {
+				throw langError;
+			}
+		}
+		return c.json({
+			success: true,
+			data: {
+				transcript,
+			},
+		});
+	} catch (error) {
+		console.error("❌ Youtube scraper error:", error);
+		const details = error?.message || String(error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to fetch YouTube transcript",
+				details,
+			},
+			500,
+		);
+	}
+});
+
+app.post("/scrape-git", async (c) => {
 	const { url } = await c.req.json();
 	const newUrl = new URL(url);
 	if (!newUrl || newUrl.hostname !== "github.com") {
@@ -6831,7 +7091,7 @@ app.post("/fetch-metadata", async (c) => {
 					success: false,
 					error: "URL is required",
 				},
-				400
+				400,
 			);
 		}
 
@@ -6844,7 +7104,7 @@ app.post("/fetch-metadata", async (c) => {
 					success: false,
 					error: "Invalid URL format",
 				},
-				400
+				400,
 			);
 		}
 
@@ -7035,7 +7295,7 @@ app.post("/fetch-metadata", async (c) => {
 							status: 404,
 							timestamp: new Date().toISOString(),
 						},
-						200
+						200,
 					);
 				}
 
@@ -7049,7 +7309,7 @@ app.post("/fetch-metadata", async (c) => {
 							status: status,
 							timestamp: new Date().toISOString(),
 						},
-						200
+						200,
 					);
 				}
 
@@ -7063,7 +7323,7 @@ app.post("/fetch-metadata", async (c) => {
 							status: status,
 							timestamp: new Date().toISOString(),
 						},
-						200
+						200,
 					);
 				}
 			}
@@ -7082,7 +7342,7 @@ app.post("/fetch-metadata", async (c) => {
 						error: fetchError.code,
 						timestamp: new Date().toISOString(),
 					},
-					200
+					200,
 				);
 			}
 
@@ -7095,7 +7355,7 @@ app.post("/fetch-metadata", async (c) => {
 						message: "Request timeout - the server took too long to respond",
 						timestamp: new Date().toISOString(),
 					},
-					200
+					200,
 				);
 			}
 
@@ -7108,7 +7368,7 @@ app.post("/fetch-metadata", async (c) => {
 					error: fetchError.message,
 					timestamp: new Date().toISOString(),
 				},
-				200
+				200,
 			);
 		}
 	} catch (error) {
@@ -7119,7 +7379,7 @@ app.post("/fetch-metadata", async (c) => {
 				error: "Internal server error",
 				details: error.message,
 			},
-			500
+			500,
 		);
 	}
 });
