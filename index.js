@@ -4011,6 +4011,18 @@ const openRouterKey = process.env.OPENROUTER_API_KEY;
 
 app.post("/inkgest-agent", async (c) => {
 	try {
+		if (!openRouterKey || !String(openRouterKey).trim()) {
+			return c.json(
+				{
+					error: "OpenRouter API key not configured",
+					code: "MISSING_API_KEY",
+					details:
+						"Set OPENROUTER_API_KEY in your environment (e.g. Vercel, Railway) for the inkgest-agent to work.",
+				},
+				503,
+			);
+		}
+
 		const {
 			prompt = "",
 			chatHistory = [],
@@ -4656,20 +4668,30 @@ app.post("/inkgest-agent", async (c) => {
 		const cause = error?.cause;
 		const isAbort =
 			error?.name === "AbortError" || cause?.name === "AbortError";
+		const isAuthError =
+			/missing authentication|missing auth|invalid api key|unauthorized/i.test(
+				message,
+			);
 		const code = isAbort
 			? "TIMEOUT"
-			: cause?.code === "UND_ERR_HEADERS_TIMEOUT"
-				? "SCRAPE_HEADERS_TIMEOUT"
-				: cause?.code === "UND_ERR_BODY_TIMEOUT"
-					? "SCRAPE_BODY_TIMEOUT"
-					: message.includes("fetch failed") || cause
-						? "NETWORK_ERROR"
-						: "AGENT_ERROR";
+			: isAuthError
+				? "MISSING_API_KEY"
+				: cause?.code === "UND_ERR_HEADERS_TIMEOUT"
+					? "SCRAPE_HEADERS_TIMEOUT"
+					: cause?.code === "UND_ERR_BODY_TIMEOUT"
+						? "SCRAPE_BODY_TIMEOUT"
+						: message.includes("fetch failed") || cause
+							? "NETWORK_ERROR"
+							: "AGENT_ERROR";
+		const userMessage =
+			isAuthError
+				? "OpenRouter API key is missing or invalid. Set OPENROUTER_API_KEY in your production environment."
+				: isAbort
+					? "Request timed out. The LLM or scrape service took too long to respond."
+					: message;
 		return c.json(
 			{
-				error: isAbort
-					? "Request timed out. The LLM or scrape service took too long to respond."
-					: message,
+				error: userMessage,
 				code,
 				details: cause?.message || (cause ? String(cause) : undefined),
 			},
@@ -4677,7 +4699,7 @@ app.post("/inkgest-agent", async (c) => {
 		);
 	}
 });
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 const SCREENSHOT_VIEWPORT_MAP = {
 	desktop: { width: 1920, height: 1080, scale: 1 },
