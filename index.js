@@ -3959,7 +3959,17 @@ const INKGEST_SCRAPE_BASE =
 
 const OPENROUTER_TIMEOUT_MS = 90_000; // 90s for LLM responses
 
-async function openRouterChatMessages(apiKey, messages, maxTokens = 1200) {
+async function openRouterChatMessages(apiKey, messages, maxTokens = 1200, options = {}) {
+	const body = {
+		model:
+			process.env.OPENROUTER_AGENT_MODEL ||
+			process.env.OPENROUTER_MODEL ||
+			"openai/gpt-4o-mini",
+		messages,
+		temperature: options.temperature ?? 0.3,
+		max_tokens: maxTokens,
+	};
+	if (options.response_format) body.response_format = options.response_format;
 	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
 		method: "POST",
 		signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
@@ -3967,15 +3977,7 @@ async function openRouterChatMessages(apiKey, messages, maxTokens = 1200) {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
 		},
-		body: JSON.stringify({
-			model:
-				process.env.OPENROUTER_AGENT_MODEL ||
-				process.env.OPENROUTER_MODEL ||
-				"openai/gpt-4o-mini",
-			messages,
-			temperature: 0.3,
-			max_tokens: maxTokens,
-		}),
+		body: JSON.stringify(body),
 	});
 	const data = await res.json().catch(() => ({}));
 	if (!res.ok) {
@@ -4222,6 +4224,7 @@ app.post("/inkgest-agent", async (c) => {
 							title: sources[0]?.title || urls[0],
 							images,
 							urls: sources.map((s) => s.url),
+							result: { content, images, urls: sources.map((s) => s.url) },
 						},
 					};
 				}
@@ -4251,18 +4254,49 @@ app.post("/inkgest-agent", async (c) => {
 					if (!res.ok) {
 						return { taskLabel: task.label, success: false, error: data?.error || `HTTP ${res.status}` };
 					}
+					const crawlExecuted = {
+						type: "crawl-url",
+						label: task.label,
+						url: seedUrl,
+						allUrls: data.allUrls || [],
+						homePageData: data.homePageData,
+						nestedResults: data.nestedResults,
+						screenshots: data.screenshots || [],
+					};
+					// Build sources for client rendering (same shape as scrape / useCrawlResult)
+					const crawlSources = buildSourcesFromCrawlResult(crawlExecuted);
+					if (crawlSources.length > 0) {
+						crawlExecuted.sources = crawlSources.map((s) => ({
+							url: s.url,
+							title: s.title,
+							markdown: s.markdown,
+							links: s.links,
+						}));
+						crawlExecuted.content = crawlSources
+							.map(
+								(s, i) =>
+									`--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`,
+							)
+							.join("\n\n");
+						const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
+						crawlExecuted.images = crawlSources
+							.flatMap((s) => s.links || [])
+							.filter((l) => imgExts.test(typeof l === "string" ? l : l?.url || ""))
+							.map((l) => (typeof l === "string" ? l : l?.url || ""))
+							.filter(Boolean)
+							.slice(0, 20);
+						crawlExecuted.result = {
+							content: crawlExecuted.content,
+							images: crawlExecuted.images,
+							sources: crawlExecuted.sources,
+						};
+					} else {
+						crawlExecuted.result = { content: "", images: [], sources: [] };
+					}
 					return {
 						taskLabel: task.label,
 						success: true,
-						executed: {
-							type: "crawl-url",
-							label: task.label,
-							url: seedUrl,
-							allUrls: data.allUrls || [],
-							homePageData: data.homePageData,
-							nestedResults: data.nestedResults,
-							screenshots: data.screenshots,
-						},
+						executed: crawlExecuted,
 					};
 				}
 
@@ -4299,6 +4333,9 @@ app.post("/inkgest-agent", async (c) => {
 							{ role: "user", content: user },
 						],
 						skill.maxTokens,
+						task.type === "infographics-svg-generator"
+							? { response_format: { type: "json_object" } }
+							: {},
 					);
 				addTokenUsage(skillUsage);
 				state.tokenUsage.prompt_tokens += skillUsage?.prompt_tokens || 0;
@@ -4314,33 +4351,57 @@ app.post("/inkgest-agent", async (c) => {
 				});
 				state.creditsUsed += taskCredits;
 
-				if (task.type === "table" && skill.parseResponse) {
-					const tableData = skill.parseResponse(rawContent);
+				// Any skill with parseResponse: merge parsed data into executed so client always gets structured payload (infographics, images, table, etc.)
+				if (skill.parseResponse) {
+					const parsedData = skill.parseResponse(rawContent);
+					const executed = {
+						type: task.type,
+						label: task.label,
+						...parsedData,
+						result: parsedData,
+					};
+					if (task.type === "table") executed.sourceUrls = urls;
+					// Ensure client has content for rendering: infographics and image-gallery need structured data
+					if (task.type === "infographics-svg-generator" && Array.isArray(executed.infographics)) {
+						executed.content = JSON.stringify(executed.infographics);
+					}
+					if (task.type === "image-gallery-creator") {
+						executed.content = Array.isArray(executed.images)
+							? JSON.stringify(executed.images)
+							: "[]";
+						executed.result = { images: executed.images || [], content: executed.content };
+					}
 					return {
 						taskLabel: task.label,
 						success: true,
-						executed: {
-							type: "table",
-							label: task.label,
-							title: tableData.title,
-							description: tableData.description,
-							columns: tableData.columns,
-							rows: tableData.rows,
-							sourceUrls: urls,
-						},
+						executed,
 					};
+				}
+
+				// Default: content-based skills (newsletter, blog, article, landing-page-generator, etc.)
+				let content = rawContent.trim();
+				// Strip markdown code fences from HTML so client can render (LLMs often wrap in ```html ... ```)
+				if (task.type === "landing-page-generator") {
+					const m = content.match(/^\s*```(?:html)?\s*\n?([\s\S]*?)\n?```\s*$/);
+					content = m ? m[1].trim() : content.replace(/^```(?:html)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+				}
+				const executed = {
+					type: task.type,
+					label: task.label,
+					content,
+					format: task.type === "newsletter" ? format : undefined,
+					sources: preSources.map((s) => ({ url: s.url, title: s.title })),
+					params: { urls, prompt: params.prompt, format, style },
+				};
+				// So client can render: landing page HTML, raw content (flat + nested for task.html / task.result?.html)
+				if (task.type === "landing-page-generator") {
+					executed.html = content;
+					executed.result = { html: content, content, sources: executed.sources };
 				}
 				return {
 					taskLabel: task.label,
 					success: true,
-					executed: {
-						type: task.type,
-						label: task.label,
-						content: rawContent.trim(),
-						format: task.type === "newsletter" ? format : undefined,
-						sources: preSources.map((s) => ({ url: s.url, title: s.title })),
-						params: { urls, prompt: params.prompt, format, style },
-					},
+					executed,
 				};
 			} catch (e) {
 				return {
