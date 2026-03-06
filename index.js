@@ -4062,6 +4062,12 @@ app.post("/inkgest-agent", async (c) => {
 		);
 		const apiBase =
 			process.env.API_BASE_URL || new URL(c.req.url).origin;
+		// In production, INKGEST_SCRAPE_BASE defaults to localhost:3002 which is unreachable.
+		// Use apiBase when env vars are unset so /scrape and /scrape-multiple (same app) work.
+		const scrapeBase =
+			process.env.INKGEST_SCRAPE_BASE_URL || process.env.SCRAPE_API_BASE_URL
+				? INKGEST_SCRAPE_BASE
+				: apiBase;
 		let scrapedSources = [];
 		let scrapeErrors = [];
 		let parsed = {};
@@ -4103,7 +4109,7 @@ app.post("/inkgest-agent", async (c) => {
 				const [regularScraped, youtubeScraped, redditScraped] =
 					await Promise.all([
 						regularUrls.length > 0
-							? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, regularUrls, {
+							? scrapeUrlsViaApi(scrapeBase, regularUrls, {
 									includeImages: true,
 									aiSummary: true,
 								})
@@ -4115,16 +4121,36 @@ app.post("/inkgest-agent", async (c) => {
 							? scrapeRedditViaApi(apiBase, redditUrls)
 							: { sources: [], errors: [] },
 					]);
+				// Fallback: when Reddit API blocks (common in prod), try Puppeteer scrape
+				let redditFinal = redditScraped;
+				if (
+					redditUrls.length > 0 &&
+					redditScraped.sources?.length === 0 &&
+					redditScraped.errors?.length > 0
+				) {
+					redditFinal = await scrapeUrlsViaApi(
+						scrapeBase,
+						redditUrls,
+						{ includeImages: true, aiSummary: true },
+					);
+					if (redditFinal.sources?.length > 0) {
+						console.log(
+							"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
+							redditUrls.length,
+							"URL(s)",
+						);
+					}
+				}
 				return {
 					sources: [
 						...(regularScraped.sources || []),
 						...(youtubeScraped.sources || []),
-						...(redditScraped.sources || []),
+						...(redditFinal.sources || []),
 					],
 					errors: [
 						...(regularScraped.errors || []),
 						...(youtubeScraped.errors || []),
-						...(redditScraped.errors || []),
+						...(redditFinal.sources?.length > 0 ? [] : redditScraped.errors || []),
 					],
 				};
 			}
@@ -4177,7 +4203,7 @@ app.post("/inkgest-agent", async (c) => {
 				const [regularScraped, youtubeScraped, redditScraped] =
 					await Promise.all([
 						regularUrls.length > 0
-							? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, regularUrls, {
+							? scrapeUrlsViaApi(scrapeBase, regularUrls, {
 									aiSummary: true,
 								})
 							: { sources: [], errors: [] },
@@ -4188,10 +4214,29 @@ app.post("/inkgest-agent", async (c) => {
 							? scrapeRedditViaApi(apiBase, redditUrls)
 							: { sources: [], errors: [] },
 					]);
+				let redditFinal = redditScraped;
+				if (
+					redditUrls.length > 0 &&
+					redditScraped.sources?.length === 0 &&
+					redditScraped.errors?.length > 0
+				) {
+					redditFinal = await scrapeUrlsViaApi(
+						scrapeBase,
+						redditUrls,
+						{ includeImages: true, aiSummary: true },
+					);
+					if (redditFinal.sources?.length > 0) {
+						console.log(
+							"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
+							redditUrls.length,
+							"URL(s)",
+						);
+					}
+				}
 				scrapedSources = [
 					...(regularScraped.sources || []),
 					...(youtubeScraped.sources || []),
-					...(redditScraped.sources || []),
+					...(redditFinal.sources || []),
 				];
 				if (regularScraped.errors?.length) {
 					scrapeErrors.push(...regularScraped.errors);
@@ -4207,7 +4252,7 @@ app.post("/inkgest-agent", async (c) => {
 						youtubeScraped.errors,
 					);
 				}
-				if (redditScraped.errors?.length) {
+				if (redditFinal.sources?.length === 0 && redditScraped.errors?.length) {
 					scrapeErrors.push(...redditScraped.errors);
 					console.error(
 						"[inkgest-agent] Reddit scrape errors:",
@@ -4268,7 +4313,7 @@ app.post("/inkgest-agent", async (c) => {
 			);
 			const [reg, yt, rd] = await Promise.all([
 				lateRegular.length > 0
-					? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, lateRegular, {
+					? scrapeUrlsViaApi(scrapeBase, lateRegular, {
 							includeImages: true,
 							aiSummary: true,
 						})
@@ -4280,14 +4325,32 @@ app.post("/inkgest-agent", async (c) => {
 					? scrapeRedditViaApi(apiBase, lateReddit)
 					: { sources: [], errors: [] },
 			]);
+			let lateRedditFinal = rd;
+			if (
+				lateReddit.length > 0 &&
+				rd.sources?.length === 0 &&
+				rd.errors?.length > 0
+			) {
+				lateRedditFinal = await scrapeUrlsViaApi(
+					scrapeBase,
+					lateReddit,
+					{ includeImages: true, aiSummary: true },
+				);
+				if (lateRedditFinal.sources?.length > 0) {
+					console.log(
+						"[inkgest-agent] Reddit fallback (Puppeteer) succeeded (late scrape)",
+					);
+				}
+			}
 			scrapedSources = [
 				...(reg.sources || []),
 				...(yt.sources || []),
-				...(rd.sources || []),
+				...(lateRedditFinal.sources || []),
 			];
 			if (reg.errors?.length) scrapeErrors.push(...reg.errors);
 			if (yt.errors?.length) scrapeErrors.push(...yt.errors);
-			if (rd.errors?.length) scrapeErrors.push(...rd.errors);
+			if (lateRedditFinal.sources?.length === 0 && rd.errors?.length)
+				scrapeErrors.push(...rd.errors);
 		}
 
 		// Fallback: when only scrape is suggested but user wants a deliverable (summarise, blog, etc.), add article task
@@ -4436,7 +4499,7 @@ app.post("/inkgest-agent", async (c) => {
 						const [regularScraped, youtubeScraped, redditScraped] =
 							await Promise.all([
 								missingRegular.length > 0
-									? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, missingRegular, {
+									? scrapeUrlsViaApi(scrapeBase, missingRegular, {
 											includeImages: true,
 											aiSummary: true,
 										})
@@ -4448,11 +4511,23 @@ app.post("/inkgest-agent", async (c) => {
 									? scrapeRedditViaApi(apiBase, missingReddit)
 									: { sources: [], errors: [] },
 							]);
+						let redditTask = redditScraped;
+						if (
+							missingReddit.length > 0 &&
+							redditScraped.sources?.length === 0 &&
+							redditScraped.errors?.length > 0
+						) {
+							redditTask = await scrapeUrlsViaApi(
+								scrapeBase,
+								missingReddit,
+								{ includeImages: true, aiSummary: true },
+							);
+						}
 						sources = [
 							...preScraped,
 							...(regularScraped.sources || []),
 							...(youtubeScraped.sources || []),
-							...(redditScraped.sources || []),
+							...(redditTask.sources || []),
 						];
 					}
 					if (sources.length === 0) {
@@ -4514,7 +4589,7 @@ app.post("/inkgest-agent", async (c) => {
 					const takeScreenshot = params.takeScreenshot === true;
 					const scrapeContent = params.scrapeContent === true;
 					const timeoutMs = scrapeContent ? 10 * 60 * 1000 : 5 * 60 * 1000;
-					const res = await fetch(`${INKGEST_SCRAPE_BASE}/crawl-url`, {
+					const res = await fetch(`${scrapeBase}/crawl-url`, {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
 						body: JSON.stringify({
