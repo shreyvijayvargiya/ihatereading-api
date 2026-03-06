@@ -4223,15 +4223,72 @@ app.post("/inkgest-agent", async (c) => {
 				? suggestedTasks
 				: [];
 
-		// Ensure every task has params.urls — scrape/content tasks need URLs; inherit from urlsToScrape when missing
+		// Ensure every task has params.urls — scrape/content tasks need URLs.
+		// Router may put URL in params.url (singular) or params.urls; inherit from other tasks when missing.
+		const urlsFromAllTasks = [
+			...new Set(
+				tasksToRun.flatMap((t) => {
+					const single = t.params?.url;
+					const multi = Array.isArray(t.params?.urls) ? t.params.urls : [];
+					return [
+						...(single && /^https?:\/\/\S+$/i.test(String(single))
+							? [single]
+							: []),
+						...multi.filter((u) => /^https?:\/\/\S+$/i.test(String(u))),
+					];
+				}),
+			),
+		];
+		const fallbackUrls =
+			urlsToScrape.length > 0 ? urlsToScrape : urlsFromAllTasks;
 		tasksToRun = tasksToRun.map((t) => {
-			const hasUrls =
-				Array.isArray(t.params?.urls) && t.params.urls.length > 0;
-			const taskUrls = hasUrls
-				? t.params.urls.filter((u) => /^https?:\/\/\S+$/i.test(String(u)))
-				: urlsToScrape;
+			const single = t.params?.url;
+			const multi = Array.isArray(t.params?.urls) ? t.params.urls : [];
+			const fromTask = [
+				...(single && /^https?:\/\/\S+$/i.test(String(single))
+					? [single]
+					: []),
+				...multi.filter((u) => /^https?:\/\/\S+$/i.test(String(u))),
+			];
+			const hasUrls = fromTask.length > 0;
+			const taskUrls = hasUrls ? fromTask : fallbackUrls;
 			return { ...t, params: { ...t.params, urls: taskUrls } };
 		});
+
+		// When router inferred URLs (in tasks) but we didn't scrape (urlsToScrape was empty), scrape now
+		if (
+			scrapedSources.length === 0 &&
+			fallbackUrls.length > 0 &&
+			urlsToScrape.length === 0
+		) {
+			const lateReddit = fallbackUrls.filter(isRedditUrl);
+			const lateYoutube = fallbackUrls.filter(isYoutubeUrl);
+			const lateRegular = fallbackUrls.filter(
+				(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
+			);
+			const [reg, yt, rd] = await Promise.all([
+				lateRegular.length > 0
+					? scrapeUrlsViaApi(INKGEST_SCRAPE_BASE, lateRegular, {
+							includeImages: true,
+							aiSummary: true,
+						})
+					: { sources: [], errors: [] },
+				lateYoutube.length > 0
+					? scrapeYoutubeViaApi(apiBase, lateYoutube)
+					: { sources: [], errors: [] },
+				lateReddit.length > 0
+					? scrapeRedditViaApi(apiBase, lateReddit)
+					: { sources: [], errors: [] },
+			]);
+			scrapedSources = [
+				...(reg.sources || []),
+				...(yt.sources || []),
+				...(rd.sources || []),
+			];
+			if (reg.errors?.length) scrapeErrors.push(...reg.errors);
+			if (yt.errors?.length) scrapeErrors.push(...yt.errors);
+			if (rd.errors?.length) scrapeErrors.push(...rd.errors);
+		}
 
 		// Fallback: when only scrape is suggested but user wants a deliverable (summarise, blog, etc.), add article task
 		const wantsDeliverable = /summarise|summarize|blog|article|create a|write a|from this (link|tweet|post|url)/i.test(
