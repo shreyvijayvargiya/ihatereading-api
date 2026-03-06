@@ -1178,7 +1178,7 @@ app.use(
 			"http://localhost:3000",
 			"http://localhost:3001",
 			"https://ihatereading.in",
-			"https://www.inkgest.com/",
+			"https://www.inkgest.com",
 		], // Allow specific origins
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 		allowHeaders: ["Content-Type", "Authorization"],
