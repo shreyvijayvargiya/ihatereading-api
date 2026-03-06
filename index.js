@@ -4222,6 +4222,16 @@ app.post("/inkgest-agent", async (c) => {
 				? suggestedTasks
 				: [];
 
+		// Ensure every task has params.urls — scrape/content tasks need URLs; inherit from urlsToScrape when missing
+		tasksToRun = tasksToRun.map((t) => {
+			const hasUrls =
+				Array.isArray(t.params?.urls) && t.params.urls.length > 0;
+			const taskUrls = hasUrls
+				? t.params.urls.filter((u) => /^https?:\/\/\S+$/i.test(String(u)))
+				: urlsToScrape;
+			return { ...t, params: { ...t.params, urls: taskUrls } };
+		});
+
 		// Fallback: when only scrape is suggested but user wants a deliverable (summarise, blog, etc.), add article task
 		const wantsDeliverable = /summarise|summarize|blog|article|create a|write a|from this (link|tweet|post|url)/i.test(
 			userPrompt,
