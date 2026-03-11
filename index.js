@@ -13,6 +13,12 @@ import axios from "axios";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import {
+	parseRepoUrl,
+	analyzeRepo,
+	analyzeSingleFile,
+	fetchRepoTree,
+} from "./lib/repoAst.js";
+import {
 	extractUrlsFromText,
 	scrapeUrlsViaApi,
 	scrapeYoutubeViaApi,
@@ -4041,13 +4047,10 @@ app.post("/inkgest-agent", async (c) => {
 			? [
 					...new Set(
 						executeTasks.flatMap((t) => {
-							const fromParams = (Array.isArray(t.params?.urls)
-								? t.params.urls
-								: []
+							const fromParams = (
+								Array.isArray(t.params?.urls) ? t.params.urls : []
 							).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
-							const fromPrompt = extractUrlsFromText(
-								t.params?.prompt || "",
-							);
+							const fromPrompt = extractUrlsFromText(t.params?.prompt || "");
 							return [...fromParams, ...fromPrompt];
 						}),
 					),
@@ -4060,8 +4063,7 @@ app.post("/inkgest-agent", async (c) => {
 		const regularUrls = urlsToScrape.filter(
 			(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
 		);
-		const apiBase =
-			process.env.API_BASE_URL || new URL(c.req.url).origin;
+		const apiBase = process.env.API_BASE_URL || new URL(c.req.url).origin;
 		// In production, INKGEST_SCRAPE_BASE defaults to localhost:3002 which is unreachable.
 		// Use apiBase when env vars are unset so /scrape and /scrape-multiple (same app) work.
 		const scrapeBase =
@@ -4104,8 +4106,7 @@ app.post("/inkgest-agent", async (c) => {
 			];
 
 			async function scrapeAllUrls() {
-				if (urlsToScrape.length === 0)
-					return { sources: [], errors: [] };
+				if (urlsToScrape.length === 0) return { sources: [], errors: [] };
 				const [regularScraped, youtubeScraped, redditScraped] =
 					await Promise.all([
 						regularUrls.length > 0
@@ -4128,11 +4129,10 @@ app.post("/inkgest-agent", async (c) => {
 					redditScraped.sources?.length === 0 &&
 					redditScraped.errors?.length > 0
 				) {
-					redditFinal = await scrapeUrlsViaApi(
-						scrapeBase,
-						redditUrls,
-						{ includeImages: true, aiSummary: true },
-					);
+					redditFinal = await scrapeUrlsViaApi(scrapeBase, redditUrls, {
+						includeImages: true,
+						aiSummary: true,
+					});
 					if (redditFinal.sources?.length > 0) {
 						console.log(
 							"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
@@ -4150,7 +4150,9 @@ app.post("/inkgest-agent", async (c) => {
 					errors: [
 						...(regularScraped.errors || []),
 						...(youtubeScraped.errors || []),
-						...(redditFinal.sources?.length > 0 ? [] : redditScraped.errors || []),
+						...(redditFinal.sources?.length > 0
+							? []
+							: redditScraped.errors || []),
 					],
 				};
 			}
@@ -4220,11 +4222,10 @@ app.post("/inkgest-agent", async (c) => {
 					redditScraped.sources?.length === 0 &&
 					redditScraped.errors?.length > 0
 				) {
-					redditFinal = await scrapeUrlsViaApi(
-						scrapeBase,
-						redditUrls,
-						{ includeImages: true, aiSummary: true },
-					);
+					redditFinal = await scrapeUrlsViaApi(scrapeBase, redditUrls, {
+						includeImages: true,
+						aiSummary: true,
+					});
 					if (redditFinal.sources?.length > 0) {
 						console.log(
 							"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
@@ -4290,9 +4291,7 @@ app.post("/inkgest-agent", async (c) => {
 			const single = t.params?.url;
 			const multi = Array.isArray(t.params?.urls) ? t.params.urls : [];
 			const fromTask = [
-				...(single && /^https?:\/\/\S+$/i.test(String(single))
-					? [single]
-					: []),
+				...(single && /^https?:\/\/\S+$/i.test(String(single)) ? [single] : []),
 				...multi.filter((u) => /^https?:\/\/\S+$/i.test(String(u))),
 			];
 			const hasUrls = fromTask.length > 0;
@@ -4331,11 +4330,10 @@ app.post("/inkgest-agent", async (c) => {
 				rd.sources?.length === 0 &&
 				rd.errors?.length > 0
 			) {
-				lateRedditFinal = await scrapeUrlsViaApi(
-					scrapeBase,
-					lateReddit,
-					{ includeImages: true, aiSummary: true },
-				);
+				lateRedditFinal = await scrapeUrlsViaApi(scrapeBase, lateReddit, {
+					includeImages: true,
+					aiSummary: true,
+				});
 				if (lateRedditFinal.sources?.length > 0) {
 					console.log(
 						"[inkgest-agent] Reddit fallback (Puppeteer) succeeded (late scrape)",
@@ -4354,9 +4352,10 @@ app.post("/inkgest-agent", async (c) => {
 		}
 
 		// Fallback: when only scrape is suggested but user wants a deliverable (summarise, blog, etc.), add article task
-		const wantsDeliverable = /summarise|summarize|blog|article|create a|write a|from this (link|tweet|post|url)/i.test(
-			userPrompt,
-		);
+		const wantsDeliverable =
+			/summarise|summarize|blog|article|create a|write a|from this (link|tweet|post|url)/i.test(
+				userPrompt,
+			);
 		const onlyScrape =
 			tasksToRun.length === 1 &&
 			tasksToRun[0]?.type === "scrape" &&
@@ -4390,6 +4389,14 @@ app.post("/inkgest-agent", async (c) => {
 				},
 			]),
 		);
+
+		// Flatten all scraped sources into a simple reference list for the final payload
+		const allSourceReferences = scrapedSources
+			.filter((s) => s && s.url)
+			.map((s) => ({
+				url: s.url,
+				title: s.title || "",
+			}));
 
 		const validTasks = tasksToRun.filter(
 			(t) => t && TASK_TYPES.includes(t.type),
@@ -4446,6 +4453,8 @@ app.post("/inkgest-agent", async (c) => {
 			creditsDistribution: [...creditsDistribution],
 			/** After crawl-url tasks run, filled with { url, markdown, title, links }[] for useCrawlResult content tasks */
 			crawlUrlSources: [],
+			/** Top-level list of all scraped source references (URLs + optional titles) */
+			references: allSourceReferences,
 		};
 
 		/** Build sources array from a crawl-url executed result for use in blog/table/article */
@@ -4517,11 +4526,10 @@ app.post("/inkgest-agent", async (c) => {
 							redditScraped.sources?.length === 0 &&
 							redditScraped.errors?.length > 0
 						) {
-							redditTask = await scrapeUrlsViaApi(
-								scrapeBase,
-								missingReddit,
-								{ includeImages: true, aiSummary: true },
-							);
+							redditTask = await scrapeUrlsViaApi(scrapeBase, missingReddit, {
+								includeImages: true,
+								aiSummary: true,
+							});
 						}
 						sources = [
 							...preScraped,
@@ -4662,6 +4670,111 @@ app.post("/inkgest-agent", async (c) => {
 					};
 				}
 
+				if (task.type === "scrape-git") {
+					const gitUrl = params.url || urls[0];
+					if (
+						!gitUrl ||
+						typeof gitUrl !== "string" ||
+						!gitUrl.includes("github.com")
+					) {
+						return {
+							taskLabel: task.label,
+							success: false,
+							error:
+								"scrape-git requires a GitHub URL (params.url or params.urls[0])",
+						};
+					}
+					const scrapeGitBody = {
+						url: gitUrl,
+						...(params.includePullRequests && { includePullRequests: true }),
+						...(params.includeIssues && { includeIssues: true }),
+					};
+					const scrapeGitRes = await fetch(`${apiBase}/scrape-git`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify(scrapeGitBody),
+						signal: AbortSignal.timeout(90_000),
+					});
+					const scrapeGitData = await scrapeGitRes.json().catch(() => ({}));
+					state.creditsDistribution.push({
+						task: "scrape-git",
+						label: task.label,
+						credits: CREDITS["scrape-git"],
+					});
+					state.creditsUsed += CREDITS["scrape-git"];
+					if (!scrapeGitRes.ok || !scrapeGitData.success) {
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: scrapeGitData?.error || `HTTP ${scrapeGitRes.status}`,
+						};
+					}
+					const executed = {
+						type: "scrape-git",
+						label: task.label,
+						url: gitUrl,
+						markdown: scrapeGitData.markdown,
+						data: scrapeGitData.data,
+						ast: scrapeGitData.ast ?? null,
+						result: {
+							markdown: scrapeGitData.markdown,
+							data: scrapeGitData.data,
+							ast: scrapeGitData.ast ?? null,
+						},
+					};
+					if (scrapeGitData.stars != null) executed.stars = scrapeGitData.stars;
+					if (scrapeGitData.pullRequests != null)
+						executed.pullRequests = scrapeGitData.pullRequests;
+					if (scrapeGitData.issues != null)
+						executed.issues = scrapeGitData.issues;
+					if (scrapeGitData.links != null) executed.links = scrapeGitData.links;
+					return { taskLabel: task.label, success: true, executed };
+				}
+
+				if (task.type === "github-trending") {
+					const since = params.since || "weekly";
+					const language = params.language || "";
+					const category = params.category || "";
+					const per_page = Math.min(Number(params.per_page) || 25, 100);
+					const query = new URLSearchParams();
+					if (since) query.set("since", since);
+					if (language) query.set("language", language);
+					if (category) query.set("category", category);
+					query.set("per_page", String(per_page));
+					const trendingRes = await fetch(
+						`${apiBase}/github-trending?${query.toString()}`,
+						{ signal: AbortSignal.timeout(30_000) },
+					);
+					const trendingData = await trendingRes.json().catch(() => ({}));
+					state.creditsDistribution.push({
+						task: "github-trending",
+						label: task.label,
+						credits: CREDITS["github-trending"],
+					});
+					state.creditsUsed += CREDITS["github-trending"];
+					if (!trendingRes.ok || !trendingData.ok) {
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: trendingData?.error || `HTTP ${trendingRes.status}`,
+						};
+					}
+					return {
+						taskLabel: task.label,
+						success: true,
+						executed: {
+							type: "github-trending",
+							label: task.label,
+							meta: trendingData.meta ?? {},
+							data: trendingData.data ?? [],
+							result: {
+								meta: trendingData.meta,
+								data: trendingData.data,
+							},
+						},
+					};
+				}
+
 				const skill = SKILLS[task.type];
 				if (!skill || task.type === "scrape") {
 					return {
@@ -4680,11 +4793,7 @@ app.post("/inkgest-agent", async (c) => {
 				// Scrape API uses aiSummary: true — returns condensed summary + links/images, no extra LLM needed
 
 				// CRITICAL: Do NOT create content when URLs were provided but scrape failed.
-				if (
-					urls.length > 0 &&
-					!useCrawlResult &&
-					preSources.length === 0
-				) {
+				if (urls.length > 0 && !useCrawlResult && preSources.length === 0) {
 					const errMsg =
 						"Scraping failed for provided URLs. Cannot create content without source data.";
 					console.error(
@@ -4843,6 +4952,8 @@ app.post("/inkgest-agent", async (c) => {
 								errors: undefined,
 								scrapeErrors:
 									scrapeErrors.length > 0 ? scrapeErrors : undefined,
+								// Top-level list of all source references (empty when no URLs)
+								references: state.references || [],
 								creditsUsed,
 								creditsDistribution,
 								tokenUsage,
@@ -4930,6 +5041,8 @@ app.post("/inkgest-agent", async (c) => {
 							send({
 								type: "end",
 								executed,
+								// Top-level list of all source references (empty when no URLs)
+								references: state.references || [],
 								errors: errors.length > 0 ? errors : undefined,
 								scrapeErrors:
 									scrapeErrors.length > 0 ? scrapeErrors : undefined,
@@ -4973,12 +5086,11 @@ app.post("/inkgest-agent", async (c) => {
 						: message.includes("fetch failed") || cause
 							? "NETWORK_ERROR"
 							: "AGENT_ERROR";
-		const userMessage =
-			isAuthError
-				? "OpenRouter API key is missing or invalid. Set OPENROUTER_API_KEY in your production environment."
-				: isAbort
-					? "Request timed out. The LLM or scrape service took too long to respond."
-					: message;
+		const userMessage = isAuthError
+			? "OpenRouter API key is missing or invalid. Set OPENROUTER_API_KEY in your production environment."
+			: isAbort
+				? "Request timed out. The LLM or scrape service took too long to respond."
+				: message;
 		return c.json(
 			{
 				error: userMessage,
@@ -4990,8 +5102,7 @@ app.post("/inkgest-agent", async (c) => {
 	}
 });
 
-// give me simple git repo 
-
+// give me simple git repo
 
 const SCREENSHOT_VIEWPORT_MAP = {
 	desktop: { width: 1920, height: 1080, scale: 1 },
@@ -6446,7 +6557,10 @@ app.post("/scrape-reddit", async (c) => {
 app.post("/scrape-youtube", async (c) => {
 	const { id } = await c.req.json();
 	if (!id) {
-		return c.json({ success: false, error: "Video id or URL is required" }, 400);
+		return c.json(
+			{ success: false, error: "Video id or URL is required" },
+			400,
+		);
 	}
 	try {
 		let transcript = [];
@@ -6480,8 +6594,64 @@ app.post("/scrape-youtube", async (c) => {
 	}
 });
 
+// POST /repo/analyze — full AST analysis (public repos, no token)
+app.post("/repo/analyze", async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({}));
+		const {
+			repoUrl,
+			branch = "main",
+			includeFullAST = false,
+			fileExtensions,
+			maxFiles = 200,
+		} = body;
+
+		const match = repoUrl?.match(/github\.com\/([^/]+)\/([^/]+)/);
+		if (!match) return c.json({ error: "Invalid GitHub repo URL" }, 400);
+
+		const [, owner, repo] = match;
+		const ast = await analyzeRepo(owner, repo, branch, {
+			includeFullAST,
+			fileExtensions,
+			maxFiles,
+		});
+		return c.json(ast);
+	} catch (err) {
+		return c.json({ error: err?.message ?? String(err) }, 500);
+	}
+});
+
+// GET /repo/tree — lightweight file tree only (public repos, no token)
+app.get("/repo/tree", async (c) => {
+	try {
+		const repoUrl = c.req.query("url");
+		const branch = c.req.query("branch") ?? "main";
+
+		if (!repoUrl) return c.json({ error: "url query param required" }, 400);
+
+		const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+		if (!match) return c.json({ error: "Invalid GitHub repo URL" }, 400);
+
+		const [, owner, repo] = match;
+		const tree = await fetchRepoTree(owner, repo, branch);
+		return c.json({
+			repo: `${owner}/${repo}`,
+			branch,
+			totalItems: tree.length,
+			tree: tree.map((i) => ({ path: i.path, type: i.type, size: i.size })),
+		});
+	} catch (err) {
+		return c.json({ error: err?.message ?? String(err) }, 500);
+	}
+});
+
 app.post("/scrape-git", async (c) => {
-	const { url } = await c.req.json();
+	const body = await c.req.json().catch(() => ({}));
+	const { url, includePullRequests = false, includeIssues = false } = body;
+
+	if (!url || typeof url !== "string") {
+		return c.json({ success: false, error: "URL is required" }, 400);
+	}
 	const newUrl = new URL(url);
 	if (!newUrl || newUrl.hostname !== "github.com") {
 		return c.json(
@@ -6492,6 +6662,11 @@ app.post("/scrape-git", async (c) => {
 			400,
 		);
 	}
+
+	const repoMatch = url.match(/github\.com\/([^/]+)\/([^/]+)/);
+	const owner = repoMatch?.[1];
+	const repo = repoMatch?.[2]?.replace(/\.git$/i, "");
+
 	try {
 		const response = await axios.get(newUrl.toString());
 
@@ -6510,7 +6685,116 @@ app.post("/scrape-git", async (c) => {
 		const { markdown } = extractSemanticContentWithFormattedMarkdown(
 			content.body,
 		);
-		return c.json({
+
+		let ast = null;
+		const parsed = parseRepoUrl(url);
+		if (parsed) {
+			try {
+				if (parsed.isBlob && parsed.path) {
+					ast = await analyzeSingleFile(
+						parsed.owner,
+						parsed.repo,
+						parsed.branch,
+						parsed.path,
+					);
+				} else {
+					ast = await analyzeRepo(parsed.owner, parsed.repo, parsed.branch);
+				}
+			} catch (astError) {
+				console.error("❌ Repo AST error:", astError);
+				ast = null;
+			}
+		}
+
+		const links = [];
+		let stars = null;
+		let pullRequests = null;
+		let issues = null;
+
+		const ghApi = "https://api.github.com";
+		const ghHeaders = {
+			Accept: "application/vnd.github.v3+json",
+			"User-Agent": "scrape-git-agent/1.0",
+		};
+
+		if (owner && repo) {
+			try {
+				const res = await fetch(`${ghApi}/repos/${owner}/${repo}`, {
+					headers: ghHeaders,
+					signal: AbortSignal.timeout(10_000),
+				});
+				if (res.ok) {
+					const data = await res.json();
+					stars = {
+						count: data.stargazers_count ?? 0,
+						forks: data.forks_count ?? 0,
+						url: data.html_url || `https://github.com/${owner}/${repo}`,
+					};
+					links.push({ label: "Repository", url: stars.url });
+				}
+			} catch (e) {
+				console.warn("❌ GitHub stars fetch failed:", e?.message);
+			}
+
+			if (includePullRequests) {
+				try {
+					const res = await fetch(
+						`${ghApi}/repos/${owner}/${repo}/pulls?state=open&per_page=30`,
+						{ headers: ghHeaders, signal: AbortSignal.timeout(10_000) },
+					);
+					if (res.ok) {
+						const list = await res.json();
+						pullRequests = list.map((pr) => ({
+							number: pr.number,
+							title: pr.title,
+							url: pr.html_url,
+							state: pr.state,
+							user: pr.user?.login,
+							created_at: pr.created_at,
+						}));
+						pullRequests.forEach((pr) => {
+							links.push({
+								label: `PR #${pr.number}: ${pr.title}`,
+								url: pr.url,
+							});
+						});
+					}
+				} catch (e) {
+					console.warn("❌ GitHub pull requests fetch failed:", e?.message);
+				}
+			}
+
+			if (includeIssues) {
+				try {
+					const res = await fetch(
+						`${ghApi}/repos/${owner}/${repo}/issues?state=open&per_page=30`,
+						{ headers: ghHeaders, signal: AbortSignal.timeout(10_000) },
+					);
+					if (res.ok) {
+						const list = await res.json();
+						const issuesOnly = list.filter((i) => !i.pull_request);
+						issues = issuesOnly.map((iss) => ({
+							number: iss.number,
+							title: iss.title,
+							url: iss.html_url,
+							state: iss.state,
+							user: iss.user?.login,
+							created_at: iss.created_at,
+						}));
+						issues.forEach((iss) => {
+							links.push({
+								label: `Issue #${iss.number}: ${iss.title}`,
+								url: iss.url,
+							});
+						});
+					}
+				} catch (e) {
+					console.warn("❌ GitHub issues fetch failed:", e?.message);
+				}
+			}
+		}
+
+		const payload = {
 			success: true,
 			data: {
 				url: url,
@@ -6519,7 +6803,14 @@ app.post("/scrape-git", async (c) => {
 				metadata: metadata,
 			},
 			markdown: markdown,
-		});
+			ast,
+		};
+		if (stars != null) payload.stars = stars;
+		if (pullRequests != null) payload.pullRequests = pullRequests;
+		if (issues != null) payload.issues = issues;
+		if (links.length > 0) payload.links = links;
+
+		return c.json(payload);
 	} catch (error) {
 		console.error("❌ Github scraper error:", error);
 		return c.json(

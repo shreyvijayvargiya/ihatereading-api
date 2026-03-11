@@ -12,21 +12,9 @@ import ollama from "ollama";
 
 dotenv.config();
 
-// Available Ollama models from your local setup
-const AVAILABLE_MODELS = [
-	"deepseek-r1:1.5b",
-	"gemma:2b",
-	"codellama:7b",
-	"nemotron-mini",
-];
-
 const ollamaClient = new ChatOllama({
 	model: "gemma:2b", // Using one of your available models
 	baseURL: "http://localhost:11434",
-});
-
-const genai = new GoogleGenAI({
-	apiKey: process.env.GOOGLE_GENAI_API_KEY,
 });
 
 const getRandomInt = (min, max) =>
@@ -34,16 +22,16 @@ const getRandomInt = (min, max) =>
 function get_useragent() {
 	const lynx_version = `Lynx/${getRandomInt(2, 3)}.${getRandomInt(
 		8,
-		9
+		9,
 	)}.${getRandomInt(0, 2)}`;
 	const libwww_version = `libwww-FM/${getRandomInt(2, 3)}.${getRandomInt(
 		13,
-		15
+		15,
 	)}`;
 	const ssl_mm_version = `SSL-MM/${getRandomInt(1, 2)}.${getRandomInt(3, 5)}`;
 	const openssl_version = `OpenSSL/${getRandomInt(1, 3)}.${getRandomInt(
 		0,
-		4
+		4,
 	)}.${getRandomInt(0, 9)}`;
 	return `${lynx_version} ${libwww_version} ${ssl_mm_version} ${openssl_version}`;
 }
@@ -98,7 +86,7 @@ async function googleSearchFunction({
 
 			if (link_tag && title_tag && description_tag) {
 				const link = decodeURIComponent(
-					link_tag.href.split("&")[0].replace("/url?q=", "")
+					link_tag.href.split("&")[0].replace("/url?q=", ""),
 				);
 
 				const title = (title_tag.textContent || "").trim().normalize("NFC");
@@ -122,50 +110,6 @@ async function googleSearchFunction({
 		return { error: error.message };
 	}
 }
-
-const googleSearchDeclaration = {
-	name: "google_search",
-	description: "Search the web for information",
-	parameters: {
-		type: Type.OBJECT,
-		properties: {
-			query: {
-				type: Type.STRING,
-				description: "The query to search for",
-			},
-			num: {
-				type: Type.NUMBER,
-				description: "The number of results to return",
-			},
-			language: {
-				type: Type.STRING,
-				description: "The language to search in",
-			},
-			country: {
-				type: Type.STRING,
-				description: "The country to search in",
-			},
-		},
-		required: ["query"],
-	},
-};
-
-const bingSearchDeclaration = tool((_) => "", {
-	name: "bing_search",
-	description: "Search the web for information",
-	schema: z.object({
-		query: z.string().describe("The query to search for"),
-	}),
-});
-
-
-const ddgSearchDeclaration = tool((_) => "", {
-	name: "ddg_search",
-	description: "Search the web for information",
-	schema: z.object({
-		query: z.string().describe("The query to search for"),
-	}),
-});
 
 // Function to generate search queries from user prompt
 const generateSearchQueries = async (prompt, modelName) => {
@@ -211,7 +155,7 @@ Example format: ["query 1", "query 2", "query 3"]`,
 // Ollama-based AI Web Search Agent (Two-step approach)
 export const aiWebSearchAgent = async (
 	prompt,
-	modelName = "deepseek-r1:1.5b"
+	modelName = "deepseek-r1:1.5b",
 ) => {
 	if (!prompt) {
 		return {
