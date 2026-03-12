@@ -4034,10 +4034,13 @@ app.post("/inkgest-agent", async (c) => {
 			prompt = "",
 			chatHistory = [],
 			executeTasks = [],
+			images: bodyImages = [],
 		} = (await c.req.json().catch(() => ({}))) || {};
 		const userPrompt = String(prompt).trim();
 		const hasExecuteTasks =
 			Array.isArray(executeTasks) && executeTasks.length > 0;
+		const hasImages =
+			Array.isArray(bodyImages) && bodyImages.length > 0;
 
 		if (!userPrompt && !hasExecuteTasks) {
 			return c.json({ error: "Prompt or executeTasks required" }, 400);
@@ -4095,7 +4098,10 @@ app.post("/inkgest-agent", async (c) => {
 			const urlLine = urlsToScrape.length
 				? `URLs found: ${urlsToScrape.join(", ")}`
 				: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
-			const userContent = `User message: ${userPrompt}\n\n${urlLine}`;
+			const imageLine = hasImages
+				? `Images provided: ${bodyImages.length} image(s). You MUST suggest an image-reading task with params.images (the executor will inject the actual images). Suggest blog, article, newsletter, or table to use the extracted image content.`
+				: "";
+			const userContent = `User message: ${userPrompt}\n\n${urlLine}${imageLine ? `\n\n${imageLine}` : ""}`;
 			const messages = [
 				{ role: "system", content: ROUTER_SYSTEM_PROMPT },
 				...chatHistory.slice(-6).map((m) => ({
@@ -4200,6 +4206,24 @@ app.post("/inkgest-agent", async (c) => {
 						: urlsToScrape;
 				return { ...t, params: { ...t.params, urls: taskUrls } };
 			});
+			if (hasImages) {
+				const imageReadingIdx = suggestedTasks.findIndex(
+					(t) => t.type === "image-reading",
+				);
+				const imageParams = { images: bodyImages };
+				if (imageReadingIdx >= 0) {
+					suggestedTasks[imageReadingIdx].params = {
+						...suggestedTasks[imageReadingIdx].params,
+						...imageParams,
+					};
+				} else {
+					suggestedTasks.unshift({
+						type: "image-reading",
+						label: "Read image(s)",
+						params: imageParams,
+					});
+				}
+			}
 		} else {
 			if (urlsToScrape.length > 0) {
 				const [regularScraped, youtubeScraped, redditScraped] =
@@ -4298,6 +4322,15 @@ app.post("/inkgest-agent", async (c) => {
 			const taskUrls = hasUrls ? fromTask : fallbackUrls;
 			return { ...t, params: { ...t.params, urls: taskUrls } };
 		});
+
+		if (hasImages) {
+			tasksToRun = tasksToRun.map((t) =>
+				t.type === "image-reading" &&
+				(!Array.isArray(t.params?.images) || t.params.images.length === 0)
+					? { ...t, params: { ...t.params, images: bodyImages } }
+					: t,
+			);
+		}
 
 		// When router inferred URLs (in tasks) but we didn't scrape (urlsToScrape was empty), scrape now
 		if (
@@ -4453,6 +4486,8 @@ app.post("/inkgest-agent", async (c) => {
 			creditsDistribution: [...creditsDistribution],
 			/** After crawl-url tasks run, filled with { url, markdown, title, links }[] for useCrawlResult content tasks */
 			crawlUrlSources: [],
+			/** After image-reading task runs, filled with same shape as scrape sources for blog/article etc. */
+			imageReadingSources: [],
 			/** Top-level list of all scraped source references (URLs + optional titles) */
 			references: allSourceReferences,
 		};
@@ -4731,6 +4766,64 @@ app.post("/inkgest-agent", async (c) => {
 					return { taskLabel: task.label, success: true, executed };
 				}
 
+				if (task.type === "image-reading") {
+					const imgs = Array.isArray(params.images) ? params.images : [];
+					if (imgs.length === 0) {
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: "image-reading requires params.images (array of { url } or { base64, mimeType })",
+						};
+					}
+					const imageReadingRes = await fetch(`${apiBase}/image-reading`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							images: imgs,
+							extractContent: true,
+							convertToCode: params.convertToCode === true,
+						}),
+						signal: AbortSignal.timeout(120_000),
+					});
+					const imageReadingData = await imageReadingRes.json().catch(() => ({}));
+					state.creditsDistribution.push({
+						task: "image-reading",
+						label: task.label,
+						credits: CREDITS["image-reading"],
+					});
+					state.creditsUsed += CREDITS["image-reading"];
+					if (!imageReadingRes.ok || !imageReadingData.success) {
+						return {
+							taskLabel: task.label,
+							success: false,
+							error: imageReadingData?.error || `HTTP ${imageReadingRes.status}`,
+						};
+					}
+					const markdown = imageReadingData.markdown || "";
+					if (markdown && state.imageReadingSources) {
+						state.imageReadingSources.push({
+							url: "image-reading",
+							title: "Image content",
+							markdown,
+							links: [],
+						});
+					}
+					return {
+						taskLabel: task.label,
+						success: true,
+						executed: {
+							type: "image-reading",
+							label: task.label,
+							results: imageReadingData.results || [],
+							markdown,
+							result: {
+								results: imageReadingData.results,
+								markdown,
+							},
+						},
+					};
+				}
+
 				if (task.type === "github-trending") {
 					const since = params.since || "weekly";
 					const language = params.language || "";
@@ -4789,11 +4882,19 @@ app.post("/inkgest-agent", async (c) => {
 				let preSources = useCrawlResult
 					? state.crawlUrlSources
 					: urls.map((u) => sourceByUrl[u]).filter(Boolean);
+				if (state.imageReadingSources?.length > 0) {
+					preSources = [...preSources, ...state.imageReadingSources];
+				}
 
 				// Scrape API uses aiSummary: true — returns condensed summary + links/images, no extra LLM needed
 
 				// CRITICAL: Do NOT create content when URLs were provided but scrape failed.
-				if (urls.length > 0 && !useCrawlResult && preSources.length === 0) {
+				if (
+					urls.length > 0 &&
+					!useCrawlResult &&
+					state.imageReadingSources?.length === 0 &&
+					preSources.length === 0
+				) {
 					const errMsg =
 						"Scraping failed for provided URLs. Cannot create content without source data.";
 					console.error(
@@ -4965,13 +5066,18 @@ app.post("/inkgest-agent", async (c) => {
 				}
 
 				const crawlUrlTasks = validTasks.filter((t) => t.type === "crawl-url");
-				const otherTasks = validTasks.filter((t) => t.type !== "crawl-url");
+				const imageReadingTasks = validTasks.filter(
+					(t) => t.type === "image-reading",
+				);
+				const otherTasks = validTasks.filter(
+					(t) => t.type !== "crawl-url" && t.type !== "image-reading",
+				);
 
 				(async () => {
 					const executed = [];
 					const errors = [];
 
-					// Phase 1: run crawl-url tasks first so we have crawlUrlSources for useCrawlResult content tasks
+					// Phase 1a: run crawl-url tasks first so we have crawlUrlSources for useCrawlResult content tasks
 					if (crawlUrlTasks.length > 0) {
 						const results = await Promise.all(
 							crawlUrlTasks.map((t) => runOneTask(t)),
@@ -5008,7 +5114,35 @@ app.post("/inkgest-agent", async (c) => {
 						});
 					}
 
-					// Phase 2: run remaining tasks (blog/article/table will use state.crawlUrlSources when useCrawlResult: true)
+					// Phase 1b: run image-reading so we have imageReadingSources for blog/article/newsletter etc.
+					if (imageReadingTasks.length > 0) {
+						const results = await Promise.all(
+							imageReadingTasks.map((t) => runOneTask(t)),
+						);
+						results.forEach((r, i) => {
+							controller.enqueue(
+								encoder.encode(
+									send({
+										type: "task",
+										index: validTasks.indexOf(imageReadingTasks[i]),
+										...r,
+									}),
+								),
+							);
+							if (r.success && r.executed) executed.push(r.executed);
+							else if (r.error) {
+								console.error(
+									"[inkgest-agent] Task failed:",
+									r.taskLabel,
+									"error:",
+									r.error,
+								);
+								errors.push({ task: r.taskLabel, error: r.error });
+							}
+						});
+					}
+
+					// Phase 2: run remaining tasks (blog/article/table will use state.crawlUrlSources and/or state.imageReadingSources)
 					if (otherTasks.length > 0) {
 						const results = await Promise.all(
 							otherTasks.map((t) => runOneTask(t)),
@@ -6956,6 +7090,142 @@ Strict requirements:
 		inputTokens: aiResponse.usageMetadata.promptTokenCount,
 		outputTokens: aiResponse.usageMetadata.candidatesTokenCount,
 	});
+});
+
+/** Normalize image input to { base64, mimeType }. Fetches from URL if needed. */
+async function normalizeImageInput(img) {
+	if (!img || typeof img !== "object") return null;
+	if (img.base64 && typeof img.base64 === "string") {
+		return {
+			base64: img.base64.replace(/^data:image\/\w+;base64,/, ""),
+			mimeType: img.mimeType || "image/png",
+		};
+	}
+	if (img.url && typeof img.url === "string") {
+		const res = await fetch(img.url, { signal: AbortSignal.timeout(15_000) });
+		if (!res.ok) throw new Error(`Failed to fetch image: ${res.status}`);
+		const buf = await res.arrayBuffer();
+		const base64 = Buffer.from(buf).toString("base64");
+		const mimeType = res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+		return { base64, mimeType };
+	}
+	return null;
+}
+
+/**
+ * POST /image-reading
+ * Body: { images: [{ url } | { base64, mimeType }], convertToCode?: boolean, extractContent?: boolean }
+ * Uses Gemini 2.0 to extract content (markdown) and optionally convert to code.
+ */
+app.post("/image-reading", async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({}));
+		const {
+			images = [],
+			convertToCode = false,
+			extractContent = true,
+		} = body;
+
+		if (!Array.isArray(images) || images.length === 0) {
+			return c.json(
+				{ success: false, error: "images array is required and must not be empty" },
+				400,
+			);
+		}
+
+		const normalized = [];
+		for (let i = 0; i < images.length; i++) {
+			try {
+				const n = await normalizeImageInput(images[i]);
+				if (n) normalized.push(n);
+			} catch (e) {
+				console.warn("[image-reading] Skip image", i, e?.message);
+			}
+		}
+		if (normalized.length === 0) {
+			return c.json(
+				{ success: false, error: "No valid image could be loaded from images array" },
+				400,
+			);
+		}
+
+		const results = [];
+		const markdownParts = [];
+
+		for (let idx = 0; idx < normalized.length; idx++) {
+			const { base64, mimeType } = normalized[idx];
+			const result = { index: idx, content: null, code: null };
+
+			if (extractContent) {
+				try {
+					const contentRes = await genai.models.generateContent({
+						model: "gemini-2.0-flash",
+						contents: [
+							{
+								role: "user",
+								parts: [
+									{
+										text: "Extract and describe all text and meaningful content from this image. Return only markdown: headings, paragraphs, lists, and any text you see. No preamble or explanation.",
+									},
+									{ inlineData: { mimeType, data: base64 } },
+								],
+							},
+						],
+					});
+					const text =
+						contentRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+					result.content = text || "(No text extracted)";
+					markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
+				} catch (e) {
+					console.warn("[image-reading] Extract content failed:", e?.message);
+					result.content = "(Content extraction failed)";
+					markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
+				}
+			}
+
+			if (convertToCode) {
+				try {
+					const codeRes = await genai.models.generateContent({
+						model: "gemini-2.0-flash",
+						contents: [
+							{
+								role: "user",
+								parts: [
+									{
+										text: "Convert this image (screenshot, mockup, or UI) into clean HTML and CSS code. Output only a single HTML document with embedded <style>. No explanations.",
+									},
+									{ inlineData: { mimeType, data: base64 } },
+								],
+							},
+						],
+					});
+					let code =
+						codeRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+					const fence = code.match(/```(?:html)?\s*\n?([\s\S]*?)\n?```/);
+					if (fence && fence[1]) code = fence[1].trim();
+					result.code = code || null;
+				} catch (e) {
+					console.warn("[image-reading] Convert to code failed:", e?.message);
+				}
+			}
+
+			results.push(result);
+		}
+
+		const markdown = markdownParts.join("\n\n");
+
+		return c.json({
+			success: true,
+			results,
+			markdown: markdown || "(No content extracted)",
+		});
+	} catch (err) {
+		console.error("❌ image-reading error:", err);
+		return c.json(
+			{ success: false, error: err?.message || "Image reading failed" },
+			500,
+		);
+	}
 });
 
 // Helper to parse repo input (either "owner/repo" or full GitHub URL)
