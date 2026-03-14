@@ -6742,7 +6742,6 @@ app.post("/scrape-youtube", async (c) => {
 						: undefined,
 			}));
 	} catch (youtubeiError) {
-		// Fallback: youtubei.js can throw (e.g. ParsingError, 400 get_transcript)
 		try {
 			transcript = await fetchTranscript(videoId, { lang: "en" });
 		} catch (langError) {
