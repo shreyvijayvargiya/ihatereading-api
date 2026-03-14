@@ -44,7 +44,6 @@ import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
-import { Innertube } from "youtubei.js";
 import {
 	fetchTranscript,
 	YoutubeTranscriptNotAvailableLanguageError,
@@ -6708,65 +6707,36 @@ app.post("/scrape-youtube", async (c) => {
 			400,
 		);
 	}
-	const videoId = extractYouTubeVideoId(id);
-	if (!videoId) {
-		return c.json(
-			{ success: false, error: "Invalid video id or URL" },
-			400,
-		);
-	}
-	let transcript = [];
 	try {
-		const youtube = await Innertube.create();
-		const info = await youtube.getInfo(videoId);
-		if (!info?.basic_info) {
-			return c.json(
-				{ success: false, error: "Video not found or unavailable" },
-				404,
-			);
-		}
-		let transcriptInfo = await info.getTranscript();
-		if (transcriptInfo?.languages?.includes("en")) {
-			transcriptInfo = await transcriptInfo.selectLanguage("en");
-		}
-		const segments =
-			transcriptInfo?.transcript?.content?.body?.initial_segments ?? [];
-		transcript = segments
-			.filter((seg) => seg?.snippet != null)
-			.map((seg) => ({
-				text: seg.snippet?.text ?? String(seg.snippet ?? ""),
-				offset: seg.start_ms != null ? Number(seg.start_ms) : undefined,
-				duration:
-					seg.start_ms != null && seg.end_ms != null
-						? Number(seg.end_ms) - Number(seg.start_ms)
-						: undefined,
-			}));
-	} catch (youtubeiError) {
+		let transcript = [];
 		try {
-			transcript = await fetchTranscript(videoId, { lang: "en" });
+			transcript = await fetchTranscript(id, { lang: "en" });
 		} catch (langError) {
+			// Fallback: try without lang to get first available transcript (e.g. if "en" not available)
 			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
-				transcript = await fetchTranscript(videoId);
+				transcript = await fetchTranscript(id);
 			} else {
-				console.error("❌ Youtube scraper error:", youtubeiError);
-				console.error("❌ Fallback youtube-transcript-plus error:", langError);
-				return c.json(
-					{
-						success: false,
-						error: "Failed to fetch YouTube transcript",
-						details: langError?.message || String(langError),
-					},
-					500,
-				);
+				throw langError;
 			}
 		}
+		return c.json({
+			success: true,
+			data: {
+				transcript,
+			},
+		});
+	} catch (error) {
+		console.error("❌ Youtube scraper error:", error);
+		const details = error?.message || String(error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to fetch YouTube transcript",
+				details,
+			},
+			500,
+		);
 	}
-	return c.json({
-		success: true,
-		data: {
-			transcript,
-		},
-	});
 });
 
 // POST /repo/analyze — full AST analysis (public repos, no token)
