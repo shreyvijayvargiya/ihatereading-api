@@ -6699,7 +6699,15 @@ app.post("/scrape-youtube", async (c) => {
 	try {
 		let transcript = [];
 		try {
-			transcript = await fetchTranscript(id, { lang: "en" });
+			transcript = await fetchTranscript(id, {
+				lang: "en",
+				fetchOptions: {
+					headers: {
+						"User-Agent":
+							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+					},
+				},
+			});
 		} catch (langError) {
 			// Fallback: try without lang to get first available transcript (e.g. if "en" not available)
 			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
