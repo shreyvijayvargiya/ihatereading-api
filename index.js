@@ -6699,6 +6699,43 @@ function extractYouTubeVideoId(idOrUrl) {
 	return null;
 }
 
+const YOUTUBE_BROWSER_UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+function browserLikeFetchOptions() {
+	const headers = {
+		"User-Agent": YOUTUBE_BROWSER_UA,
+		"Accept-Language": "en-US,en;q=0.9",
+		Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		Referer: "https://www.youtube.com/",
+	};
+	return {
+		userAgent: YOUTUBE_BROWSER_UA,
+		videoFetch: (params) =>
+			fetch(params.url, {
+				method: params.method || "GET",
+				headers: { ...headers, ...params.headers },
+				body: params.body,
+			}),
+		playerFetch: (params) =>
+			fetch(params.url, {
+				method: params.method || "POST",
+				headers: {
+					...headers,
+					"Content-Type": "application/json",
+					...params.headers,
+				},
+				body: params.body,
+			}),
+		transcriptFetch: (params) =>
+			fetch(params.url, {
+				method: params.method || "GET",
+				headers: { ...headers, ...params.headers },
+				body: params.body,
+			}),
+	};
+}
+
 app.post("/scrape-youtube", async (c) => {
 	const { id } = await c.req.json();
 	if (!id) {
@@ -6707,14 +6744,15 @@ app.post("/scrape-youtube", async (c) => {
 			400,
 		);
 	}
+	const isProd = process.env.VERCEL === "1";
+	const baseOpts = isProd ? browserLikeFetchOptions() : {};
 	try {
 		let transcript = [];
 		try {
-			transcript = await fetchTranscript(id, { lang: "en" });
+			transcript = await fetchTranscript(id, { lang: "en", ...baseOpts });
 		} catch (langError) {
-			// Fallback: try without lang to get first available transcript (e.g. if "en" not available)
 			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
-				transcript = await fetchTranscript(id);
+				transcript = await fetchTranscript(id, baseOpts);
 			} else {
 				throw langError;
 			}
