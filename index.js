@@ -39,7 +39,7 @@ import { GoogleGenAI } from "@google/genai";
 import browserPool from "./browser-pool.js";
 import fs from "fs";
 import NodeCache from "node-cache";
-import { fetch } from "undici";
+import { fetch, ProxyAgent } from "undici";
 import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
@@ -6702,38 +6702,62 @@ function extractYouTubeVideoId(idOrUrl) {
 const YOUTUBE_BROWSER_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-function browserLikeFetchOptions() {
-	const headers = {
-		"User-Agent": YOUTUBE_BROWSER_UA,
-		"Accept-Language": "en-US,en;q=0.9",
-		Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		Referer: "https://www.youtube.com/",
-	};
+const BROWSER_HEADERS = {
+	"User-Agent": YOUTUBE_BROWSER_UA,
+	"Accept-Language": "en-US,en;q=0.9",
+	Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	Referer: "https://www.youtube.com/",
+};
+
+function browserLikeFetchOptions(dispatcher) {
+	const headers = { ...BROWSER_HEADERS };
+	const fetchOpts = (opts) => (dispatcher ? { ...opts, dispatcher } : opts);
 	return {
 		userAgent: YOUTUBE_BROWSER_UA,
 		videoFetch: (params) =>
-			fetch(params.url, {
-				method: params.method || "GET",
-				headers: { ...headers, ...params.headers },
-				body: params.body,
-			}),
+			fetch(
+				params.url,
+				fetchOpts({
+					method: params.method || "GET",
+					headers: { ...headers, ...params.headers },
+					body: params.body,
+				}),
+			),
 		playerFetch: (params) =>
-			fetch(params.url, {
-				method: params.method || "POST",
-				headers: {
-					...headers,
-					"Content-Type": "application/json",
-					...params.headers,
-				},
-				body: params.body,
-			}),
+			fetch(
+				params.url,
+				fetchOpts({
+					method: params.method || "POST",
+					headers: {
+						...headers,
+						"Content-Type": "application/json",
+						...params.headers,
+					},
+					body: params.body,
+				}),
+			),
 		transcriptFetch: (params) =>
-			fetch(params.url, {
-				method: params.method || "GET",
-				headers: { ...headers, ...params.headers },
-				body: params.body,
-			}),
+			fetch(
+				params.url,
+				fetchOpts({
+					method: params.method || "GET",
+					headers: { ...headers, ...params.headers },
+					body: params.body,
+				}),
+			),
 	};
+}
+
+function getScrapeYoutubeFetchOptions() {
+	if (process.env.VERCEL !== "1") return {};
+	try {
+		const proxy = proxyManager.getNextProxy();
+		const proxyUrl = `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`;
+		const dispatcher = new ProxyAgent(proxyUrl);
+		return browserLikeFetchOptions(dispatcher);
+	} catch {
+		return browserLikeFetchOptions();
+	}
 }
 
 app.post("/scrape-youtube", async (c) => {
@@ -6744,8 +6768,7 @@ app.post("/scrape-youtube", async (c) => {
 			400,
 		);
 	}
-	const isProd = process.env.VERCEL === "1";
-	const baseOpts = isProd ? browserLikeFetchOptions() : {};
+	const baseOpts = getScrapeYoutubeFetchOptions();
 	try {
 		let transcript = [];
 		try {
