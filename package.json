@@ -87,6 +87,7 @@
 		"uuid": "^11.1.0",
 		"xml2js": "^0.6.2",
 		"youtube-transcript-plus": "^1.2.0",
+		"youtubei.js": "^10.5.0",
 		"zod": "^3.25.76"
 	},
 	"devDependencies": {

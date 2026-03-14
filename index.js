@@ -44,6 +44,7 @@ import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import { Innertube } from "youtubei.js";
 import {
 	fetchTranscript,
 	YoutubeTranscriptNotAvailableLanguageError,
@@ -6688,6 +6689,17 @@ app.post("/scrape-reddit", async (c) => {
 	}
 });
 
+function extractYouTubeVideoId(idOrUrl) {
+	if (!idOrUrl || typeof idOrUrl !== "string") return null;
+	const s = idOrUrl.trim();
+	const youtuBe = /^(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})(?:\?|$)/;
+	const watch = /(?:v=)([a-zA-Z0-9_-]{11})(?:&|$)/;
+	const m = s.match(youtuBe) || s.match(watch);
+	if (m) return m[1];
+	if (/^[a-zA-Z0-9_-]{11}$/.test(s)) return s;
+	return null;
+}
+
 app.post("/scrape-youtube", async (c) => {
 	const { id } = await c.req.json();
 	if (!id) {
@@ -6696,44 +6708,66 @@ app.post("/scrape-youtube", async (c) => {
 			400,
 		);
 	}
-	try {
-		let transcript = [];
-		try {
-			transcript = await fetchTranscript(id, {
-				lang: "en",
-				fetchOptions: {
-					headers: {
-						"User-Agent":
-							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-					},
-				},
-			});
-		} catch (langError) {
-			// Fallback: try without lang to get first available transcript (e.g. if "en" not available)
-			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
-				transcript = await fetchTranscript(id);
-			} else {
-				throw langError;
-			}
-		}
-		return c.json({
-			success: true,
-			data: {
-				transcript,
-			},
-		});
-	} catch (error) {
-		console.error("❌ Youtube scraper error:", error);
-		const details = error?.message || String(error);
+	const videoId = extractYouTubeVideoId(id);
+	if (!videoId) {
 		return c.json(
-			{
-				success: false,
-				error: "Failed to fetch YouTube transcript",
-				details,
-			},
-			500,
+			{ success: false, error: "Invalid video id or URL" },
+			400,
 		);
 	}
+	let transcript = [];
+	try {
+		const youtube = await Innertube.create();
+		const info = await youtube.getInfo(videoId);
+		if (!info?.basic_info) {
+			return c.json(
+				{ success: false, error: "Video not found or unavailable" },
+				404,
+			);
+		}
+		let transcriptInfo = await info.getTranscript();
+		if (transcriptInfo?.languages?.includes("en")) {
+			transcriptInfo = await transcriptInfo.selectLanguage("en");
+		}
+		const segments =
+			transcriptInfo?.transcript?.content?.body?.initial_segments ?? [];
+		transcript = segments
+			.filter((seg) => seg?.snippet != null)
+			.map((seg) => ({
+				text: seg.snippet?.text ?? String(seg.snippet ?? ""),
+				offset: seg.start_ms != null ? Number(seg.start_ms) : undefined,
+				duration:
+					seg.start_ms != null && seg.end_ms != null
+						? Number(seg.end_ms) - Number(seg.start_ms)
+						: undefined,
+			}));
+	} catch (youtubeiError) {
+		// Fallback: youtubei.js can throw (e.g. ParsingError, 400 get_transcript)
+		try {
+			transcript = await fetchTranscript(videoId, { lang: "en" });
+		} catch (langError) {
+			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
+				transcript = await fetchTranscript(videoId);
+			} else {
+				console.error("❌ Youtube scraper error:", youtubeiError);
+				console.error("❌ Fallback youtube-transcript-plus error:", langError);
+				return c.json(
+					{
+						success: false,
+						error: "Failed to fetch YouTube transcript",
+						details: langError?.message || String(langError),
+					},
+					500,
+				);
+			}
+		}
+	}
+	return c.json({
+		success: true,
+		data: {
+			transcript,
+		},
+	});
 });
 
 // POST /repo/analyze — full AST analysis (public repos, no token)
