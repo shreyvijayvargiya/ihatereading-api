@@ -5256,6 +5256,8 @@ async function captureOneScreenshotWithPage(page, options) {
 		waitUntil = "domcontentloaded",
 		waitForSelector,
 		timeout = 50000,
+		contentReadyTimeout = 12000,
+		postLoadWaitMs = 1200,
 		fullPage = false,
 		coords,
 		blockDistractions = true,
@@ -5286,6 +5288,32 @@ async function captureOneScreenshotWithPage(page, options) {
 		try {
 			await page.waitForSelector(waitForSelector, { timeout: 10000 });
 		} catch {}
+	}
+
+	// Guard against blank screenshots: wait until DOM has meaningful content.
+	try {
+		await page.waitForFunction(
+			() => {
+				const rs = document.readyState;
+				const body = document.body;
+				if (!body) return false;
+				const rect = body.getBoundingClientRect();
+				const textLen = (body.innerText || "").trim().length;
+				const hasMedia = document.images.length > 0 || document.querySelector("video, canvas");
+				return (
+					(rs === "interactive" || rs === "complete") &&
+					rect.width > 0 &&
+					rect.height > 0 &&
+					(textLen > 80 || hasMedia)
+				);
+			},
+			{ timeout: Math.min(contentReadyTimeout, timeout) },
+		);
+	} catch {}
+
+	// Give SPAs/lazy sections one extra beat to render.
+	if (postLoadWaitMs > 0) {
+		await new Promise((r) => setTimeout(r, postLoadWaitMs));
 	}
 
 	if (blockDistractions && BLOCK_DISTRACTIONS_CSS) {
@@ -5532,6 +5560,286 @@ app.post("/take-screenshot-multiple", async (c) => {
 		console.error("❌ take-screenshot-multiple error:", error);
 		return c.json(
 			{ success: false, error: error?.message || "Internal server error" },
+			500,
+		);
+	}
+});
+
+function normalizeWebsiteUrl(input) {
+	if (!input || typeof input !== "string") return null;
+	const raw = input.trim();
+	if (!raw) return null;
+	const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+	try {
+		return new URL(withProtocol).toString();
+	} catch {
+		return null;
+	}
+}
+
+async function isLikelyStaticSite(url) {
+	try {
+		const resp = await axios.get(url, {
+			timeout: 12000,
+			maxRedirects: 5,
+			headers: {
+				"User-Agent": userAgents.random().toString(),
+				Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+			},
+		});
+		const html = typeof resp?.data === "string" ? resp.data : "";
+		if (!html) return false;
+		const scriptTags = (html.match(/<script[\s>]/gi) || []).length;
+		const inlineHydrationHints = /__NEXT_DATA__|__NUXT__|window\.__INITIAL_STATE__|id="root"|id="__next"|data-reactroot|sveltekit|astro-island/i.test(
+			html,
+		);
+		// Simple heuristic: fewer scripts and no framework hydration hints => likely static.
+		return scriptTags <= 3 && !inlineHydrationHints;
+	} catch {
+		return false;
+	}
+}
+
+async function uploadScreenshotBuffer(buffer) {
+	const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
+	const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
+	const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
+	await file.save(buffer, {
+		metadata: {
+			contentType: "image/png",
+			cacheControl: "public, max-age=3600",
+		},
+	});
+	await file.makePublic();
+	return `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+}
+
+async function smartCaptureScreenshot(url, options = {}) {
+	const {
+		device = "desktop",
+		waitForSelector,
+		timeout = 45000,
+		waitUntil = "domcontentloaded",
+		contentReadyTimeout = 12000,
+		postLoadWaitMs = 1200,
+		blockDistractions = true,
+		fullPage = true,
+		coords,
+		forceMode,
+		useProxy = true,
+	} = options;
+
+	const staticSite =
+		forceMode === "static" ? true : forceMode === "dynamic" ? false : await isLikelyStaticSite(url);
+
+	if (staticSite) {
+		const { buffer, metadata, markdown, dimensions } = await browserPool.withPage((page) =>
+			captureOneScreenshotWithPage(page, {
+				url,
+				device,
+				waitUntil,
+				waitForSelector,
+				timeout,
+				contentReadyTimeout,
+				postLoadWaitMs,
+				fullPage,
+				coords,
+				blockDistractions,
+			}),
+		);
+		const screenshot = await uploadScreenshotBuffer(buffer);
+		return {
+			success: true,
+			mode: "static",
+			url,
+			screenshot,
+			metadata,
+			markdown,
+			dimensions,
+		};
+	}
+
+	const result = await scrapeSingleUrlWithPuppeteer(url, {
+		waitForSelector: waitForSelector || null,
+		timeout,
+		useProxy,
+		takeScreenshot: true,
+		includeSemanticContent: false,
+		includeImages: false,
+		includeLinks: false,
+		extractMetadata: true,
+		aiSummary: false,
+		includeCache: false,
+	});
+
+	if (!result?.success || !result?.screenshot) {
+		// If dynamic path fails, fallback to direct screenshot capture to avoid hard failure.
+		const { buffer, metadata, markdown, dimensions } = await browserPool.withPage((page) =>
+			captureOneScreenshotWithPage(page, {
+				url,
+				device,
+				waitUntil,
+				waitForSelector,
+				timeout,
+				contentReadyTimeout,
+				postLoadWaitMs,
+				fullPage,
+				coords,
+				blockDistractions,
+			}),
+		);
+		const screenshot = await uploadScreenshotBuffer(buffer);
+		return {
+			success: true,
+			mode: "dynamic-fallback",
+			url,
+			screenshot,
+			metadata,
+			markdown,
+			dimensions,
+		};
+	}
+
+	return {
+		success: true,
+		mode: "dynamic",
+		url,
+		screenshot: result.screenshot,
+		metadata: result?.data?.metadata || null,
+		markdown: result?.markdown || null,
+		dimensions: SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop,
+	};
+}
+
+app.post("/screenshot", async (c) => {
+	try {
+		const {
+			url,
+			device = "desktop",
+			waitForSelector,
+			timeout = 45000,
+			waitUntil = "domcontentloaded",
+			contentReadyTimeout = 12000,
+			postLoadWaitMs = 1200,
+			blockDistractions = true,
+			fullPage = true,
+			coords,
+			forceMode,
+			useProxy = true,
+		} = await c.req.json();
+
+		const normalizedUrl = normalizeWebsiteUrl(url);
+		if (!normalizedUrl) {
+			return c.json({ success: false, error: "Invalid URL format" }, 400);
+		}
+
+		const result = await smartCaptureScreenshot(normalizedUrl, {
+			device,
+			waitForSelector,
+			timeout,
+			waitUntil,
+			contentReadyTimeout,
+			postLoadWaitMs,
+			blockDistractions,
+			fullPage,
+			coords,
+			forceMode,
+			useProxy,
+		});
+
+		return c.json({
+			success: true,
+			...result,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.error("❌ screenshot error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to capture screenshot",
+				details: error?.message || String(error),
+			},
+			500,
+		);
+	}
+});
+
+app.post("/screenshot-multiple", async (c) => {
+	try {
+		const {
+			urls,
+			device = "desktop",
+			waitForSelector,
+			timeout = 45000,
+			waitUntil = "domcontentloaded",
+			contentReadyTimeout = 12000,
+			postLoadWaitMs = 1200,
+			blockDistractions = true,
+			fullPage = true,
+			coords,
+			forceMode,
+			useProxy = true,
+		} = await c.req.json();
+
+		if (!Array.isArray(urls) || urls.length === 0) {
+			return c.json(
+				{ success: false, error: "urls must be a non-empty array" },
+				400,
+			);
+		}
+
+		const MAX_URLS = 50;
+		const normalized = urls
+			.slice(0, MAX_URLS)
+			.map((u) => normalizeWebsiteUrl(u))
+			.filter(Boolean);
+		if (normalized.length === 0) {
+			return c.json({ success: false, error: "No valid URLs" }, 400);
+		}
+
+		const results = await Promise.all(
+			normalized.map((url) =>
+				smartCaptureScreenshot(url, {
+					device,
+					waitForSelector,
+					timeout,
+					waitUntil,
+					contentReadyTimeout,
+					postLoadWaitMs,
+					blockDistractions,
+					fullPage,
+					coords,
+					forceMode,
+					useProxy,
+				}).catch((err) => ({
+					success: false,
+					url,
+					screenshot: null,
+					metadata: null,
+					markdown: null,
+					mode: forceMode || "auto",
+					error: err?.message || "Screenshot failed",
+					dimensions:
+						SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop,
+				})),
+			),
+		);
+
+		return c.json({
+			success: true,
+			results,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.error("❌ screenshot-multiple error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to capture screenshots",
+				details: error?.message || String(error),
+			},
 			500,
 		);
 	}
