@@ -20,6 +20,7 @@ import {
 } from "./lib/repoAst.js";
 import {
 	extractUrlsFromText,
+	collectHttpUrlsFromTasks,
 	scrapeUrlsViaApi,
 	scrapeYoutubeViaApi,
 	scrapeRedditViaApi,
@@ -30,6 +31,9 @@ import {
 	SKILLS,
 	TASK_TYPES,
 	CREDITS,
+	MAX_SOURCE_CHARS_TOTAL_THRESHOLD,
+	MAX_SUMMARY_INPUT_CHARS,
+	MAX_SUMMARY_OUTPUT_CHARS,
 } from "./lib/inkgestAgent.js";
 import { browserAgentRouter } from "./lib/inkgestBrowserAgent.js";
 import { logger } from "hono/logger";
@@ -4014,6 +4018,98 @@ async function openRouterChatMessages(
 	return { content, usage };
 }
 
+/** Caps skill completion tokens (OpenRouter rejects high max_tokens vs account credits). Override via INKGEST_SKILL_MAX_OUTPUT_TOKENS. */
+const INKGEST_SKILL_MAX_OUTPUT_TOKENS = Math.min(
+	8192,
+	Math.max(
+		256,
+		Number.parseInt(process.env.INKGEST_SKILL_MAX_OUTPUT_TOKENS || "4096", 10) ||
+			4096,
+	),
+);
+
+const INKGEST_CONTENT_SKILLS_CONDENSE = new Set([
+	"blog",
+	"article",
+	"newsletter",
+	"substack",
+	"linkedin",
+	"twitter",
+	"landing-page-generator",
+]);
+
+/**
+ * When combined source markdown is large, one cheap condense call shrinks context before blog/newsletter/etc.
+ * Scrapes already use aiSummary when possible; this handles many URLs, long transcripts, or crawl blobs.
+ */
+async function condenseSourcesIfOverBudget(
+	apiKey,
+	taskType,
+	preSources,
+	addTokenUsage,
+	state,
+) {
+	if (!preSources?.length || !INKGEST_CONTENT_SKILLS_CONDENSE.has(taskType)) {
+		return preSources;
+	}
+	const totalMd = preSources.reduce(
+		(n, s) => n + String(s.markdown || "").length,
+		0,
+	);
+	if (totalMd <= MAX_SOURCE_CHARS_TOTAL_THRESHOLD) return preSources;
+
+	const perSlice = Math.floor(
+		MAX_SUMMARY_INPUT_CHARS / Math.max(preSources.length, 1),
+	);
+	const chunks = preSources.map((s, i) => {
+		const md = String(s.markdown || "").slice(0, perSlice);
+		return `--- ${s.url || `Source ${i + 1}`} | ${s.title || ""} ---\n${md}`;
+	});
+	const body = chunks.join("\n\n").slice(0, MAX_SUMMARY_INPUT_CHARS);
+
+	const condenseMaxOut = Math.min(
+		2800,
+		INKGEST_SKILL_MAX_OUTPUT_TOKENS,
+		Math.max(800, Math.ceil(MAX_SUMMARY_OUTPUT_CHARS / 3)),
+	);
+
+	const { content, usage } = await openRouterChatMessages(
+		apiKey,
+		[
+			{
+				role: "system",
+				content: `You merge multiple scraped sources into one factual research brief for a writer creating ${taskType} output.
+Preserve each source URL (markdown headings or a bullet list of links). Keep key facts, quotes, numbers, and image URLs; omit boilerplate and navigation. Do not invent. Markdown only. Stay under ${MAX_SUMMARY_OUTPUT_CHARS} characters.`,
+			},
+			{ role: "user", content: body },
+		],
+		condenseMaxOut,
+		{ temperature: 0.2 },
+	);
+	addTokenUsage(usage);
+	const credit = CREDITS["source-condense"] ?? 0.25;
+	state.creditsDistribution.push({
+		task: "source-condense",
+		label: `Condense sources for ${taskType}`,
+		credits: credit,
+	});
+	state.creditsUsed += credit;
+
+	const condensedMd = String(content || "").slice(0, MAX_SUMMARY_OUTPUT_CHARS);
+	const mergedLinks = preSources
+		.flatMap((s) => s.links || [])
+		.filter(Boolean)
+		.slice(0, 50);
+	return [
+		{
+			url: preSources[0]?.url || "condensed-sources",
+			title: "Condensed source brief",
+			markdown: condensedMd,
+			links: mergedLinks,
+		},
+	];
+}
+
 const openRouterKey = process.env.OPENROUTER_API_KEY;
 
 app.post("/inkgest-agent", async (c) => {
@@ -4046,6 +4142,22 @@ app.post("/inkgest-agent", async (c) => {
 			return c.json({ error: "Prompt or executeTasks required" }, 400);
 		}
 
+		const encoder = new TextEncoder();
+		const send = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+
+		const stream = new ReadableStream({
+			start(controller) {
+				controller.enqueue(encoder.encode(": stream-open\n\n"));
+				void (async () => {
+					let state = null;
+					let creditsUsed = 0;
+					const creditsDistribution = [];
+					const tokenUsage = {
+						prompt_tokens: 0,
+						completion_tokens: 0,
+						total_tokens: 0,
+					};
+					try {
 		const extractedUrls = hasExecuteTasks
 			? [
 					...new Set(
@@ -4060,10 +4172,10 @@ app.post("/inkgest-agent", async (c) => {
 				]
 			: extractUrlsFromText(userPrompt);
 
-		const urlsToScrape = extractedUrls.slice(0, 10);
-		const redditUrls = urlsToScrape.filter(isRedditUrl);
-		const youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
-		const regularUrls = urlsToScrape.filter(
+		let urlsToScrape = extractedUrls.slice(0, 10);
+		let redditUrls = urlsToScrape.filter(isRedditUrl);
+		let youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
+		let regularUrls = urlsToScrape.filter(
 			(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
 		);
 		const apiBase = process.env.API_BASE_URL || new URL(c.req.url).origin;
@@ -4077,14 +4189,6 @@ app.post("/inkgest-agent", async (c) => {
 		let scrapeErrors = [];
 		let parsed = {};
 		let suggestedTasks = [];
-
-		const creditsDistribution = [];
-		let creditsUsed = 0;
-		const tokenUsage = {
-			prompt_tokens: 0,
-			completion_tokens: 0,
-			total_tokens: 0,
-		};
 
 		function addTokenUsage(usage) {
 			if (usage && typeof usage === "object") {
@@ -4163,19 +4267,8 @@ app.post("/inkgest-agent", async (c) => {
 				};
 			}
 
-			const [scraped, routerResult] = await Promise.all([
-				urlsToScrape.length > 0 ? scrapeAllUrls() : { sources: [], errors: [] },
-				openRouterChatMessages(openRouterKey, messages),
-			]);
-
-			scrapedSources = scraped.sources || [];
-			if (scraped.errors?.length) {
-				scrapeErrors.push(...scraped.errors);
-				console.error(
-					"[inkgest-agent] Scrape errors (router path):",
-					scraped.errors,
-				);
-			}
+			// Plan phase: LLM decides tasks first (no parallel scrape).
+			const routerResult = await openRouterChatMessages(openRouterKey, messages);
 			const raw = routerResult.content;
 			addTokenUsage(routerResult.usage);
 			creditsDistribution.push({ task: "thinking", credits: CREDITS.thinking });
@@ -4184,26 +4277,33 @@ app.post("/inkgest-agent", async (c) => {
 			try {
 				parsed = parseAgentResponse(raw);
 			} catch (e) {
-				return c.json(
-					{
-						error:
-							"Agent could not parse your request. Try being more specific.",
-						raw: raw.slice(0, 500),
-						creditsUsed,
-						creditsDistribution,
-						tokenUsage,
-					},
-					500,
+				controller.enqueue(
+					encoder.encode(
+						send({
+							type: "end",
+							error:
+								"Agent could not parse your request. Try being more specific.",
+							raw: raw.slice(0, 500),
+							executed: [],
+							references: [],
+							creditsUsed,
+							creditsDistribution,
+							tokenUsage,
+						}),
+					),
 				);
+				controller.close();
+				return;
 			}
 
+			const promptUrls = extractUrlsFromText(userPrompt).slice(0, 10);
 			suggestedTasks = (
 				Array.isArray(parsed.suggestedTasks) ? parsed.suggestedTasks : []
 			).map((t) => {
 				const taskUrls =
 					Array.isArray(t.params?.urls) && t.params.urls.length > 0
 						? t.params.urls.filter((u) => /^https?:\/\/\S+$/i.test(String(u)))
-						: urlsToScrape;
+						: promptUrls;
 				return { ...t, params: { ...t.params, urls: taskUrls } };
 			});
 			if (hasImages) {
@@ -4224,12 +4324,36 @@ app.post("/inkgest-agent", async (c) => {
 					});
 				}
 			}
+
+			// Scrape phase: merge URLs from user message + planned tasks, then fetch in parallel.
+			urlsToScrape = [
+				...new Set([...promptUrls, ...collectHttpUrlsFromTasks(suggestedTasks)]),
+			].slice(0, 10);
+			redditUrls = urlsToScrape.filter(isRedditUrl);
+			youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
+			regularUrls = urlsToScrape.filter(
+				(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
+			);
+
+			const scraped =
+				urlsToScrape.length > 0
+					? await scrapeAllUrls()
+					: { sources: [], errors: [] };
+			scrapedSources = scraped.sources || [];
+			if (scraped.errors?.length) {
+				scrapeErrors.push(...scraped.errors);
+				console.error(
+					"[inkgest-agent] Scrape errors (after plan):",
+					scraped.errors,
+				);
+			}
 		} else {
 			if (urlsToScrape.length > 0) {
 				const [regularScraped, youtubeScraped, redditScraped] =
 					await Promise.all([
 						regularUrls.length > 0
 							? scrapeUrlsViaApi(scrapeBase, regularUrls, {
+									includeImages: true,
 									aiSummary: true,
 								})
 							: { sources: [], errors: [] },
@@ -4477,10 +4601,25 @@ app.post("/inkgest-agent", async (c) => {
 				"scrapeErrors:",
 				errPayload.scrapeErrors,
 			);
-			return c.json(errPayload, 422);
+			controller.enqueue(
+				encoder.encode(
+					send({
+						type: "end",
+						error: errPayload.error,
+						executed: [],
+						references: allSourceReferences,
+						scrapeErrors: errPayload.scrapeErrors,
+						creditsUsed: errPayload.creditsUsed,
+						creditsDistribution: errPayload.creditsDistribution,
+						tokenUsage: errPayload.tokenUsage,
+					}),
+				),
+			);
+			controller.close();
+			return;
 		}
 
-		const state = {
+		state = {
 			tokenUsage: { ...tokenUsage },
 			creditsUsed,
 			creditsDistribution: [...creditsDistribution],
@@ -4705,67 +4844,6 @@ app.post("/inkgest-agent", async (c) => {
 					};
 				}
 
-				if (task.type === "scrape-git") {
-					const gitUrl = params.url || urls[0];
-					if (
-						!gitUrl ||
-						typeof gitUrl !== "string" ||
-						!gitUrl.includes("github.com")
-					) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error:
-								"scrape-git requires a GitHub URL (params.url or params.urls[0])",
-						};
-					}
-					const scrapeGitBody = {
-						url: gitUrl,
-						...(params.includePullRequests && { includePullRequests: true }),
-						...(params.includeIssues && { includeIssues: true }),
-					};
-					const scrapeGitRes = await fetch(`${apiBase}/scrape-git`, {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify(scrapeGitBody),
-						signal: AbortSignal.timeout(90_000),
-					});
-					const scrapeGitData = await scrapeGitRes.json().catch(() => ({}));
-					state.creditsDistribution.push({
-						task: "scrape-git",
-						label: task.label,
-						credits: CREDITS["scrape-git"],
-					});
-					state.creditsUsed += CREDITS["scrape-git"];
-					if (!scrapeGitRes.ok || !scrapeGitData.success) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: scrapeGitData?.error || `HTTP ${scrapeGitRes.status}`,
-						};
-					}
-					const executed = {
-						type: "scrape-git",
-						label: task.label,
-						url: gitUrl,
-						markdown: scrapeGitData.markdown,
-						data: scrapeGitData.data,
-						ast: scrapeGitData.ast ?? null,
-						result: {
-							markdown: scrapeGitData.markdown,
-							data: scrapeGitData.data,
-							ast: scrapeGitData.ast ?? null,
-						},
-					};
-					if (scrapeGitData.stars != null) executed.stars = scrapeGitData.stars;
-					if (scrapeGitData.pullRequests != null)
-						executed.pullRequests = scrapeGitData.pullRequests;
-					if (scrapeGitData.issues != null)
-						executed.issues = scrapeGitData.issues;
-					if (scrapeGitData.links != null) executed.links = scrapeGitData.links;
-					return { taskLabel: task.label, success: true, executed };
-				}
-
 				if (task.type === "image-reading") {
 					const imgs = Array.isArray(params.images) ? params.images : [];
 					if (imgs.length === 0) {
@@ -4886,7 +4964,7 @@ app.post("/inkgest-agent", async (c) => {
 					preSources = [...preSources, ...state.imageReadingSources];
 				}
 
-				// Scrape API uses aiSummary: true — returns condensed summary + links/images, no extra LLM needed
+				// Scrape path uses aiSummary: true where possible; condense step below if sources are still huge.
 
 				// CRITICAL: Do NOT create content when URLs were provided but scrape failed.
 				if (
@@ -4911,16 +4989,29 @@ app.post("/inkgest-agent", async (c) => {
 					};
 				}
 
+				const sourcesForSkill = await condenseSourcesIfOverBudget(
+					openRouterKey,
+					task.type,
+					preSources,
+					addTokenUsage,
+					state,
+				);
+
 				const format = params.format || "substack";
 				const style = params.style || "casual";
 				const system = skill.buildSystemPrompt(
 					format,
 					style,
-					preSources.length > 0,
+					sourcesForSkill.length > 0,
 				);
 				const user = skill.buildUserContent(
 					params.prompt || userPrompt,
-					preSources,
+					sourcesForSkill,
+				);
+
+				const cappedMaxTokens = Math.min(
+					skill.maxTokens,
+					INKGEST_SKILL_MAX_OUTPUT_TOKENS,
 				);
 
 				const { content: rawContent, usage: skillUsage } =
@@ -4930,7 +5021,7 @@ app.post("/inkgest-agent", async (c) => {
 							{ role: "system", content: system },
 							{ role: "user", content: user },
 						],
-						skill.maxTokens,
+						cappedMaxTokens,
 						task.type === "infographics-svg-generator"
 							? { response_format: { type: "json_object" } }
 							: {},
@@ -4994,12 +5085,16 @@ app.post("/inkgest-agent", async (c) => {
 								.replace(/\n?```\s*$/, "")
 								.trim();
 				}
+				const usedCondensedBrief =
+					sourcesForSkill.length === 1 &&
+					sourcesForSkill[0]?.title === "Condensed source brief";
 				const executed = {
 					type: task.type,
 					label: task.label,
 					content,
 					format: task.type === "newsletter" ? format : undefined,
 					sources: preSources.map((s) => ({ url: s.url, title: s.title })),
+					...(usedCondensedBrief ? { condensedSources: true } : {}),
 					params: { urls, prompt: params.prompt, format, style },
 				};
 				// So client can render: landing page HTML, raw content (flat + nested for task.html / task.result?.html)
@@ -5025,11 +5120,6 @@ app.post("/inkgest-agent", async (c) => {
 			}
 		}
 
-		const encoder = new TextEncoder();
-		const send = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
-
-		const stream = new ReadableStream({
-			async start(controller) {
 				controller.enqueue(
 					encoder.encode(
 						send({
@@ -5037,7 +5127,7 @@ app.post("/inkgest-agent", async (c) => {
 							success: true,
 							thinking: parsed.thinking || "",
 							message: hasExecuteTasks
-								? `Running ${validTasks.length} task(s) in parallel.`
+								? `Running ${validTasks.length} task(s) (staged: crawl → images → data fetches → content).`
 								: parsed.message || "Here's what I suggest.",
 							suggestedTasks,
 						}),
@@ -5072,8 +5162,14 @@ app.post("/inkgest-agent", async (c) => {
 				const otherTasks = validTasks.filter(
 					(t) => t.type !== "crawl-url" && t.type !== "image-reading",
 				);
+				const prefetchTaskTypes = new Set(["scrape", "github-trending"]);
+				const prefetchTasks = otherTasks.filter((t) =>
+					prefetchTaskTypes.has(t.type),
+				);
+				const contentTasks = otherTasks.filter(
+					(t) => !prefetchTaskTypes.has(t.type),
+				);
 
-				(async () => {
 					const executed = [];
 					const errors = [];
 
@@ -5142,17 +5238,45 @@ app.post("/inkgest-agent", async (c) => {
 						});
 					}
 
-					// Phase 2: run remaining tasks (blog/article/table will use state.crawlUrlSources and/or state.imageReadingSources)
-					if (otherTasks.length > 0) {
+					// Phase 2a: data-fetch tasks (scrape / github-trending) in parallel
+					if (prefetchTasks.length > 0) {
 						const results = await Promise.all(
-							otherTasks.map((t) => runOneTask(t)),
+							prefetchTasks.map((t) => runOneTask(t)),
 						);
 						results.forEach((r, i) => {
 							controller.enqueue(
 								encoder.encode(
 									send({
 										type: "task",
-										index: validTasks.indexOf(otherTasks[i]),
+										index: validTasks.indexOf(prefetchTasks[i]),
+										...r,
+									}),
+								),
+							);
+							if (r.success && r.executed) executed.push(r.executed);
+							else if (r.error) {
+								console.error(
+									"[inkgest-agent] Task failed:",
+									r.taskLabel,
+									"error:",
+									r.error,
+								);
+								errors.push({ task: r.taskLabel, error: r.error });
+							}
+						});
+					}
+
+					// Phase 2b: content / LLM tasks in parallel (after global scrape + prefetch)
+					if (contentTasks.length > 0) {
+						const results = await Promise.all(
+							contentTasks.map((t) => runOneTask(t)),
+						);
+						results.forEach((r, i) => {
+							controller.enqueue(
+								encoder.encode(
+									send({
+										type: "task",
+										index: validTasks.indexOf(contentTasks[i]),
 										...r,
 									}),
 								),
@@ -5187,6 +5311,32 @@ app.post("/inkgest-agent", async (c) => {
 						),
 					);
 					controller.close();
+					} catch (innerErr) {
+						console.error("[inkgest-agent] stream pipeline", innerErr);
+						try {
+							controller.enqueue(
+								encoder.encode(
+									send({
+										type: "end",
+										error: innerErr?.message || "Agent failed",
+										executed: [],
+										references: state?.references ?? [],
+										creditsUsed: state?.creditsUsed ?? creditsUsed,
+										creditsDistribution:
+											state?.creditsDistribution ?? creditsDistribution,
+										tokenUsage: state?.tokenUsage ?? tokenUsage,
+									}),
+								),
+							);
+						} catch (_) {
+							/* ignore */
+						}
+						try {
+							controller.close();
+						} catch (_) {
+							/* ignore */
+						}
+					}
 				})();
 			},
 		});
@@ -5197,6 +5347,7 @@ app.post("/inkgest-agent", async (c) => {
 				"Content-Type": "text/event-stream",
 				"Cache-Control": "no-cache",
 				Connection: "keep-alive",
+				"X-Accel-Buffering": "no",
 			},
 		});
 	} catch (error) {
