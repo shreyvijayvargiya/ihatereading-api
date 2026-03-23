@@ -957,34 +957,48 @@ class ProxyManager {
 
 	// Health check for all proxies
 	async checkProxyHealth(proxy) {
+		let browser;
 		try {
-			const browser = await chromium.launch({
-				headless: true,
-				args: [
-					"--no-sandbox",
-					"--disable-setuid-sandbox",
-					"--disable-dev-shm-usage",
-					"--disable-gpu",
-				],
-			});
+			const puppeteer = (await import("puppeteer-core")).default;
+			const proxyArg = `--proxy-server=http://${proxy.host}:${proxy.port}`;
+			const SYSTEM_CHROME_ARGS = [
+				"--no-sandbox",
+				"--disable-setuid-sandbox",
+				"--disable-dev-shm-usage",
+				"--disable-gpu",
+				proxyArg,
+			];
+			try {
+				const executablePath = await chromium.executablePath();
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath,
+					args: [...chromium.args, ...SYSTEM_CHROME_ARGS],
+					ignoreDefaultArgs: ["--disable-extensions"],
+				});
+			} catch {
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath:
+						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+					args: SYSTEM_CHROME_ARGS,
+				});
+			}
 
-			const context = await browser.newContext({
-				proxy: {
-					server: `http://${proxy.host}:${proxy.port}`,
+			const page = await browser.newPage();
+			await page.setUserAgent(
+				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			);
+			if (proxy.username && proxy.password) {
+				await page.authenticate({
 					username: proxy.username,
 					password: proxy.password,
-				},
-				userAgent:
-					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-				timeout: 10000,
-			});
-
-			const page = await context.newPage();
+				});
+			}
 			await page.goto("https://httpbin.org/ip", { timeout: 10000 });
-			const content = await page.textContent("body");
+			const content = await page.$eval("body", (el) => el.textContent);
 
 			await page.close();
-			await context.close();
 			await browser.close();
 
 			if (content.includes("origin")) {
@@ -995,6 +1009,7 @@ class ProxyManager {
 				return false;
 			}
 		} catch (error) {
+			if (browser) await browser.close().catch(() => {});
 			this.markProxyFailed(proxy.host);
 			return false;
 		}
@@ -2299,7 +2314,7 @@ Return ONLY the JSON object matching the schema above, with no additional text o
 });
 
 // Google Maps scraping endpoint using headless Chrome
-app.post("/scrap-google-maps", async (c) => {
+app.post("/scrape-google-maps", async (c) => {
 	try {
 		const { queries, singleQuery } = await c.req.json();
 
@@ -2330,105 +2345,207 @@ app.post("/scrap-google-maps", async (c) => {
 
 		let browser;
 		try {
-			// Launch headless Chrome browser with proper configuration
-			browser = await chromium.launch({
-				headless: true,
-				userAgent:
-					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-				args: [
-					"--no-sandbox",
-					"--disable-setuid-sandbox",
-					"--disable-dev-shm-usage",
-					"--disable-accelerated-2d-canvas",
-					"--no-first-run",
-					"--no-zygote",
-					"--single-process",
-					"--disable-gpu",
-				],
-			});
-
-			// Create a shared context for all queries
-			const context = await browser.newContext();
-
-			// Block unnecessary resources to improve performance
-			await context.route("**/*", (route) => {
-				const type = route.request().resourceType();
-				return ["image", "font", "stylesheet"].includes(type)
-					? route.abort()
-					: route.continue();
-			});
+			const puppeteer = (await import("puppeteer-core")).default;
+			const SYSTEM_CHROME_ARGS = [
+				"--no-sandbox",
+				"--disable-setuid-sandbox",
+				"--disable-dev-shm-usage",
+				"--disable-accelerated-2d-canvas",
+				"--no-first-run",
+				"--no-zygote",
+				"--single-process",
+				"--disable-gpu",
+			];
+			try {
+				const executablePath = await chromium.executablePath();
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath,
+					args: [...chromium.args, ...SYSTEM_CHROME_ARGS],
+					ignoreDefaultArgs: ["--disable-extensions"],
+				});
+			} catch {
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath:
+						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+					args: SYSTEM_CHROME_ARGS,
+				});
+			}
 
 			// Process all queries in parallel using Promise.all
 			const results = await Promise.all(
 				queryArray.map(async (query) => {
-					const page = await context.newPage();
+					const page = await browser.newPage();
 					try {
+						await page.setUserAgent(
+							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+						);
+
+						// Block unnecessary resources to improve performance
+						await page.setRequestInterception(true);
+						page.on("request", (req) => {
+							if (["image", "font", "stylesheet"].includes(req.resourceType())) {
+								req.abort();
+							} else {
+								req.continue();
+							}
+						});
+
+						let scrapedUrl = `https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`
 						// Navigate to Google Maps
 						await page.goto(
-							`https://www.google.com/maps/search/${encodeURIComponent(query)}`,
+							scrapedUrl,
 							{
-								waitUntil: "networkidle",
+								waitUntil: "networkidle0",
 								timeout: 30000,
 							},
 						);
 
 						// Wait a bit for the location to be fully loaded
-						await page.waitForTimeout(5000);
+						await new Promise((r) => setTimeout(r, 5000));
 
-						const locationResults = await page.evaluate(() => {
-							// Select the results container with role feed and aria-label with Results for ...
-							const resultsContainer = Array.from(
-								document.querySelectorAll('div[role="feed"]'),
-							).find((el) =>
-								el.getAttribute("aria-label")?.includes("Results for"),
-							);
-
-							if (!resultsContainer) return [];
-
-							// Each child div under feed represents a location card
-							const cards = Array.from(
-								resultsContainer.querySelectorAll("div"),
-							).slice(0, 10);
-
-							return cards.map((card) => {
-								// Name
-								const name =
-									card
-										.querySelector('[class*="fontHeadlineSmall"]')
-										?.textContent?.trim() || "";
-
-								// Rating text (e.g. "Rated 4.5 stars out of 5")
-								const ratingLabel =
-									card
-										.querySelector('[class*="fontBodyMedium"]')
-										?.getAttribute("aria-label") || "";
-								const ratingMatch = ratingLabel.match(/Rated ([0-9.]+) stars?/);
-								const rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
-
-								// Review count text (e.g. "200 reviews")
-								const reviewsText =
-									card
-										.querySelector('[aria-label$="reviews"]')
-										?.getAttribute("aria-label") || "";
-								const reviewsMatch = reviewsText.match(/(\d+,?\d*) reviews/);
-								const reviews = reviewsMatch
-									? reviewsMatch[1].replace(/,/g, "")
-									: null;
-
-								// Google Maps URL link
-								const url =
-									card.querySelector(
-										'a[href*="https://lh3.googleusercontent.com/gps-cs-s"]',
-									)?.href || "";
-
-								// Image URL (if exists)
-								const image = card.querySelector("img[src]")?.src || "";
-
-								return { name, rating, reviews, url, image };
-							});
+						// Scroll the feed to trigger lazy-loaded results
+						await page.evaluate(async () => {
+							const feed = document.querySelector('div[role="feed"]');
+							if (!feed) return;
+							for (let i = 0; i < 5; i++) {
+								feed.scrollBy(0, 1000);
+								await new Promise((r) => setTimeout(r, 1000));
+							}
 						});
 
-						return { query, ...locationResults };
+						// Pass 1: extract just names + URLs from the feed (reliable)
+						const feedEntries = await page.evaluate(() => {
+							const feed = document.querySelector('div[role="feed"]');
+							if (!feed) return [];
+							return Array.from(
+								feed.querySelectorAll('a[href*="/maps/place/"]'),
+							)
+								.slice(0, 10)
+								.map((card) => ({
+									name: card.getAttribute("aria-label")?.trim() || "",
+									url: card.href || "",
+								}))
+								.filter((item) => item.name.length > 0);
+						});
+
+						// Pass 2: visit each place page to get rich details
+						const locationResults = await Promise.all(
+							feedEntries.map(async (entry) => {
+								const detailPage = await page.browser().newPage();
+								try {
+									await detailPage.setRequestInterception(true);
+									detailPage.on("request", (req) => {
+										if (
+											["image", "font", "stylesheet", "media"].includes(
+												req.resourceType(),
+											)
+										)
+											req.abort();
+										else req.continue();
+									});
+									await detailPage.goto(entry.url, {
+										waitUntil: "domcontentloaded",
+										timeout: 15000,
+									});
+									await new Promise((r) => setTimeout(r, 2000));
+
+									const details = await detailPage.evaluate(() => {
+										// Rating
+										let rating = null;
+										for (const el of document.querySelectorAll("[aria-label]")) {
+											const al = el.getAttribute("aria-label");
+											const m =
+												al.match(/([1-5]\.[0-9])\s*stars?/i) ||
+												al.match(/rated\s+([1-5]\.[0-9])/i);
+											if (m) { rating = parseFloat(m[1]); break; }
+										}
+
+										// Reviews
+										let reviews = null;
+										for (const el of document.querySelectorAll("[aria-label]")) {
+											const al = el.getAttribute("aria-label");
+											const m = al.match(/([\d,]+)\s*reviews?/i);
+											if (m) { reviews = m[1].replace(/,/g, ""); break; }
+										}
+
+										// Address
+										const addrEl =
+											document.querySelector(
+												'button[data-item-id="address"]',
+											) ||
+											document.querySelector(
+												'[data-tooltip="Copy address"]',
+											);
+										const address =
+											addrEl
+												?.getAttribute("aria-label")
+												?.replace(/^Address:\s*/i, "")
+												?.trim() || "";
+
+										// Phone
+										const phoneEl =
+											document.querySelector('[data-item-id^="phone"]') ||
+											document.querySelector(
+												'[data-tooltip="Copy phone number"]',
+											);
+										const phone =
+											phoneEl
+												?.getAttribute("aria-label")
+												?.replace(/^Phone:\s*/i, "")
+												?.trim() ||
+											phoneEl?.textContent?.trim() ||
+											"";
+
+										// Website
+										const websiteEl = document.querySelector(
+											'a[data-item-id="authority"]',
+										);
+										const website = websiteEl?.href || "";
+
+										// Category
+										const category =
+											document
+												.querySelector('button[jsaction*="category"]')
+												?.textContent?.trim() || "";
+
+										// Image (og:image or first photo)
+										const ogImage =
+											document
+												.querySelector('meta[property="og:image"]')
+												?.getAttribute("content") || "";
+
+										return {
+											rating,
+											reviews,
+											address,
+											phone,
+											website,
+											category,
+											image: ogImage,
+										};
+									});
+
+									return { ...entry, ...details };
+								} catch {
+									return {
+										...entry,
+										rating: null,
+										reviews: null,
+										address: "",
+										phone: "",
+										website: "",
+										category: "",
+										image: "",
+									};
+								} finally {
+									await detailPage.close().catch(() => {});
+								}
+							}),
+						);
+
+						return { query, results: locationResults };
 					} catch (error) {
 						console.error(`Error processing query "${query}":`, error);
 						return {
@@ -2437,6 +2554,7 @@ app.post("/scrap-google-maps", async (c) => {
 							address: "",
 							coordinates: null,
 							url: "",
+							scrapedUrl: scrapedUrl,
 							details: [],
 							rating: "Rating not available",
 							reviews: "Reviews not available",
@@ -2449,17 +2567,14 @@ app.post("/scrap-google-maps", async (c) => {
 				}),
 			);
 
-			// Close the shared context after all queries are complete
-			await context.close();
-
 			// If single query was provided, return just the location data
 			if (!Array.isArray(queries)) {
 				const result = results[0];
-				if (!result.coordinates) {
+				if (!result.results || result.results.length === 0) {
 					return c.json(
 						{
 							success: false,
-							error: "Location not found or coordinates not available",
+							error: "No results found for the given query",
 							data: result,
 						},
 						404,
@@ -2496,6 +2611,305 @@ app.post("/scrap-google-maps", async (c) => {
 			500,
 		);
 	}
+});
+
+// ─── Google Maps AI Agent ─────────────────────────────────────────────────────
+// Combines /scrape-google-maps + /scrape-multiple + Gemini to answer user queries
+app.post("/google-maps-agent", async (c) => {
+	const { query, prompt } = await c.req.json();
+
+	if (!query) {
+		return c.json({ success: false, error: "query is required" }, 400);
+	}
+
+	const userPrompt = prompt || `Find the best results for: ${query}`;
+
+	// ── Step 1: Scrape Google Maps ─────────────────────────────────────────────
+	let places = [];
+	{
+		let mapsBrowser;
+		try {
+			const puppeteer = (await import("puppeteer-core")).default;
+			const MAPS_ARGS = [
+				"--no-sandbox",
+				"--disable-setuid-sandbox",
+				"--disable-dev-shm-usage",
+				"--disable-accelerated-2d-canvas",
+				"--no-first-run",
+				"--no-zygote",
+				"--single-process",
+				"--disable-gpu",
+			];
+			try {
+				const executablePath = await chromium.executablePath();
+				mapsBrowser = await puppeteer.launch({
+					headless: true,
+					executablePath,
+					args: [...chromium.args, ...MAPS_ARGS],
+					ignoreDefaultArgs: ["--disable-extensions"],
+				});
+			} catch {
+				mapsBrowser = await puppeteer.launch({
+					headless: true,
+					executablePath:
+						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+					args: MAPS_ARGS,
+				});
+			}
+
+			const page = await mapsBrowser.newPage();
+			await page.setUserAgent(
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			);
+			await page.setRequestInterception(true);
+			page.on("request", (req) => {
+				if (["image", "font", "stylesheet"].includes(req.resourceType()))
+					req.abort();
+				else req.continue();
+			});
+
+			await page.goto(
+				`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`,
+				{ waitUntil: "networkidle0", timeout: 30000 },
+			);
+			await new Promise((r) => setTimeout(r, 5000));
+
+			await page.evaluate(async () => {
+				const feed = document.querySelector('div[role="feed"]');
+				if (!feed) return;
+				for (let i = 0; i < 5; i++) {
+					feed.scrollBy(0, 1000);
+					await new Promise((r) => setTimeout(r, 1000));
+				}
+			});
+
+			// Pass 1: extract just names + URLs from the feed (reliable)
+			const feedEntries = await page.evaluate(() => {
+				const feed = document.querySelector('div[role="feed"]');
+				if (!feed) return [];
+				return Array.from(feed.querySelectorAll('a[href*="/maps/place/"]'))
+					.slice(0, 10)
+					.map((card) => ({
+						name: card.getAttribute("aria-label")?.trim() || "",
+						url: card.href || "",
+					}))
+					.filter((item) => item.name.length > 0);
+			});
+
+			// Pass 2: visit each place page for rich details
+			places = await Promise.all(
+				feedEntries.map(async (entry) => {
+					const detailPage = await page.browser().newPage();
+					try {
+						await detailPage.setRequestInterception(true);
+						detailPage.on("request", (req) => {
+							if (
+								["image", "font", "stylesheet", "media"].includes(
+									req.resourceType(),
+								)
+							)
+								req.abort();
+							else req.continue();
+						});
+						await detailPage.goto(entry.url, {
+							waitUntil: "domcontentloaded",
+							timeout: 15000,
+						});
+						await new Promise((r) => setTimeout(r, 2000));
+
+						const details = await detailPage.evaluate(() => {
+							let rating = null;
+							for (const el of document.querySelectorAll("[aria-label]")) {
+								const al = el.getAttribute("aria-label");
+								const m =
+									al.match(/([1-5]\.[0-9])\s*stars?/i) ||
+									al.match(/rated\s+([1-5]\.[0-9])/i);
+								if (m) { rating = parseFloat(m[1]); break; }
+							}
+
+							let reviews = null;
+							for (const el of document.querySelectorAll("[aria-label]")) {
+								const al = el.getAttribute("aria-label");
+								const m = al.match(/([\d,]+)\s*reviews?/i);
+								if (m) { reviews = m[1].replace(/,/g, ""); break; }
+							}
+
+							const addrEl =
+								document.querySelector('button[data-item-id="address"]') ||
+								document.querySelector('[data-tooltip="Copy address"]');
+							const address =
+								addrEl
+									?.getAttribute("aria-label")
+									?.replace(/^Address:\s*/i, "")
+									?.trim() || "";
+
+							const phoneEl =
+								document.querySelector('[data-item-id^="phone"]') ||
+								document.querySelector('[data-tooltip="Copy phone number"]');
+							const phone =
+								phoneEl
+									?.getAttribute("aria-label")
+									?.replace(/^Phone:\s*/i, "")
+									?.trim() ||
+								phoneEl?.textContent?.trim() ||
+								"";
+
+							const websiteEl = document.querySelector(
+								'a[data-item-id="authority"]',
+							);
+							const website = websiteEl?.href || "";
+
+							const category =
+								document
+									.querySelector('button[jsaction*="category"]')
+									?.textContent?.trim() || "";
+
+							const image =
+								document
+									.querySelector('meta[property="og:image"]')
+									?.getAttribute("content") || "";
+
+							return { rating, reviews, address, phone, website, category, image };
+						});
+
+						return { ...entry, ...details };
+					} catch {
+						return {
+							...entry,
+							rating: null,
+							reviews: null,
+							address: "",
+							phone: "",
+							website: "",
+							category: "",
+							image: "",
+						};
+					} finally {
+						await detailPage.close().catch(() => {});
+					}
+				}),
+			);
+
+			await page.close();
+		} catch (err) {
+			console.error("Maps agent — scraping error:", err);
+		} finally {
+			if (mapsBrowser) await mapsBrowser.close().catch(() => {});
+		}
+	}
+
+	if (places.length === 0) {
+		return c.json(
+			{
+				success: false,
+				error: "No Google Maps results found for the given query",
+				query,
+			},
+			404,
+		);
+	}
+
+	// ── Step 2: Build LLM context from the already-enriched places ─────────────
+	const topUrls = places
+		.slice(0, 5)
+		.map((p) => p.url)
+		.filter((u) => u.includes("/maps/place/"));
+
+	const scrapedPages = await Promise.allSettled(
+		topUrls.map((url) =>
+			scrapeSingleUrlWithPuppeteer(url, {
+				includeSemanticContent: false,
+				includeImages: false,
+				includeLinks: false,
+				extractMetadata: false,
+				timeout: 20000,
+			}),
+		),
+	);
+
+	// ── Step 3: Build LLM context ──────────────────────────────────────────────
+	const mapsContext = places
+		.map((p, i) =>
+		[
+			`### ${i + 1}. ${p.name}`,
+			`- Rating: ${p.rating != null ? `${p.rating} ⭐` : "N/A"}`,
+			`- Reviews: ${p.reviews ?? "N/A"}`,
+			`- Category: ${p.category || "N/A"}`,
+			`- Address: ${p.address || "N/A"}`,
+			`- Phone: ${p.phone || "N/A"}`,
+			`- Website: ${p.website || "N/A"}`,
+			`- Maps URL: ${p.url}`,
+		].join("\n"),
+	)
+	.join("\n\n");
+
+	const scrapedContext = scrapedPages
+		.map((r, i) => {
+			if (r.status !== "fulfilled" || !r.value?.markdown) return null;
+			return `#### ${places[i]?.name}\n${r.value.markdown.slice(0, 2000)}`;
+		})
+		.filter(Boolean)
+		.join("\n\n---\n\n");
+
+	// ── Step 4: Gemini LLM call ────────────────────────────────────────────────
+	const llmPrompt = [
+		`You are a helpful local search assistant. Answer the user's question using the Google Maps data and scraped page details provided below.`,
+		``,
+		`User query: "${userPrompt}"`,
+		`Search term used on Google Maps: "${query}"`,
+		``,
+		`## Google Maps Results (${places.length} places found):`,
+		mapsContext,
+		scrapedContext
+			? `\n## Additional Scraped Details from Place Pages:\n${scrapedContext}`
+			: "",
+		``,
+		`Respond with ONLY a valid JSON object (no markdown fences) in this exact shape:`,
+		`{`,
+		`  "answer": "A direct, helpful answer to the user query",`,
+		`  "topPicks": [`,
+		`    { "name": "", "rating": null, "reviews": null, "address": "", "url": "", "whyRecommended": "" }`,
+		`  ],`,
+		`  "insights": "Key tips or observations about these results",`,
+		`  "totalFound": ${places.length}`,
+		`}`,
+	].join("\n");
+
+	const aiResponse = await genai.models.generateContent({
+		model: "gemini-2.0-flash",
+		contents: [{ role: "user", parts: [{ text: llmPrompt }] }],
+	});
+
+	const rawText =
+		aiResponse?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+	let parsed;
+	try {
+		let jsonText = rawText.trim();
+		const fenceMatch = jsonText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+		if (fenceMatch) jsonText = fenceMatch[1].trim();
+		const firstBrace = jsonText.indexOf("{");
+		const lastBrace = jsonText.lastIndexOf("}");
+		if (firstBrace !== -1 && lastBrace > firstBrace)
+			jsonText = jsonText.slice(firstBrace, lastBrace + 1);
+		parsed = JSON.parse(jsonText);
+	} catch {
+		parsed = {
+			answer: rawText,
+			topPicks: places.slice(0, 5).map((p) => ({ ...p, whyRecommended: "" })),
+			insights: null,
+			totalFound: places.length,
+		};
+	}
+
+	return c.json({
+		success: true,
+		query,
+		prompt: userPrompt,
+		...parsed,
+		allPlaces: places,
+		timestamp: new Date().toISOString(),
+	});
 });
 
 // Enhanced Bing Search endpoint using Axios
