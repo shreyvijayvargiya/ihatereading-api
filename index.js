@@ -2415,7 +2415,8 @@ app.post("/scrape-google-maps", async (c) => {
 							}
 						});
 
-						// Pass 1: extract just names + URLs from the feed (reliable)
+						// Pass 1: extract names, URLs and coordinates from the feed
+						// Coordinates are encoded in the URL: !3d{lat}!4d{lng}
 						const feedEntries = await page.evaluate(() => {
 							const feed = document.querySelector('div[role="feed"]');
 							if (!feed) return [];
@@ -2423,10 +2424,22 @@ app.post("/scrape-google-maps", async (c) => {
 								feed.querySelectorAll('a[href*="/maps/place/"]'),
 							)
 								.slice(0, 10)
-								.map((card) => ({
-									name: card.getAttribute("aria-label")?.trim() || "",
-									url: card.href || "",
-								}))
+								.map((card) => {
+									const url = card.href || "";
+									const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
+									const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
+									return {
+										name: card.getAttribute("aria-label")?.trim() || "",
+										url,
+										coordinates:
+											latMatch && lngMatch
+												? {
+														lat: parseFloat(latMatch[1]),
+														lng: parseFloat(lngMatch[1]),
+												  }
+												: null,
+									};
+								})
 								.filter((item) => item.name.length > 0);
 						});
 
@@ -2683,16 +2696,29 @@ app.post("/google-maps-agent", async (c) => {
 				}
 			});
 
-			// Pass 1: extract just names + URLs from the feed (reliable)
+			// Pass 1: extract names, URLs and coordinates from the feed
+			// Coordinates are encoded in the URL: !3d{lat}!4d{lng}
 			const feedEntries = await page.evaluate(() => {
 				const feed = document.querySelector('div[role="feed"]');
 				if (!feed) return [];
 				return Array.from(feed.querySelectorAll('a[href*="/maps/place/"]'))
 					.slice(0, 10)
-					.map((card) => ({
-						name: card.getAttribute("aria-label")?.trim() || "",
-						url: card.href || "",
-					}))
+					.map((card) => {
+						const url = card.href || "";
+						const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
+						const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
+						return {
+							name: card.getAttribute("aria-label")?.trim() || "",
+							url,
+							coordinates:
+								latMatch && lngMatch
+									? {
+											lat: parseFloat(latMatch[1]),
+											lng: parseFloat(lngMatch[1]),
+									  }
+									: null,
+						};
+					})
 					.filter((item) => item.name.length > 0);
 			});
 
@@ -2838,6 +2864,7 @@ app.post("/google-maps-agent", async (c) => {
 			`- Address: ${p.address || "N/A"}`,
 			`- Phone: ${p.phone || "N/A"}`,
 			`- Website: ${p.website || "N/A"}`,
+			`- Coordinates: ${p.coordinates ? `${p.coordinates.lat}, ${p.coordinates.lng}` : "N/A"}`,
 			`- Maps URL: ${p.url}`,
 		].join("\n"),
 	)
