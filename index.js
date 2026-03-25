@@ -6279,29 +6279,67 @@ app.post("/inkgest-agent", async (c) => {
 							return;
 						}
 
-						// Deduplicate: skip crawl-url when the target URL was already scraped
-						// in the global scrape phase. Seed crawlUrlSources from the existing
-						// scraped data so useCrawlResult content tasks (blog, article, etc.)
-						// still receive source material without a redundant full-site crawl.
-						const deduplicatedTasks = validTasks.filter((t) => {
-							if (t.type !== "crawl-url") return true;
-							const targetUrl =
-								t.params?.url ||
-								(Array.isArray(t.params?.urls) ? t.params.urls[0] : null);
-							if (targetUrl && sourceByUrl[targetUrl]) {
-								const existing = sourceByUrl[targetUrl];
-								if (
-									existing &&
-									!state.crawlUrlSources.some((s) => s.url === existing.url)
-								) {
-									state.crawlUrlSources.push(existing);
-								}
-								console.log(
-									"[inkgest-agent] Skipping redundant crawl-url (already scraped):",
-									targetUrl,
-								);
-								return false;
+						// Normalise a URL for dedup comparison: lowercase hostname, strip trailing slash.
+						const normalizeUrl = (u) => {
+							if (!u || typeof u !== "string") return u;
+							try {
+								const parsed = new URL(u);
+								parsed.hostname = parsed.hostname.toLowerCase();
+								if (parsed.pathname === "/") parsed.pathname = "";
+								return parsed.origin + parsed.pathname + parsed.search + parsed.hash;
+							} catch {
+								return u.replace(/\/+$/, "");
 							}
+						};
+
+						// Build a normalised lookup so URL variants (trailing slash, case) still match.
+						const sourceByUrlNorm = Object.fromEntries(
+							Object.entries(sourceByUrl).map(([k, v]) => [normalizeUrl(k), v]),
+						);
+
+						// Deduplicate task list:
+						// 1. Skip crawl-url when its target URL was already scraped globally —
+						//    seed crawlUrlSources so useCrawlResult content tasks still get data.
+						// 2. Skip redundant explicit scrape tasks whose ALL URLs are already in
+						//    sourceByUrl — the content task will use the pre-scraped data directly.
+						const deduplicatedTasks = validTasks.filter((t) => {
+							if (t.type === "crawl-url") {
+								const targetUrl =
+									t.params?.url ||
+									(Array.isArray(t.params?.urls) ? t.params.urls[0] : null);
+								const existing = targetUrl
+									? sourceByUrlNorm[normalizeUrl(targetUrl)]
+									: null;
+								if (existing) {
+									if (
+										!state.crawlUrlSources.some((s) => s.url === existing.url)
+									) {
+										state.crawlUrlSources.push(existing);
+									}
+									console.log(
+										"[inkgest-agent] Skipping redundant crawl-url (already scraped):",
+										targetUrl,
+									);
+									return false;
+								}
+							}
+
+							if (t.type === "scrape") {
+								const taskUrls = (
+									Array.isArray(t.params?.urls) ? t.params.urls : []
+								).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
+								if (
+									taskUrls.length > 0 &&
+									taskUrls.every((u) => sourceByUrlNorm[normalizeUrl(u)])
+								) {
+									console.log(
+										"[inkgest-agent] Skipping redundant scrape task (all URLs already scraped):",
+										taskUrls,
+									);
+									return false;
+								}
+							}
+
 							return true;
 						});
 
