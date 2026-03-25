@@ -2313,6 +2313,490 @@ Return ONLY the JSON object matching the schema above, with no additional text o
 	}
 });
 
+// ─── Google Maps helpers ──────────────────────────────────────────────────────
+
+async function callOpenRouter(
+	messages,
+	{
+		model = "google/gemini-2.0-flash-001",
+		jsonMode = false,
+		maxTokens = null,
+	} = {},
+) {
+	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+			"Content-Type": "application/json",
+			"HTTP-Referer": "https://ihatereading.in",
+			"X-Title": "IHateReading Maps Agent",
+		},
+		body: JSON.stringify({
+			model,
+			messages,
+			...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+			...(maxTokens != null ? { max_tokens: maxTokens } : {}),
+		}),
+	});
+	const data = await res.json();
+	// Surface API-level errors immediately instead of silently returning empty text
+	if (!res.ok || data.error) {
+		const msg = data.error?.message || data.error || `HTTP ${res.status}`;
+		throw new Error(`OpenRouter error: ${msg}`);
+	}
+	const text = data.choices?.[0]?.message?.content ?? "";
+	if (!text) {
+		const reason = data.choices?.[0]?.finish_reason || "unknown";
+		throw new Error(
+			`OpenRouter returned empty content (finish_reason: ${reason})`,
+		);
+	}
+	return {
+		text,
+		usage: {
+			promptTokens: data.usage?.prompt_tokens ?? 0,
+			completionTokens: data.usage?.completion_tokens ?? 0,
+			totalTokens: data.usage?.total_tokens ?? 0,
+		},
+	};
+}
+
+function parseJsonFromLLM(text) {
+	let s = text.trim();
+	const fence = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+	if (fence) s = fence[1].trim();
+	const first = s.indexOf("{");
+	const last = s.lastIndexOf("}");
+	if (first !== -1 && last > first) s = s.slice(first, last + 1);
+	return JSON.parse(s);
+}
+
+/**
+ * Scrapes a single Google Maps query using an existing puppeteer browser instance.
+ * Returns an array of enriched place objects.
+ */
+async function runMapsQuery(browser, query) {
+	const page = await browser.newPage();
+	try {
+		await page.setUserAgent(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		);
+		await page.setRequestInterception(true);
+		page.on("request", (req) => {
+			if (["image", "font", "stylesheet", "media"].includes(req.resourceType()))
+				req.abort();
+			else req.continue();
+		});
+
+		await page.goto(
+			`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`,
+			{ waitUntil: "networkidle0", timeout: 30000 },
+		);
+		await new Promise((r) => setTimeout(r, 5000));
+
+		await page.evaluate(async () => {
+			const feed = document.querySelector('div[role="feed"]');
+			if (!feed) return;
+			for (let i = 0; i < 5; i++) {
+				feed.scrollBy(0, 1000);
+				await new Promise((r) => setTimeout(r, 1000));
+			}
+		});
+
+		// Pass 1: names + URLs + coordinates (from URL params)
+		const feedEntries = await page.evaluate(() => {
+			const feed = document.querySelector('div[role="feed"]');
+			if (!feed) return [];
+			return Array.from(feed.querySelectorAll('a[href*="/maps/place/"]'))
+				.slice(0, 10)
+				.map((card) => {
+					const url = card.href || "";
+					const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
+					const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
+					return {
+						name: card.getAttribute("aria-label")?.trim() || "",
+						url,
+						coordinates:
+							latMatch && lngMatch
+								? { lat: parseFloat(latMatch[1]), lng: parseFloat(lngMatch[1]) }
+								: null,
+					};
+				})
+				.filter((item) => item.name.length > 0);
+		});
+
+		// Pass 2: visit each place page for rating, reviews, address, phone, website
+		const places = await Promise.all(
+			feedEntries.map(async (entry) => {
+				const detailPage = await browser.newPage();
+				try {
+					await detailPage.setRequestInterception(true);
+					detailPage.on("request", (req) => {
+						if (
+							["image", "font", "stylesheet", "media"].includes(
+								req.resourceType(),
+							)
+						)
+							req.abort();
+						else req.continue();
+					});
+					await detailPage.goto(entry.url, {
+						waitUntil: "domcontentloaded",
+						timeout: 15000,
+					});
+					await new Promise((r) => setTimeout(r, 2000));
+
+					const details = await detailPage.evaluate(() => {
+						let rating = null;
+						for (const el of document.querySelectorAll("[aria-label]")) {
+							const al = el.getAttribute("aria-label");
+							const m =
+								al.match(/([1-5]\.[0-9])\s*stars?/i) ||
+								al.match(/rated\s+([1-5]\.[0-9])/i);
+							if (m) {
+								rating = parseFloat(m[1]);
+								break;
+							}
+						}
+						let reviews = null;
+						for (const el of document.querySelectorAll("[aria-label]")) {
+							const al = el.getAttribute("aria-label");
+							const m = al.match(/([\d,]+)\s*reviews?/i);
+							if (m) {
+								reviews = m[1].replace(/,/g, "");
+								break;
+							}
+						}
+						const addrEl =
+							document.querySelector('button[data-item-id="address"]') ||
+							document.querySelector('[data-tooltip="Copy address"]');
+						const address =
+							addrEl
+								?.getAttribute("aria-label")
+								?.replace(/^Address:\s*/i, "")
+								?.trim() || "";
+						const phoneEl =
+							document.querySelector('[data-item-id^="phone"]') ||
+							document.querySelector('[data-tooltip="Copy phone number"]');
+						const phone =
+							phoneEl
+								?.getAttribute("aria-label")
+								?.replace(/^Phone:\s*/i, "")
+								?.trim() ||
+							phoneEl?.textContent?.trim() ||
+							"";
+						const websiteEl = document.querySelector(
+							'a[data-item-id="authority"]',
+						);
+						const rawWebsite = websiteEl?.href || "";
+						let website = rawWebsite;
+						try {
+							const u = new URL(rawWebsite);
+							const q = u.searchParams.get("q");
+							if (q) website = q;
+						} catch {
+							/* keep rawWebsite */
+						}
+						const category =
+							document
+								.querySelector('button[jsaction*="category"]')
+								?.textContent?.trim() || "";
+						const image =
+							document
+								.querySelector('meta[property="og:image"]')
+								?.getAttribute("content") || "";
+						return {
+							rating,
+							reviews,
+							address,
+							phone,
+							website,
+							category,
+							image,
+						};
+					});
+
+					return { ...entry, ...details };
+				} catch {
+					return {
+						...entry,
+						rating: null,
+						reviews: null,
+						address: "",
+						phone: "",
+						website: "",
+						category: "",
+						image: "",
+					};
+				} finally {
+					await detailPage.close().catch(() => {});
+				}
+			}),
+		);
+
+		return places;
+	} finally {
+		await page.close().catch(() => {});
+	}
+}
+
+/**
+ * Start a Lightpanda process and connect Puppeteer to it via CDP WebSocket.
+ * Returns { browser, proc } — caller must disconnect browser and kill proc when done.
+ */
+async function startLightpanda(port = 9222) {
+	const { lightpanda } = await import("@lightpanda/browser");
+	const puppeteer = (await import("puppeteer-core")).default;
+	const proc = await lightpanda.serve({ host: "127.0.0.1", port });
+	// Give Lightpanda a moment to bind the port
+	await new Promise((r) => setTimeout(r, 500));
+	const browser = await puppeteer.connect({
+		browserWSEndpoint: `ws://127.0.0.1:${port}`,
+	});
+	return { browser, proc };
+}
+
+function stopLightpanda({ browser, proc }) {
+	try {
+		browser?.disconnect();
+	} catch {
+		/* ignore */
+	}
+	try {
+		proc?.stdout?.destroy();
+	} catch {
+		/* ignore */
+	}
+	try {
+		proc?.stderr?.destroy();
+	} catch {
+		/* ignore */
+	}
+	try {
+		proc?.kill();
+	} catch {
+		/* ignore */
+	}
+}
+
+/**
+ * Helper: open a fresh Lightpanda context+page, navigate to url, run fn(page),
+ * then fully tear down the context before returning.
+ * Lightpanda rules: ONE context at a time, no re-navigation of a live page.
+ * Pattern mirrors lightpanda-browser.js: createBrowserContext → context.newPage
+ * → navigate → evaluate → page.close → context.close.
+ */
+async function withLightpandaPage(browser, url, fn) {
+	const context = await browser.createBrowserContext();
+	const page = await context.newPage();
+	try {
+		await page
+			.setUserAgent(
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			)
+			.catch(() => {});
+		await page.goto(url, { waitUntil: "load", timeout: 30000 });
+		await new Promise((r) => setTimeout(r, 3000));
+		return await fn(page);
+	} finally {
+		await page.close().catch(() => {});
+		await context.close().catch(() => {});
+	}
+}
+
+/**
+ * Same scraping logic as runMapsQuery but tailored for Lightpanda.
+ * Lightpanda constraints:
+ *   - ONE context allowed at a time (no concurrent contexts)
+ *   - Re-navigating a page causes "Navigating frame was detached"
+ * Solution: create a fresh context for every navigation step; close it fully
+ * before opening the next one (sequential, never concurrent).
+ */
+async function runMapsQueryLightpanda(browser, query) {
+	// ── Step 1: Search results page ──────────────────────────────────────────
+	const feedEntries = await withLightpandaPage(
+		browser,
+		`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`,
+		async (page) => {
+			// Scroll feed to trigger lazy-loaded cards
+			await page
+				.evaluate(async () => {
+					for (let i = 0; i < 5; i++) {
+						try {
+							const feed = document.querySelector('div[role="feed"]');
+							if (feed) {
+								feed.scrollTop = (feed.scrollTop || 0) + 1000;
+							} else {
+								document.documentElement.scrollTop += 1000;
+							}
+						} catch {
+							/* ignore */
+						}
+						await new Promise((r) => setTimeout(r, 1000));
+					}
+				})
+				.catch(() => {});
+
+			await new Promise((r) => setTimeout(r, 2000));
+
+			return page
+				.evaluate(() => {
+					try {
+						const feed = document.querySelector('div[role="feed"]');
+						const root = feed || document;
+						return Array.from(root.querySelectorAll('a[href*="/maps/place/"]'))
+							.slice(0, 10)
+							.map((card) => {
+								const url = card.href || card.getAttribute("href") || "";
+								const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
+								const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
+								const name =
+									(card.getAttribute("aria-label") || "").trim() ||
+									(card.textContent || "").trim().split("\n")[0] ||
+									"";
+								return {
+									name,
+									url,
+									coordinates:
+										latMatch && lngMatch
+											? {
+													lat: parseFloat(latMatch[1]),
+													lng: parseFloat(lngMatch[1]),
+												}
+											: null,
+								};
+							})
+							.filter((e) => e.name.length > 0 && e.url.length > 0);
+					} catch {
+						return [];
+					}
+				})
+				.catch(() => []);
+		},
+	);
+
+	// ── Step 2: Visit each place page in its own fresh context ───────────────
+	const places = [];
+	for (const entry of feedEntries) {
+		try {
+			const details = await withLightpandaPage(
+				browser,
+				entry.url,
+				async (page) => {
+					return page
+						.evaluate(() => {
+							try {
+								let rating = null;
+								for (const el of document.querySelectorAll("[aria-label]")) {
+									try {
+										const al = el.getAttribute("aria-label") || "";
+										const m =
+											al.match(/([1-5]\.[0-9])\s*stars?/i) ||
+											al.match(/rated\s+([1-5]\.[0-9])/i);
+										if (m) {
+											rating = parseFloat(m[1]);
+											break;
+										}
+									} catch {
+										/* skip */
+									}
+								}
+								let reviews = null;
+								for (const el of document.querySelectorAll("[aria-label]")) {
+									try {
+										const al = el.getAttribute("aria-label") || "";
+										const m = al.match(/([\d,]+)\s*reviews?/i);
+										if (m) {
+											reviews = m[1].replace(/,/g, "");
+											break;
+										}
+									} catch {
+										/* skip */
+									}
+								}
+								const addrEl =
+									document.querySelector('button[data-item-id="address"]') ||
+									document.querySelector('[data-tooltip="Copy address"]');
+								const address = (addrEl?.getAttribute("aria-label") || "")
+									.replace(/^Address:\s*/i, "")
+									.trim();
+								const phoneEl =
+									document.querySelector('[data-item-id^="phone"]') ||
+									document.querySelector('[data-tooltip="Copy phone number"]');
+								const phone =
+									(phoneEl?.getAttribute("aria-label") || "")
+										.replace(/^Phone:\s*/i, "")
+										.trim() || (phoneEl?.textContent || "").trim();
+								const websiteEl = document.querySelector(
+									'a[data-item-id="authority"]',
+								);
+								const rawWebsite = websiteEl?.href || "";
+								let website = rawWebsite;
+								try {
+									const u = new URL(rawWebsite);
+									const q = u.searchParams.get("q");
+									if (q) website = q;
+								} catch {
+									/* keep rawWebsite */
+								}
+								const category = (
+									document.querySelector('button[jsaction*="category"]')
+										?.textContent || ""
+								).trim();
+								const image =
+									document
+										.querySelector('meta[property="og:image"]')
+										?.getAttribute("content") || "";
+								return {
+									rating,
+									reviews,
+									address,
+									phone,
+									website,
+									category,
+									image,
+								};
+							} catch {
+								return {
+									rating: null,
+									reviews: null,
+									address: "",
+									phone: "",
+									website: "",
+									category: "",
+									image: "",
+								};
+							}
+						})
+						.catch(() => ({
+							rating: null,
+							reviews: null,
+							address: "",
+							phone: "",
+							website: "",
+							category: "",
+							image: "",
+						}));
+				},
+			);
+			places.push({ ...entry, ...details });
+		} catch {
+			places.push({
+				...entry,
+				rating: null,
+				reviews: null,
+				address: "",
+				phone: "",
+				website: "",
+				category: "",
+				image: "",
+			});
+		}
+	}
+
+	return places;
+}
+
 // Google Maps scraping endpoint using headless Chrome
 app.post("/scrape-google-maps", async (c) => {
 	try {
@@ -2346,7 +2830,7 @@ app.post("/scrape-google-maps", async (c) => {
 		let browser;
 		try {
 			const puppeteer = (await import("puppeteer-core")).default;
-			const SYSTEM_CHROME_ARGS = [
+			const ARGS = [
 				"--no-sandbox",
 				"--disable-setuid-sandbox",
 				"--disable-dev-shm-usage",
@@ -2361,7 +2845,7 @@ app.post("/scrape-google-maps", async (c) => {
 				browser = await puppeteer.launch({
 					headless: true,
 					executablePath,
-					args: [...chromium.args, ...SYSTEM_CHROME_ARGS],
+					args: [...chromium.args, ...ARGS],
 					ignoreDefaultArgs: ["--disable-extensions"],
 				});
 			} catch {
@@ -2369,218 +2853,22 @@ app.post("/scrape-google-maps", async (c) => {
 					headless: true,
 					executablePath:
 						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-					args: SYSTEM_CHROME_ARGS,
+					args: ARGS,
 				});
 			}
 
-			// Process all queries in parallel using Promise.all
 			const results = await Promise.all(
 				queryArray.map(async (query) => {
-					const page = await browser.newPage();
 					try {
-						await page.setUserAgent(
-							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-						);
-
-						// Block unnecessary resources to improve performance
-						await page.setRequestInterception(true);
-						page.on("request", (req) => {
-							if (["image", "font", "stylesheet"].includes(req.resourceType())) {
-								req.abort();
-							} else {
-								req.continue();
-							}
-						});
-
-						let scrapedUrl = `https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`
-						// Navigate to Google Maps
-						await page.goto(
-							scrapedUrl,
-							{
-								waitUntil: "networkidle0",
-								timeout: 30000,
-							},
-						);
-
-						// Wait a bit for the location to be fully loaded
-						await new Promise((r) => setTimeout(r, 5000));
-
-						// Scroll the feed to trigger lazy-loaded results
-						await page.evaluate(async () => {
-							const feed = document.querySelector('div[role="feed"]');
-							if (!feed) return;
-							for (let i = 0; i < 5; i++) {
-								feed.scrollBy(0, 1000);
-								await new Promise((r) => setTimeout(r, 1000));
-							}
-						});
-
-						// Pass 1: extract names, URLs and coordinates from the feed
-						// Coordinates are encoded in the URL: !3d{lat}!4d{lng}
-						const feedEntries = await page.evaluate(() => {
-							const feed = document.querySelector('div[role="feed"]');
-							if (!feed) return [];
-							return Array.from(
-								feed.querySelectorAll('a[href*="/maps/place/"]'),
-							)
-								.slice(0, 10)
-								.map((card) => {
-									const url = card.href || "";
-									const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
-									const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
-									return {
-										name: card.getAttribute("aria-label")?.trim() || "",
-										url,
-										coordinates:
-											latMatch && lngMatch
-												? {
-														lat: parseFloat(latMatch[1]),
-														lng: parseFloat(lngMatch[1]),
-												  }
-												: null,
-									};
-								})
-								.filter((item) => item.name.length > 0);
-						});
-
-						// Pass 2: visit each place page to get rich details
-						const locationResults = await Promise.all(
-							feedEntries.map(async (entry) => {
-								const detailPage = await page.browser().newPage();
-								try {
-									await detailPage.setRequestInterception(true);
-									detailPage.on("request", (req) => {
-										if (
-											["image", "font", "stylesheet", "media"].includes(
-												req.resourceType(),
-											)
-										)
-											req.abort();
-										else req.continue();
-									});
-									await detailPage.goto(entry.url, {
-										waitUntil: "domcontentloaded",
-										timeout: 15000,
-									});
-									await new Promise((r) => setTimeout(r, 2000));
-
-									const details = await detailPage.evaluate(() => {
-										// Rating
-										let rating = null;
-										for (const el of document.querySelectorAll("[aria-label]")) {
-											const al = el.getAttribute("aria-label");
-											const m =
-												al.match(/([1-5]\.[0-9])\s*stars?/i) ||
-												al.match(/rated\s+([1-5]\.[0-9])/i);
-											if (m) { rating = parseFloat(m[1]); break; }
-										}
-
-										// Reviews
-										let reviews = null;
-										for (const el of document.querySelectorAll("[aria-label]")) {
-											const al = el.getAttribute("aria-label");
-											const m = al.match(/([\d,]+)\s*reviews?/i);
-											if (m) { reviews = m[1].replace(/,/g, ""); break; }
-										}
-
-										// Address
-										const addrEl =
-											document.querySelector(
-												'button[data-item-id="address"]',
-											) ||
-											document.querySelector(
-												'[data-tooltip="Copy address"]',
-											);
-										const address =
-											addrEl
-												?.getAttribute("aria-label")
-												?.replace(/^Address:\s*/i, "")
-												?.trim() || "";
-
-										// Phone
-										const phoneEl =
-											document.querySelector('[data-item-id^="phone"]') ||
-											document.querySelector(
-												'[data-tooltip="Copy phone number"]',
-											);
-										const phone =
-											phoneEl
-												?.getAttribute("aria-label")
-												?.replace(/^Phone:\s*/i, "")
-												?.trim() ||
-											phoneEl?.textContent?.trim() ||
-											"";
-
-										// Website
-										const websiteEl = document.querySelector(
-											'a[data-item-id="authority"]',
-										);
-										const website = websiteEl?.href || "";
-
-										// Category
-										const category =
-											document
-												.querySelector('button[jsaction*="category"]')
-												?.textContent?.trim() || "";
-
-										// Image (og:image or first photo)
-										const ogImage =
-											document
-												.querySelector('meta[property="og:image"]')
-												?.getAttribute("content") || "";
-
-										return {
-											rating,
-											reviews,
-											address,
-											phone,
-											website,
-											category,
-											image: ogImage,
-										};
-									});
-
-									return { ...entry, ...details };
-								} catch {
-									return {
-										...entry,
-										rating: null,
-										reviews: null,
-										address: "",
-										phone: "",
-										website: "",
-										category: "",
-										image: "",
-									};
-								} finally {
-									await detailPage.close().catch(() => {});
-								}
-							}),
-						);
-
-						return { query, results: locationResults };
+						const places = await runMapsQuery(browser, query);
+						return { query, results: places };
 					} catch (error) {
 						console.error(`Error processing query "${query}":`, error);
-						return {
-							query,
-							name: "",
-							address: "",
-							coordinates: null,
-							url: "",
-							scrapedUrl: scrapedUrl,
-							details: [],
-							rating: "Rating not available",
-							reviews: "Reviews not available",
-							type: "Location",
-							error: error.message,
-						};
-					} finally {
-						await page.close();
+						return { query, results: [], error: error.message };
 					}
 				}),
 			);
 
-			// If single query was provided, return just the location data
 			if (!Array.isArray(queries)) {
 				const result = results[0];
 				if (!result.results || result.results.length === 0) {
@@ -2593,25 +2881,19 @@ app.post("/scrape-google-maps", async (c) => {
 						404,
 					);
 				}
-				return c.json({
-					success: true,
-					data: result,
-				});
+				return c.json({ success: true, data: result });
 			}
 
-			// For multiple queries, return array of results
 			return c.json({
 				success: true,
 				data: {
 					totalQueries: queryArray.length,
-					results: results,
+					results,
 					generatedAt: new Date().toISOString(),
 				},
 			});
 		} finally {
-			if (browser) {
-				await browser.close();
-			}
+			if (browser) await browser.close();
 		}
 	} catch (error) {
 		console.error("Google Maps Scraping Error:", error);
@@ -2626,316 +2908,646 @@ app.post("/scrape-google-maps", async (c) => {
 	}
 });
 
-// ─── Google Maps AI Agent ─────────────────────────────────────────────────────
-// Combines /scrape-google-maps + /scrape-multiple + Gemini to answer user queries
-app.post("/google-maps-agent", async (c) => {
-	const { query, prompt } = await c.req.json();
+// ─── Google Maps scraping via Lightpanda (Zig-based headless browser) ─────────
+// Faster and lighter than Chromium — uses CDP WebSocket, same Puppeteer page API
+app.post("/scrape-google-maps-lightpanda", async (c) => {
+	try {
+		const { queries, singleQuery } = await c.req.json();
 
-	if (!query) {
-		return c.json({ success: false, error: "query is required" }, 400);
-	}
+		if (!queries && !singleQuery) {
+			return c.json(
+				{
+					success: false,
+					error: "Either 'queries' array or 'singleQuery' string is required",
+				},
+				400,
+			);
+		}
 
-	const userPrompt = prompt || `Find the best results for: ${query}`;
+		const queryArray = Array.isArray(queries)
+			? queries
+			: [queries || singleQuery];
 
-	// ── Step 1: Scrape Google Maps ─────────────────────────────────────────────
-	let places = [];
-	{
-		let mapsBrowser;
+		if (!queryArray.length || queryArray.some((q) => !q)) {
+			return c.json(
+				{ success: false, error: "At least one valid query is needed" },
+				400,
+			);
+		}
+
+		let lp = null;
 		try {
-			const puppeteer = (await import("puppeteer-core")).default;
-			const MAPS_ARGS = [
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-dev-shm-usage",
-				"--disable-accelerated-2d-canvas",
-				"--no-first-run",
-				"--no-zygote",
-				"--single-process",
-				"--disable-gpu",
-			];
-			try {
-				const executablePath = await chromium.executablePath();
-				mapsBrowser = await puppeteer.launch({
-					headless: true,
-					executablePath,
-					args: [...chromium.args, ...MAPS_ARGS],
-					ignoreDefaultArgs: ["--disable-extensions"],
-				});
-			} catch {
-				mapsBrowser = await puppeteer.launch({
-					headless: true,
-					executablePath:
-						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-					args: MAPS_ARGS,
-				});
+			lp = await startLightpanda(9222);
+
+			// Lightpanda: single context — run queries sequentially to avoid conflicts
+			const results = [];
+			for (const query of queryArray) {
+				try {
+					const places = await runMapsQueryLightpanda(lp.browser, query);
+					results.push({ query, results: places });
+				} catch (error) {
+					console.error(`[Lightpanda] Query "${query}" failed:`, error.message);
+					results.push({ query, results: [], error: error.message });
+				}
 			}
 
-			const page = await mapsBrowser.newPage();
-			await page.setUserAgent(
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			);
-			await page.setRequestInterception(true);
-			page.on("request", (req) => {
-				if (["image", "font", "stylesheet"].includes(req.resourceType()))
-					req.abort();
-				else req.continue();
-			});
-
-			await page.goto(
-				`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`,
-				{ waitUntil: "networkidle0", timeout: 30000 },
-			);
-			await new Promise((r) => setTimeout(r, 5000));
-
-			await page.evaluate(async () => {
-				const feed = document.querySelector('div[role="feed"]');
-				if (!feed) return;
-				for (let i = 0; i < 5; i++) {
-					feed.scrollBy(0, 1000);
-					await new Promise((r) => setTimeout(r, 1000));
+			if (!Array.isArray(queries)) {
+				const result = results[0];
+				if (!result.results || result.results.length === 0) {
+					return c.json(
+						{
+							success: false,
+							error: "No results found for the given query",
+							data: result,
+						},
+						404,
+					);
 				}
+				return c.json({ success: true, browser: "lightpanda", data: result });
+			}
+
+			return c.json({
+				success: true,
+				browser: "lightpanda",
+				data: {
+					totalQueries: queryArray.length,
+					results,
+					generatedAt: new Date().toISOString(),
+				},
 			});
-
-			// Pass 1: extract names, URLs and coordinates from the feed
-			// Coordinates are encoded in the URL: !3d{lat}!4d{lng}
-			const feedEntries = await page.evaluate(() => {
-				const feed = document.querySelector('div[role="feed"]');
-				if (!feed) return [];
-				return Array.from(feed.querySelectorAll('a[href*="/maps/place/"]'))
-					.slice(0, 10)
-					.map((card) => {
-						const url = card.href || "";
-						const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
-						const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
-						return {
-							name: card.getAttribute("aria-label")?.trim() || "",
-							url,
-							coordinates:
-								latMatch && lngMatch
-									? {
-											lat: parseFloat(latMatch[1]),
-											lng: parseFloat(lngMatch[1]),
-									  }
-									: null,
-						};
-					})
-					.filter((item) => item.name.length > 0);
-			});
-
-			// Pass 2: visit each place page for rich details
-			places = await Promise.all(
-				feedEntries.map(async (entry) => {
-					const detailPage = await page.browser().newPage();
-					try {
-						await detailPage.setRequestInterception(true);
-						detailPage.on("request", (req) => {
-							if (
-								["image", "font", "stylesheet", "media"].includes(
-									req.resourceType(),
-								)
-							)
-								req.abort();
-							else req.continue();
-						});
-						await detailPage.goto(entry.url, {
-							waitUntil: "domcontentloaded",
-							timeout: 15000,
-						});
-						await new Promise((r) => setTimeout(r, 2000));
-
-						const details = await detailPage.evaluate(() => {
-							let rating = null;
-							for (const el of document.querySelectorAll("[aria-label]")) {
-								const al = el.getAttribute("aria-label");
-								const m =
-									al.match(/([1-5]\.[0-9])\s*stars?/i) ||
-									al.match(/rated\s+([1-5]\.[0-9])/i);
-								if (m) { rating = parseFloat(m[1]); break; }
-							}
-
-							let reviews = null;
-							for (const el of document.querySelectorAll("[aria-label]")) {
-								const al = el.getAttribute("aria-label");
-								const m = al.match(/([\d,]+)\s*reviews?/i);
-								if (m) { reviews = m[1].replace(/,/g, ""); break; }
-							}
-
-							const addrEl =
-								document.querySelector('button[data-item-id="address"]') ||
-								document.querySelector('[data-tooltip="Copy address"]');
-							const address =
-								addrEl
-									?.getAttribute("aria-label")
-									?.replace(/^Address:\s*/i, "")
-									?.trim() || "";
-
-							const phoneEl =
-								document.querySelector('[data-item-id^="phone"]') ||
-								document.querySelector('[data-tooltip="Copy phone number"]');
-							const phone =
-								phoneEl
-									?.getAttribute("aria-label")
-									?.replace(/^Phone:\s*/i, "")
-									?.trim() ||
-								phoneEl?.textContent?.trim() ||
-								"";
-
-							const websiteEl = document.querySelector(
-								'a[data-item-id="authority"]',
-							);
-							const website = websiteEl?.href || "";
-
-							const category =
-								document
-									.querySelector('button[jsaction*="category"]')
-									?.textContent?.trim() || "";
-
-							const image =
-								document
-									.querySelector('meta[property="og:image"]')
-									?.getAttribute("content") || "";
-
-							return { rating, reviews, address, phone, website, category, image };
-						});
-
-						return { ...entry, ...details };
-					} catch {
-						return {
-							...entry,
-							rating: null,
-							reviews: null,
-							address: "",
-							phone: "",
-							website: "",
-							category: "",
-							image: "",
-						};
-					} finally {
-						await detailPage.close().catch(() => {});
-					}
-				}),
-			);
-
-			await page.close();
-		} catch (err) {
-			console.error("Maps agent — scraping error:", err);
 		} finally {
-			if (mapsBrowser) await mapsBrowser.close().catch(() => {});
+			if (lp) stopLightpanda(lp);
 		}
-	}
-
-	if (places.length === 0) {
+	} catch (error) {
+		console.error("[Lightpanda] Google Maps Scraping Error:", error);
 		return c.json(
 			{
 				success: false,
-				error: "No Google Maps results found for the given query",
-				query,
+				error: "Failed to scrape Google Maps via Lightpanda",
+				details: error.message,
 			},
+			500,
+		);
+	}
+});
+
+// ─── Google Maps Agentic Search ───────────────────────────────────────────────
+// 1. OpenRouter generates 2–5 targeted Maps search queries from the user prompt
+// 2. All queries scraped in parallel (shared browser, deduped by URL)
+// 3. OpenRouter synthesizes a final structured answer
+app.post("/google-maps-agent", async (c) => {
+	const { prompt } = await c.req.json();
+	if (!prompt) {
+		return c.json({ success: false, error: "prompt is required" }, 400);
+	}
+
+	// Track token usage across both LLM calls
+	const tokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+	const addUsage = (u) => {
+		tokenUsage.promptTokens += u.promptTokens;
+		tokenUsage.completionTokens += u.completionTokens;
+		tokenUsage.totalTokens += u.totalTokens;
+	};
+
+	// ── Step 1: Generate search queries ───────────────────────────────────────
+	let queries = [];
+	try {
+		const { text, usage } = await callOpenRouter(
+			[
+				{
+					role: "system",
+					content: `You are a Google Maps search query expert. Given a user prompt, generate 2 to 5 specific, targeted Google Maps search queries that together will find the best results. Each query should be short and direct (like a user would type into Google Maps). Return ONLY a JSON object: { "queries": ["query1", "query2", ...] }`,
+				},
+				{ role: "user", content: prompt },
+			],
+			{ jsonMode: true },
+		);
+		addUsage(usage);
+		const parsed = parseJsonFromLLM(text);
+		queries = Array.isArray(parsed.queries)
+			? parsed.queries.slice(0, 5).filter(Boolean)
+			: [];
+	} catch (err) {
+		console.error("Maps agent — query generation failed:", err.message);
+	}
+	if (queries.length === 0) queries = [prompt];
+
+	// ── Step 2: Scrape all queries in parallel (one shared browser) ───────────
+	let browser;
+	let allPlaces = [];
+	try {
+		const puppeteer = (await import("puppeteer-core")).default;
+		const ARGS = [
+			"--no-sandbox",
+			"--disable-setuid-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-accelerated-2d-canvas",
+			"--no-first-run",
+			"--no-zygote",
+			"--single-process",
+			"--disable-gpu",
+		];
+		try {
+			const executablePath = await chromium.executablePath();
+			browser = await puppeteer.launch({
+				headless: true,
+				executablePath,
+				args: [...chromium.args, ...ARGS],
+				ignoreDefaultArgs: ["--disable-extensions"],
+			});
+		} catch {
+			browser = await puppeteer.launch({
+				headless: true,
+				executablePath:
+					"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				args: ARGS,
+			});
+		}
+
+		const queryResults = await Promise.all(
+			queries.map(async (query) => {
+				try {
+					const places = await runMapsQuery(browser, query);
+					return places.map((p) => ({ ...p, sourceQuery: query }));
+				} catch (err) {
+					console.error(`Maps agent — query "${query}" failed:`, err.message);
+					return [];
+				}
+			}),
+		);
+		allPlaces = queryResults.flat();
+	} finally {
+		if (browser) await browser.close().catch(() => {});
+	}
+
+	// ── Step 3: Deduplicate by Maps URL ───────────────────────────────────────
+	const seen = new Set();
+	const uniquePlaces = allPlaces.filter((p) => {
+		if (!p.url || seen.has(p.url)) return false;
+		seen.add(p.url);
+		return true;
+	});
+
+	if (uniquePlaces.length === 0) {
+		return c.json(
+			{ success: false, error: "No results found", queriesUsed: queries },
 			404,
 		);
 	}
 
-	// ── Step 2: Build LLM context from the already-enriched places ─────────────
-	const topUrls = places
-		.slice(0, 5)
-		.map((p) => p.url)
-		.filter((u) => u.includes("/maps/place/"));
-
-	const scrapedPages = await Promise.allSettled(
-		topUrls.map((url) =>
-			scrapeSingleUrlWithPuppeteer(url, {
-				includeSemanticContent: false,
-				includeImages: false,
-				includeLinks: false,
-				extractMetadata: false,
-				timeout: 20000,
-			}),
-		),
-	);
-
-	// ── Step 3: Build LLM context ──────────────────────────────────────────────
-	const mapsContext = places
+	// ── Step 4: Synthesize final answer with OpenRouter ───────────────────────
+	const placesContext = uniquePlaces
 		.map((p, i) =>
-		[
-			`### ${i + 1}. ${p.name}`,
-			`- Rating: ${p.rating != null ? `${p.rating} ⭐` : "N/A"}`,
-			`- Reviews: ${p.reviews ?? "N/A"}`,
-			`- Category: ${p.category || "N/A"}`,
-			`- Address: ${p.address || "N/A"}`,
-			`- Phone: ${p.phone || "N/A"}`,
-			`- Website: ${p.website || "N/A"}`,
-			`- Coordinates: ${p.coordinates ? `${p.coordinates.lat}, ${p.coordinates.lng}` : "N/A"}`,
-			`- Maps URL: ${p.url}`,
-		].join("\n"),
-	)
-	.join("\n\n");
+			[
+				`### ${i + 1}. ${p.name}`,
+				`- Rating: ${p.rating != null ? `${p.rating} ⭐` : "N/A"}`,
+				`- Reviews: ${p.reviews ?? "N/A"}`,
+				`- Category: ${p.category || "N/A"}`,
+				`- Address: ${p.address || "N/A"}`,
+				`- Phone: ${p.phone || "N/A"}`,
+				`- Website: ${p.website || "N/A"}`,
+				`- Coordinates: ${p.coordinates ? `${p.coordinates.lat}, ${p.coordinates.lng}` : "N/A"}`,
+				`- Found via: "${p.sourceQuery}"`,
+				`- Maps URL: ${p.url}`,
+			].join("\n"),
+		)
+		.join("\n\n");
 
-	const scrapedContext = scrapedPages
-		.map((r, i) => {
-			if (r.status !== "fulfilled" || !r.value?.markdown) return null;
-			return `#### ${places[i]?.name}\n${r.value.markdown.slice(0, 2000)}`;
-		})
-		.filter(Boolean)
-		.join("\n\n---\n\n");
-
-	// ── Step 4: Gemini LLM call ────────────────────────────────────────────────
-	const llmPrompt = [
-		`You are a helpful local search assistant. Answer the user's question using the Google Maps data and scraped page details provided below.`,
-		``,
-		`User query: "${userPrompt}"`,
-		`Search term used on Google Maps: "${query}"`,
-		``,
-		`## Google Maps Results (${places.length} places found):`,
-		mapsContext,
-		scrapedContext
-			? `\n## Additional Scraped Details from Place Pages:\n${scrapedContext}`
-			: "",
-		``,
-		`Respond with ONLY a valid JSON object (no markdown fences) in this exact shape:`,
-		`{`,
-		`  "answer": "A direct, helpful answer to the user query",`,
-		`  "topPicks": [`,
-		`    { "name": "", "rating": null, "reviews": null, "address": "", "url": "", "whyRecommended": "" }`,
-		`  ],`,
-		`  "insights": "Key tips or observations about these results",`,
-		`  "totalFound": ${places.length}`,
-		`}`,
-	].join("\n");
-
-	const aiResponse = await genai.models.generateContent({
-		model: "gemini-2.0-flash",
-		contents: [{ role: "user", parts: [{ text: llmPrompt }] }],
-	});
-
-	const rawText =
-		aiResponse?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+	// All URLs visited: Maps search pages + individual place detail pages
+	const mapsSearchUrls = queries.map(
+		(q) => `https://www.google.com/maps/search/${encodeURIComponent(q)}?hl=en`,
+	);
+	const placeDetailUrls = uniquePlaces.map((p) => p.url).filter(Boolean);
+	const scrapedUrls = [...mapsSearchUrls, ...placeDetailUrls];
 
 	let parsed;
 	try {
-		let jsonText = rawText.trim();
-		const fenceMatch = jsonText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-		if (fenceMatch) jsonText = fenceMatch[1].trim();
-		const firstBrace = jsonText.indexOf("{");
-		const lastBrace = jsonText.lastIndexOf("}");
-		if (firstBrace !== -1 && lastBrace > firstBrace)
-			jsonText = jsonText.slice(firstBrace, lastBrace + 1);
-		parsed = JSON.parse(jsonText);
+		const { text, usage } = await callOpenRouter(
+			[
+				{
+					role: "system",
+					content: `You are a helpful local search assistant. The user asked: "${prompt}". You searched Google Maps with ${queries.length} targeted queries and found ${uniquePlaces.length} unique places. Analyze ALL the results and return ONLY a valid JSON object (no markdown fences, no explanation):
+{
+  "answer": "A clear, direct answer to the user's prompt in 2-4 sentences",
+  "topPicks": [
+    {
+      "name": "",
+      "rating": null,
+      "reviews": null,
+      "category": "",
+      "address": "",
+      "phone": "",
+      "website": "",
+      "coordinates": { "lat": null, "lng": null },
+      "mapsUrl": "",
+      "whyRecommended": "1-2 sentence reason"
+    }
+  ],
+  "insights": "Patterns, tips or observations about these results (e.g. price range, best time to visit, area clusters)",
+  "queriesUsed": [],
+  "totalFound": 0
+}`,
+				},
+				{
+					role: "user",
+					content: `User prompt: "${prompt}"\n\nSearch queries used: ${JSON.stringify(queries)}\n\nAll places found:\n\n${placesContext}`,
+				},
+			],
+			{ jsonMode: true },
+		);
+		addUsage(usage);
+		parsed = parseJsonFromLLM(text);
 	} catch {
 		parsed = {
-			answer: rawText,
-			topPicks: places.slice(0, 5).map((p) => ({ ...p, whyRecommended: "" })),
+			answer: `Found ${uniquePlaces.length} results across ${queries.length} searches.`,
+			topPicks: uniquePlaces.slice(0, 5).map((p) => ({
+				name: p.name,
+				rating: p.rating,
+				reviews: p.reviews,
+				category: p.category,
+				address: p.address,
+				phone: p.phone,
+				website: p.website,
+				coordinates: p.coordinates,
+				mapsUrl: p.url,
+				whyRecommended: "",
+			})),
 			insights: null,
-			totalFound: places.length,
+			queriesUsed: queries,
+			totalFound: uniquePlaces.length,
 		};
 	}
 
 	return c.json({
 		success: true,
-		query,
-		prompt: userPrompt,
+		prompt,
 		...parsed,
-		allPlaces: places,
+		queriesUsed: queries,
+		allPlaces: uniquePlaces,
+		scrapedUrls,
+		scrapedUrlsCount: scrapedUrls.length,
+		tokenUsage,
 		timestamp: new Date().toISOString(),
+	});
+});
+
+// ─── AI Blog Generator ────────────────────────────────────────────────────────
+// 1. Scrape all supplied URLs in parallel (aiSummary:true per URL to compress)
+// 2. Condense summaries further if combined size still risks context overflow
+// 3. Generate 5 distinct, stunning blog posts in parallel via OpenRouter
+// Each blog has a different angle, tone, and structure but shares the same
+// source material. Backlinks and images from the scraped pages are woven in.
+app.post("/ai-blog-generator-url-scraper", async (c) => {
+	const {
+		urls,
+		topic = "",
+		count = 5,
+		// maxCharsPerUrl: how many characters of scraped content to send per URL.
+		// Lower = fewer input tokens = fits smaller credit budgets.
+		maxCharsPerUrl = 400,
+		// maxOutputTokens: cap on generated output tokens per blog.
+		// Must stay below your available OpenRouter credits minus input token cost.
+		maxOutputTokens = 380,
+	} = await c.req.json();
+
+	if (!Array.isArray(urls) || urls.length === 0) {
+		return c.json(
+			{ success: false, error: "'urls' must be a non-empty array" },
+			400,
+		);
+	}
+
+	const tokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+	const addUsage = (u) => {
+		tokenUsage.promptTokens += u?.promptTokens ?? 0;
+		tokenUsage.completionTokens += u?.completionTokens ?? 0;
+		tokenUsage.totalTokens += u?.totalTokens ?? 0;
+	};
+
+	// ── Step 1: Scrape all URLs in parallel, aiSummary=true to keep each
+	//            scrape small enough to concatenate safely later
+	const scrapeResults = await Promise.allSettled(
+		urls.map((url) =>
+			scrapeSingleUrlWithPuppeteer(url, {
+				includeSemanticContent: true,
+				includeImages: true,
+				includeLinks: true,
+				extractMetadata: true,
+				aiSummary: true,
+				timeout: 30000,
+			}).catch((err) => ({
+				url,
+				error: err.message,
+				summary: null,
+				markdown: null,
+			})),
+		),
+	);
+
+	// Collect successful scrapes
+	const scraped = scrapeResults.map((r, i) => {
+		const url = urls[i];
+		if (r.status === "fulfilled") {
+			const v = r.value;
+			return {
+				url,
+				title: v.data?.title || v.data?.metadata?.title || "",
+				summary: v.summary || "",
+				// Trim raw markdown as a fallback if summary is empty
+				markdown: (v.markdown || "").slice(0, 1500),
+				images: (v.data?.images || [])
+					.slice(0, 5)
+					.map((img) =>
+						typeof img === "string" ? img : img?.src || img?.url || "",
+					)
+					.filter(Boolean),
+				links: (v.data?.links || [])
+					.slice(0, 8)
+					.map((l) => (typeof l === "string" ? l : l?.href || l?.url || ""))
+					.filter(Boolean),
+				error: null,
+			};
+		}
+		return {
+			url,
+			title: "",
+			summary: "",
+			markdown: "",
+			images: [],
+			links: [],
+			error: r.reason?.message || "failed",
+		};
+	});
+
+	const successfulScrapes = scraped.filter((s) => s.summary || s.markdown);
+	if (successfulScrapes.length === 0) {
+		return c.json({ success: false, error: "All URLs failed to scrape" }, 422);
+	}
+
+	// ── Step 2: Build context string ─────────────────────────────────────────
+	// Each URL's content is capped at maxCharsPerUrl chars to control input
+	// token cost. Keeping this small is the primary lever against credit errors.
+	const perUrlCap = Math.min(
+		Math.max(100, Number(maxCharsPerUrl) || 400),
+		3000,
+	);
+
+	const rawContext = successfulScrapes
+		.map((s, i) => {
+			const body = (s.summary || s.markdown).slice(0, perUrlCap);
+			const imgLine = s.images.length
+				? `Images: ${s.images.slice(0, 3).join(", ")}`
+				: "";
+			const linkLine = s.links.length
+				? `Links: ${s.links.slice(0, 3).join(", ")}`
+				: "";
+			return `[${i + 1}] ${s.title || s.url} (${s.url})\n${imgLine}${imgLine ? "\n" : ""}${linkLine}${linkLine ? "\n" : ""}\n${body}`;
+		})
+		.join("\n\n");
+
+	// Collect image + backlink pools (kept small to save input tokens)
+	const allImages = [
+		...new Set(successfulScrapes.flatMap((s) => s.images)),
+	].slice(0, 5);
+	const allBacklinks = [
+		...new Set(successfulScrapes.flatMap((s) => [s.url, ...s.links])),
+	].slice(0, 8);
+	const imageHint = allImages.length ? `\nImages: ${allImages.join(", ")}` : "";
+	const linkHint = allBacklinks.length
+		? `\nLinks: ${allBacklinks.join(", ")}`
+		: "";
+
+	const outTokens = Math.min(
+		Math.max(100, Number(maxOutputTokens) || 380),
+		4096,
+	);
+
+	// ── Step 3: Validate count and pick angles ────────────────────────────────
+	const blogCount = Math.min(Math.max(1, Number(count) || 5), 10);
+
+	const ALL_BLOG_ANGLES = [
+		{
+			id: "deep-dive",
+			label: "Deep-Dive Analysis",
+			tone: "authoritative, long-form analytical",
+			structure:
+				"Introduction → Background → Core Analysis (3-4 sections) → Expert Insights → Conclusion",
+			audience: "professionals and enthusiasts who want depth",
+		},
+		{
+			id: "beginners-guide",
+			label: "Beginner's Guide",
+			tone: "friendly, approachable, jargon-free",
+			structure:
+				"Hook → Why It Matters → Step-by-Step Breakdown → Common Mistakes → Next Steps",
+			audience: "newcomers and curious readers with no prior knowledge",
+		},
+		{
+			id: "listicle",
+			label: "Power Listicle",
+			tone: "punchy, scannable, energetic",
+			structure:
+				"Catchy intro → 7-10 numbered points, each with a subheading + 2-3 sentences + relevant link or image",
+			audience: "busy readers who skim for quick takeaways",
+		},
+		{
+			id: "opinion-thought-leadership",
+			label: "Opinion / Thought Leadership",
+			tone: "bold, opinionated, provocative but grounded",
+			structure:
+				"Strong contrarian hook → Thesis statement → 3 arguments with evidence → Counter-argument addressed → Rallying conclusion",
+			audience: "industry insiders and decision-makers who enjoy debate",
+		},
+		{
+			id: "case-study",
+			label: "Case Study / Story-Driven",
+			tone: "narrative, storytelling, human-focused",
+			structure:
+				"Story hook → Problem setup → Journey/Solution → Results & Data → Lessons Learned → Call to Action",
+			audience: "readers who connect through stories and real-world examples",
+		},
+		{
+			id: "how-to-tutorial",
+			label: "How-To Tutorial",
+			tone: "practical, instructional, clear",
+			structure:
+				"Goal statement → Prerequisites → Numbered steps with code/examples → Troubleshooting tips → Summary",
+			audience:
+				"developers and practitioners who want to build or implement something",
+		},
+		{
+			id: "trends-roundup",
+			label: "Trends & Roundup",
+			tone: "journalistic, curated, forward-looking",
+			structure:
+				"Week-in-review intro → 5-7 trend highlights with commentary → What to watch next → Closing take",
+			audience: "tech followers who want a curated digest of what's happening",
+		},
+		{
+			id: "comparison",
+			label: "Comparison & Pros/Cons",
+			tone: "balanced, objective, analytical",
+			structure:
+				"Context → Side-by-side comparison table → Deep-dive on each option → Verdict for different use cases",
+			audience: "decision-makers evaluating tools, frameworks, or approaches",
+		},
+		{
+			id: "interview-qa",
+			label: "Interview / Q&A Style",
+			tone: "conversational, insightful, personal",
+			structure:
+				"Introduction of subject → 6-8 Q&A pairs → Key takeaways → Closing thoughts",
+			audience:
+				"readers who enjoy human perspectives and behind-the-scenes insights",
+		},
+		{
+			id: "newsletter",
+			label: "Newsletter Edition",
+			tone: "warm, personal, concise",
+			structure:
+				"Personal opening note → 3-5 curated stories with brief commentary → Tool or resource spotlight → Sign-off",
+			audience:
+				"subscribers who want a friendly weekly digest they can read in 5 minutes",
+		},
+	];
+
+	const BLOG_ANGLES = ALL_BLOG_ANGLES.slice(0, blogCount);
+
+	// Use XML-style delimiters so the LLM never has to escape markdown inside JSON.
+	// We parse the sections out ourselves — far more reliable than JSON-in-JSON.
+	const SYSTEM_PROMPT = (
+		angle,
+	) => `You are an elite content strategist and award-winning blogger writing for a high-traffic publication.
+
+BLOG ANGLE: ${angle.label}
+TONE: ${angle.tone}
+TARGET AUDIENCE: ${angle.audience}
+STRUCTURE: ${angle.structure}
+${topic ? `TOPIC FOCUS: ${topic}` : ""}
+
+REQUIREMENTS:
+- Write in the ${angle.tone} tone for ${angle.audience}.
+- Use markdown: H2/H3 headings, bold phrases, bullets where useful.
+- Embed images inline: ![alt](url) — use URLs from the Images list.
+- Hyperlink sources inline: [text](url) — use URLs from the Links list.
+- End with a short Call to Action paragraph.
+
+OUTPUT — write CONTENT first (it gets all available tokens), then the short metadata fields:
+<CONTENT>
+full markdown blog here — write freely, no escaping
+</CONTENT>
+<TITLE>headline under 70 chars</TITLE>
+<META>SEO meta description under 155 chars</META>
+<TAGS>tag1,tag2,tag3</TAGS>
+<FEATURED_IMAGE>one image url or empty</FEATURED_IMAGE>`;
+
+	const USER_CONTENT = (angle) =>
+		`Write a ${angle.label} blog post.\nResearch:\n${rawContext}${imageHint}${linkHint}`;
+
+	// Parse delimited response — CONTENT is first so it gets the most tokens.
+	// Title/meta/tags are after and may be absent if the model ran out of budget;
+	// we fall back to extracting the title from the first heading in the content.
+	function parseDelimitedBlog(text) {
+		const extract = (tag) => {
+			// Handle both closed tags and unclosed (truncated) CONTENT block
+			if (tag === "CONTENT") {
+				const open = text.indexOf("<CONTENT>");
+				if (open === -1) return "";
+				const close = text.indexOf("</CONTENT>", open);
+				// If closing tag is missing (truncated), take everything after opening tag
+				return (
+					close === -1 ? text.slice(open + 9) : text.slice(open + 9, close)
+				).trim();
+			}
+			const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
+			return m ? m[1].trim() : "";
+		};
+		const content = extract("CONTENT");
+		if (!content) throw new Error("no content found");
+		let title = extract("TITLE");
+		// Fallback: grab first markdown heading from content
+		if (!title) {
+			const h = content.match(/^#{1,3}\s+(.+)/m);
+			title = h ? h[1].trim() : "";
+		}
+		const metaDescription = extract("META");
+		const tagsRaw = extract("TAGS");
+		const featuredImage = extract("FEATURED_IMAGE");
+		return {
+			title,
+			metaDescription,
+			suggestedTags: tagsRaw
+				? tagsRaw
+						.split(",")
+						.map((t) => t.trim())
+						.filter(Boolean)
+				: [],
+			featuredImage,
+			content,
+			wordCount: content.split(/\s+/).filter(Boolean).length,
+		};
+	}
+
+	// ── Step 4: Generate 5 blogs sequentially ────────────────────────────────
+	// Sequential (not parallel) to avoid OpenRouter rate-limit rejections when
+	// sending 5 large-context requests simultaneously. jsonMode OFF — embedding
+	// long markdown inside a JSON string causes Gemini to truncate silently.
+	const blogs = [];
+	for (const angle of BLOG_ANGLES) {
+		try {
+			const { text, usage } = await callOpenRouter(
+				[
+					{ role: "system", content: SYSTEM_PROMPT(angle) },
+					{ role: "user", content: USER_CONTENT(angle) },
+				],
+				{ jsonMode: false, maxTokens: outTokens },
+			);
+			addUsage(usage);
+			try {
+				const parsed = parseDelimitedBlog(text);
+				blogs.push({ angle: angle.id, label: angle.label, ...parsed });
+			} catch {
+				// Delimiter parse failed — try JSON as last resort, else keep raw
+				try {
+					const parsed = parseJsonFromLLM(text);
+					blogs.push({ angle: angle.id, label: angle.label, ...parsed });
+				} catch {
+					blogs.push({
+						angle: angle.id,
+						label: angle.label,
+						content: text,
+						parseError: true,
+						rawLength: text.length,
+					});
+				}
+			}
+		} catch (err) {
+			blogs.push({ angle: angle.id, label: angle.label, error: err.message });
+		}
+		// Small breathing room between calls
+		await new Promise((r) => setTimeout(r, 300));
+	}
+
+	return c.json({
+		success: true,
+		topic: topic || null,
+		blogs,
+		metadata: {
+			urlsProvided: urls.length,
+			urlsScrapedSuccessfully: successfulScrapes.length,
+			urlsFailed: scraped.filter((s) => s.error).length,
+			scrapedUrls: scraped.map((s) => ({
+				url: s.url,
+				success: !s.error,
+				error: s.error,
+			})),
+			blogsRequested: blogCount,
+			blogsGenerated: blogs.filter((b) => !b.error).length,
+			maxCharsPerUrl: perUrlCap,
+			maxOutputTokens: outTokens,
+			tokenUsage,
+			timestamp: new Date().toISOString(),
+		},
 	});
 });
 
@@ -4464,8 +5076,10 @@ const INKGEST_SKILL_MAX_OUTPUT_TOKENS = Math.min(
 	8192,
 	Math.max(
 		256,
-		Number.parseInt(process.env.INKGEST_SKILL_MAX_OUTPUT_TOKENS || "4096", 10) ||
-			4096,
+		Number.parseInt(
+			process.env.INKGEST_SKILL_MAX_OUTPUT_TOKENS || "4096",
+			10,
+		) || 4096,
 	),
 );
 
@@ -4576,8 +5190,7 @@ app.post("/inkgest-agent", async (c) => {
 		const userPrompt = String(prompt).trim();
 		const hasExecuteTasks =
 			Array.isArray(executeTasks) && executeTasks.length > 0;
-		const hasImages =
-			Array.isArray(bodyImages) && bodyImages.length > 0;
+		const hasImages = Array.isArray(bodyImages) && bodyImages.length > 0;
 
 		if (!userPrompt && !hasExecuteTasks) {
 			return c.json({ error: "Prompt or executeTasks required" }, 400);
@@ -4599,1159 +5212,1258 @@ app.post("/inkgest-agent", async (c) => {
 						total_tokens: 0,
 					};
 					try {
-		const extractedUrls = hasExecuteTasks
-			? [
-					...new Set(
-						executeTasks.flatMap((t) => {
-							const fromParams = (
-								Array.isArray(t.params?.urls) ? t.params.urls : []
-							).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
-							const fromPrompt = extractUrlsFromText(t.params?.prompt || "");
-							return [...fromParams, ...fromPrompt];
-						}),
-					),
-				]
-			: extractUrlsFromText(userPrompt);
+						const extractedUrls = hasExecuteTasks
+							? [
+									...new Set(
+										executeTasks.flatMap((t) => {
+											const fromParams = (
+												Array.isArray(t.params?.urls) ? t.params.urls : []
+											).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
+											const fromPrompt = extractUrlsFromText(
+												t.params?.prompt || "",
+											);
+											return [...fromParams, ...fromPrompt];
+										}),
+									),
+								]
+							: extractUrlsFromText(userPrompt);
 
-		let urlsToScrape = extractedUrls.slice(0, 10);
-		let redditUrls = urlsToScrape.filter(isRedditUrl);
-		let youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
-		let regularUrls = urlsToScrape.filter(
-			(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
-		);
-		const apiBase = process.env.API_BASE_URL || new URL(c.req.url).origin;
-		// In production, INKGEST_SCRAPE_BASE defaults to localhost:3002 which is unreachable.
-		// Use apiBase when env vars are unset so /scrape and /scrape-multiple (same app) work.
-		const scrapeBase =
-			process.env.INKGEST_SCRAPE_BASE_URL || process.env.SCRAPE_API_BASE_URL
-				? INKGEST_SCRAPE_BASE
-				: apiBase;
-		let scrapedSources = [];
-		let scrapeErrors = [];
-		let parsed = {};
-		let suggestedTasks = [];
-
-		function addTokenUsage(usage) {
-			if (usage && typeof usage === "object") {
-				tokenUsage.prompt_tokens += usage.prompt_tokens || 0;
-				tokenUsage.completion_tokens += usage.completion_tokens || 0;
-				tokenUsage.total_tokens += usage.total_tokens || 0;
-			}
-		}
-
-		if (!hasExecuteTasks) {
-			const urlLine = urlsToScrape.length
-				? `URLs found: ${urlsToScrape.join(", ")}`
-				: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
-			const imageLine = hasImages
-				? `Images provided: ${bodyImages.length} image(s). You MUST suggest an image-reading task with params.images (the executor will inject the actual images). Suggest blog, article, newsletter, or table to use the extracted image content.`
-				: "";
-			const userContent = `User message: ${userPrompt}\n\n${urlLine}${imageLine ? `\n\n${imageLine}` : ""}`;
-			const messages = [
-				{ role: "system", content: ROUTER_SYSTEM_PROMPT },
-				...chatHistory.slice(-6).map((m) => ({
-					role: m.role === "user" ? "user" : "assistant",
-					content: m.content,
-				})),
-				{ role: "user", content: userContent },
-			];
-
-			async function scrapeAllUrls() {
-				if (urlsToScrape.length === 0) return { sources: [], errors: [] };
-				const [regularScraped, youtubeScraped, redditScraped] =
-					await Promise.all([
-						regularUrls.length > 0
-							? scrapeUrlsViaApi(scrapeBase, regularUrls, {
-									includeImages: true,
-									aiSummary: true,
-								})
-							: { sources: [], errors: [] },
-						youtubeUrls.length > 0
-							? scrapeYoutubeViaApi(apiBase, youtubeUrls)
-							: { sources: [], errors: [] },
-						redditUrls.length > 0
-							? scrapeRedditViaApi(apiBase, redditUrls)
-							: { sources: [], errors: [] },
-					]);
-				// Fallback: when Reddit API blocks (common in prod), try Puppeteer scrape
-				let redditFinal = redditScraped;
-				if (
-					redditUrls.length > 0 &&
-					redditScraped.sources?.length === 0 &&
-					redditScraped.errors?.length > 0
-				) {
-					redditFinal = await scrapeUrlsViaApi(scrapeBase, redditUrls, {
-						includeImages: true,
-						aiSummary: true,
-					});
-					if (redditFinal.sources?.length > 0) {
-						console.log(
-							"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
-							redditUrls.length,
-							"URL(s)",
+						let urlsToScrape = extractedUrls.slice(0, 10);
+						let redditUrls = urlsToScrape.filter(isRedditUrl);
+						let youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
+						let regularUrls = urlsToScrape.filter(
+							(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
 						);
-					}
-				}
-				return {
-					sources: [
-						...(regularScraped.sources || []),
-						...(youtubeScraped.sources || []),
-						...(redditFinal.sources || []),
-					],
-					errors: [
-						...(regularScraped.errors || []),
-						...(youtubeScraped.errors || []),
-						...(redditFinal.sources?.length > 0
-							? []
-							: redditScraped.errors || []),
-					],
-				};
-			}
+						const apiBase =
+							process.env.API_BASE_URL || new URL(c.req.url).origin;
+						// In production, INKGEST_SCRAPE_BASE defaults to localhost:3002 which is unreachable.
+						// Use apiBase when env vars are unset so /scrape and /scrape-multiple (same app) work.
+						const scrapeBase =
+							process.env.INKGEST_SCRAPE_BASE_URL ||
+							process.env.SCRAPE_API_BASE_URL
+								? INKGEST_SCRAPE_BASE
+								: apiBase;
+						let scrapedSources = [];
+						let scrapeErrors = [];
+						let parsed = {};
+						let suggestedTasks = [];
 
-			// Plan phase: LLM decides tasks first (no parallel scrape).
-			const routerResult = await openRouterChatMessages(openRouterKey, messages);
-			const raw = routerResult.content;
-			addTokenUsage(routerResult.usage);
-			creditsDistribution.push({ task: "thinking", credits: CREDITS.thinking });
-			creditsUsed += CREDITS.thinking;
+						function addTokenUsage(usage) {
+							if (usage && typeof usage === "object") {
+								tokenUsage.prompt_tokens += usage.prompt_tokens || 0;
+								tokenUsage.completion_tokens += usage.completion_tokens || 0;
+								tokenUsage.total_tokens += usage.total_tokens || 0;
+							}
+						}
 
-			try {
-				parsed = parseAgentResponse(raw);
-			} catch (e) {
-				controller.enqueue(
-					encoder.encode(
-						send({
-							type: "end",
-							error:
-								"Agent could not parse your request. Try being more specific.",
-							raw: raw.slice(0, 500),
-							executed: [],
-							references: [],
-							creditsUsed,
-							creditsDistribution,
-							tokenUsage,
-						}),
-					),
-				);
-				controller.close();
-				return;
-			}
+						if (!hasExecuteTasks) {
+							const urlLine = urlsToScrape.length
+								? `URLs found: ${urlsToScrape.join(", ")}`
+								: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
+							const imageLine = hasImages
+								? `Images provided: ${bodyImages.length} image(s). You MUST suggest an image-reading task with params.images (the executor will inject the actual images). Suggest blog, article, newsletter, or table to use the extracted image content.`
+								: "";
+							const userContent = `User message: ${userPrompt}\n\n${urlLine}${imageLine ? `\n\n${imageLine}` : ""}`;
+							const messages = [
+								{ role: "system", content: ROUTER_SYSTEM_PROMPT },
+								...chatHistory.slice(-6).map((m) => ({
+									role: m.role === "user" ? "user" : "assistant",
+									content: m.content,
+								})),
+								{ role: "user", content: userContent },
+							];
 
-			const promptUrls = extractUrlsFromText(userPrompt).slice(0, 10);
-			suggestedTasks = (
-				Array.isArray(parsed.suggestedTasks) ? parsed.suggestedTasks : []
-			).map((t) => {
-				const taskUrls =
-					Array.isArray(t.params?.urls) && t.params.urls.length > 0
-						? t.params.urls.filter((u) => /^https?:\/\/\S+$/i.test(String(u)))
-						: promptUrls;
-				return { ...t, params: { ...t.params, urls: taskUrls } };
-			});
-			if (hasImages) {
-				const imageReadingIdx = suggestedTasks.findIndex(
-					(t) => t.type === "image-reading",
-				);
-				const imageParams = { images: bodyImages };
-				if (imageReadingIdx >= 0) {
-					suggestedTasks[imageReadingIdx].params = {
-						...suggestedTasks[imageReadingIdx].params,
-						...imageParams,
-					};
-				} else {
-					suggestedTasks.unshift({
-						type: "image-reading",
-						label: "Read image(s)",
-						params: imageParams,
-					});
-				}
-			}
+							async function scrapeAllUrls() {
+								if (urlsToScrape.length === 0)
+									return { sources: [], errors: [] };
+								const [regularScraped, youtubeScraped, redditScraped] =
+									await Promise.all([
+										regularUrls.length > 0
+											? scrapeUrlsViaApi(scrapeBase, regularUrls, {
+													includeImages: true,
+													aiSummary: true,
+												})
+											: { sources: [], errors: [] },
+										youtubeUrls.length > 0
+											? scrapeYoutubeViaApi(apiBase, youtubeUrls)
+											: { sources: [], errors: [] },
+										redditUrls.length > 0
+											? scrapeRedditViaApi(apiBase, redditUrls)
+											: { sources: [], errors: [] },
+									]);
+								// Fallback: when Reddit API blocks (common in prod), try Puppeteer scrape
+								let redditFinal = redditScraped;
+								if (
+									redditUrls.length > 0 &&
+									redditScraped.sources?.length === 0 &&
+									redditScraped.errors?.length > 0
+								) {
+									redditFinal = await scrapeUrlsViaApi(scrapeBase, redditUrls, {
+										includeImages: true,
+										aiSummary: true,
+									});
+									if (redditFinal.sources?.length > 0) {
+										console.log(
+											"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
+											redditUrls.length,
+											"URL(s)",
+										);
+									}
+								}
+								return {
+									sources: [
+										...(regularScraped.sources || []),
+										...(youtubeScraped.sources || []),
+										...(redditFinal.sources || []),
+									],
+									errors: [
+										...(regularScraped.errors || []),
+										...(youtubeScraped.errors || []),
+										...(redditFinal.sources?.length > 0
+											? []
+											: redditScraped.errors || []),
+									],
+								};
+							}
 
-			// Scrape phase: merge URLs from user message + planned tasks, then fetch in parallel.
-			urlsToScrape = [
-				...new Set([...promptUrls, ...collectHttpUrlsFromTasks(suggestedTasks)]),
-			].slice(0, 10);
-			redditUrls = urlsToScrape.filter(isRedditUrl);
-			youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
-			regularUrls = urlsToScrape.filter(
-				(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
-			);
+							// Plan phase: LLM decides tasks first (no parallel scrape).
+							const routerResult = await openRouterChatMessages(
+								openRouterKey,
+								messages,
+							);
+							const raw = routerResult.content;
+							addTokenUsage(routerResult.usage);
+							creditsDistribution.push({
+								task: "thinking",
+								credits: CREDITS.thinking,
+							});
+							creditsUsed += CREDITS.thinking;
 
-			const scraped =
-				urlsToScrape.length > 0
-					? await scrapeAllUrls()
-					: { sources: [], errors: [] };
-			scrapedSources = scraped.sources || [];
-			if (scraped.errors?.length) {
-				scrapeErrors.push(...scraped.errors);
-				console.error(
-					"[inkgest-agent] Scrape errors (after plan):",
-					scraped.errors,
-				);
-			}
-		} else {
-			if (urlsToScrape.length > 0) {
-				const [regularScraped, youtubeScraped, redditScraped] =
-					await Promise.all([
-						regularUrls.length > 0
-							? scrapeUrlsViaApi(scrapeBase, regularUrls, {
-									includeImages: true,
-									aiSummary: true,
-								})
-							: { sources: [], errors: [] },
-						youtubeUrls.length > 0
-							? scrapeYoutubeViaApi(apiBase, youtubeUrls)
-							: { sources: [], errors: [] },
-						redditUrls.length > 0
-							? scrapeRedditViaApi(apiBase, redditUrls)
-							: { sources: [], errors: [] },
-					]);
-				let redditFinal = redditScraped;
-				if (
-					redditUrls.length > 0 &&
-					redditScraped.sources?.length === 0 &&
-					redditScraped.errors?.length > 0
-				) {
-					redditFinal = await scrapeUrlsViaApi(scrapeBase, redditUrls, {
-						includeImages: true,
-						aiSummary: true,
-					});
-					if (redditFinal.sources?.length > 0) {
-						console.log(
-							"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
-							redditUrls.length,
-							"URL(s)",
-						);
-					}
-				}
-				scrapedSources = [
-					...(regularScraped.sources || []),
-					...(youtubeScraped.sources || []),
-					...(redditFinal.sources || []),
-				];
-				if (regularScraped.errors?.length) {
-					scrapeErrors.push(...regularScraped.errors);
-					console.error(
-						"[inkgest-agent] Scrape errors (execute path):",
-						regularScraped.errors,
-					);
-				}
-				if (youtubeScraped.errors?.length) {
-					scrapeErrors.push(...youtubeScraped.errors);
-					console.error(
-						"[inkgest-agent] YouTube scrape errors:",
-						youtubeScraped.errors,
-					);
-				}
-				if (redditFinal.sources?.length === 0 && redditScraped.errors?.length) {
-					scrapeErrors.push(...redditScraped.errors);
-					console.error(
-						"[inkgest-agent] Reddit scrape errors:",
-						redditScraped.errors,
-					);
-				}
-			}
-		}
+							try {
+								parsed = parseAgentResponse(raw);
+							} catch (e) {
+								controller.enqueue(
+									encoder.encode(
+										send({
+											type: "end",
+											error:
+												"Agent could not parse your request. Try being more specific.",
+											raw: raw.slice(0, 500),
+											executed: [],
+											references: [],
+											creditsUsed,
+											creditsDistribution,
+											tokenUsage,
+										}),
+									),
+								);
+								controller.close();
+								return;
+							}
 
-		let tasksToRun = hasExecuteTasks
-			? executeTasks
-			: parsed.shouldExecute === true
-				? suggestedTasks
-				: [];
+							const promptUrls = extractUrlsFromText(userPrompt).slice(0, 10);
+							suggestedTasks = (
+								Array.isArray(parsed.suggestedTasks)
+									? parsed.suggestedTasks
+									: []
+							).map((t) => {
+								const taskUrls =
+									Array.isArray(t.params?.urls) && t.params.urls.length > 0
+										? t.params.urls.filter((u) =>
+												/^https?:\/\/\S+$/i.test(String(u)),
+											)
+										: promptUrls;
+								return { ...t, params: { ...t.params, urls: taskUrls } };
+							});
+							if (hasImages) {
+								const imageReadingIdx = suggestedTasks.findIndex(
+									(t) => t.type === "image-reading",
+								);
+								const imageParams = { images: bodyImages };
+								if (imageReadingIdx >= 0) {
+									suggestedTasks[imageReadingIdx].params = {
+										...suggestedTasks[imageReadingIdx].params,
+										...imageParams,
+									};
+								} else {
+									suggestedTasks.unshift({
+										type: "image-reading",
+										label: "Read image(s)",
+										params: imageParams,
+									});
+								}
+							}
 
-		// Ensure every task has params.urls — scrape/content tasks need URLs.
-		// Router may put URL in params.url (singular) or params.urls; inherit from other tasks when missing.
-		const urlsFromAllTasks = [
-			...new Set(
-				tasksToRun.flatMap((t) => {
-					const single = t.params?.url;
-					const multi = Array.isArray(t.params?.urls) ? t.params.urls : [];
-					return [
-						...(single && /^https?:\/\/\S+$/i.test(String(single))
-							? [single]
-							: []),
-						...multi.filter((u) => /^https?:\/\/\S+$/i.test(String(u))),
-					];
-				}),
-			),
-		];
-		const fallbackUrls =
-			urlsToScrape.length > 0 ? urlsToScrape : urlsFromAllTasks;
-		tasksToRun = tasksToRun.map((t) => {
-			const single = t.params?.url;
-			const multi = Array.isArray(t.params?.urls) ? t.params.urls : [];
-			const fromTask = [
-				...(single && /^https?:\/\/\S+$/i.test(String(single)) ? [single] : []),
-				...multi.filter((u) => /^https?:\/\/\S+$/i.test(String(u))),
-			];
-			const hasUrls = fromTask.length > 0;
-			const taskUrls = hasUrls ? fromTask : fallbackUrls;
-			return { ...t, params: { ...t.params, urls: taskUrls } };
-		});
+							// Scrape phase: merge URLs from user message + planned tasks, then fetch in parallel.
+							urlsToScrape = [
+								...new Set([
+									...promptUrls,
+									...collectHttpUrlsFromTasks(suggestedTasks),
+								]),
+							].slice(0, 10);
+							redditUrls = urlsToScrape.filter(isRedditUrl);
+							youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
+							regularUrls = urlsToScrape.filter(
+								(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
+							);
 
-		if (hasImages) {
-			tasksToRun = tasksToRun.map((t) =>
-				t.type === "image-reading" &&
-				(!Array.isArray(t.params?.images) || t.params.images.length === 0)
-					? { ...t, params: { ...t.params, images: bodyImages } }
-					: t,
-			);
-		}
+							const scraped =
+								urlsToScrape.length > 0
+									? await scrapeAllUrls()
+									: { sources: [], errors: [] };
+							scrapedSources = scraped.sources || [];
+							if (scraped.errors?.length) {
+								scrapeErrors.push(...scraped.errors);
+								console.error(
+									"[inkgest-agent] Scrape errors (after plan):",
+									scraped.errors,
+								);
+							}
+						} else {
+							if (urlsToScrape.length > 0) {
+								const [regularScraped, youtubeScraped, redditScraped] =
+									await Promise.all([
+										regularUrls.length > 0
+											? scrapeUrlsViaApi(scrapeBase, regularUrls, {
+													includeImages: true,
+													aiSummary: true,
+												})
+											: { sources: [], errors: [] },
+										youtubeUrls.length > 0
+											? scrapeYoutubeViaApi(apiBase, youtubeUrls)
+											: { sources: [], errors: [] },
+										redditUrls.length > 0
+											? scrapeRedditViaApi(apiBase, redditUrls)
+											: { sources: [], errors: [] },
+									]);
+								let redditFinal = redditScraped;
+								if (
+									redditUrls.length > 0 &&
+									redditScraped.sources?.length === 0 &&
+									redditScraped.errors?.length > 0
+								) {
+									redditFinal = await scrapeUrlsViaApi(scrapeBase, redditUrls, {
+										includeImages: true,
+										aiSummary: true,
+									});
+									if (redditFinal.sources?.length > 0) {
+										console.log(
+											"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
+											redditUrls.length,
+											"URL(s)",
+										);
+									}
+								}
+								scrapedSources = [
+									...(regularScraped.sources || []),
+									...(youtubeScraped.sources || []),
+									...(redditFinal.sources || []),
+								];
+								if (regularScraped.errors?.length) {
+									scrapeErrors.push(...regularScraped.errors);
+									console.error(
+										"[inkgest-agent] Scrape errors (execute path):",
+										regularScraped.errors,
+									);
+								}
+								if (youtubeScraped.errors?.length) {
+									scrapeErrors.push(...youtubeScraped.errors);
+									console.error(
+										"[inkgest-agent] YouTube scrape errors:",
+										youtubeScraped.errors,
+									);
+								}
+								if (
+									redditFinal.sources?.length === 0 &&
+									redditScraped.errors?.length
+								) {
+									scrapeErrors.push(...redditScraped.errors);
+									console.error(
+										"[inkgest-agent] Reddit scrape errors:",
+										redditScraped.errors,
+									);
+								}
+							}
+						}
 
-		// When router inferred URLs (in tasks) but we didn't scrape (urlsToScrape was empty), scrape now
-		if (
-			scrapedSources.length === 0 &&
-			fallbackUrls.length > 0 &&
-			urlsToScrape.length === 0
-		) {
-			const lateReddit = fallbackUrls.filter(isRedditUrl);
-			const lateYoutube = fallbackUrls.filter(isYoutubeUrl);
-			const lateRegular = fallbackUrls.filter(
-				(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
-			);
-			const [reg, yt, rd] = await Promise.all([
-				lateRegular.length > 0
-					? scrapeUrlsViaApi(scrapeBase, lateRegular, {
-							includeImages: true,
-							aiSummary: true,
-						})
-					: { sources: [], errors: [] },
-				lateYoutube.length > 0
-					? scrapeYoutubeViaApi(apiBase, lateYoutube)
-					: { sources: [], errors: [] },
-				lateReddit.length > 0
-					? scrapeRedditViaApi(apiBase, lateReddit)
-					: { sources: [], errors: [] },
-			]);
-			let lateRedditFinal = rd;
-			if (
-				lateReddit.length > 0 &&
-				rd.sources?.length === 0 &&
-				rd.errors?.length > 0
-			) {
-				lateRedditFinal = await scrapeUrlsViaApi(scrapeBase, lateReddit, {
-					includeImages: true,
-					aiSummary: true,
-				});
-				if (lateRedditFinal.sources?.length > 0) {
-					console.log(
-						"[inkgest-agent] Reddit fallback (Puppeteer) succeeded (late scrape)",
-					);
-				}
-			}
-			scrapedSources = [
-				...(reg.sources || []),
-				...(yt.sources || []),
-				...(lateRedditFinal.sources || []),
-			];
-			if (reg.errors?.length) scrapeErrors.push(...reg.errors);
-			if (yt.errors?.length) scrapeErrors.push(...yt.errors);
-			if (lateRedditFinal.sources?.length === 0 && rd.errors?.length)
-				scrapeErrors.push(...rd.errors);
-		}
+						let tasksToRun = hasExecuteTasks
+							? executeTasks
+							: parsed.shouldExecute === true
+								? suggestedTasks
+								: [];
 
-		// Fallback: when only scrape is suggested but user wants a deliverable (summarise, blog, etc.), add article task
-		const wantsDeliverable =
-			/summarise|summarize|blog|article|create a|write a|from this (link|tweet|post|url)/i.test(
-				userPrompt,
-			);
-		const onlyScrape =
-			tasksToRun.length === 1 &&
-			tasksToRun[0]?.type === "scrape" &&
-			urlsToScrape.length > 0;
-		if (onlyScrape && wantsDeliverable) {
-			const format = /blog/i.test(userPrompt) ? "blog" : "article";
-			tasksToRun = [
-				...tasksToRun,
-				{
-					type: format,
-					label: `Create ${format} from scraped content`,
-					params: {
-						urls: urlsToScrape,
-						prompt:
-							format === "blog"
-								? "Create a blog post from this content"
-								: "Summarize the key points and takeaways",
-					},
-				},
-			];
-		}
+						// Ensure every task has params.urls — scrape/content tasks need URLs.
+						// Router may put URL in params.url (singular) or params.urls; inherit from other tasks when missing.
+						const urlsFromAllTasks = [
+							...new Set(
+								tasksToRun.flatMap((t) => {
+									const single = t.params?.url;
+									const multi = Array.isArray(t.params?.urls)
+										? t.params.urls
+										: [];
+									return [
+										...(single && /^https?:\/\/\S+$/i.test(String(single))
+											? [single]
+											: []),
+										...multi.filter((u) => /^https?:\/\/\S+$/i.test(String(u))),
+									];
+								}),
+							),
+						];
+						const fallbackUrls =
+							urlsToScrape.length > 0 ? urlsToScrape : urlsFromAllTasks;
+						tasksToRun = tasksToRun.map((t) => {
+							const single = t.params?.url;
+							const multi = Array.isArray(t.params?.urls) ? t.params.urls : [];
+							const fromTask = [
+								...(single && /^https?:\/\/\S+$/i.test(String(single))
+									? [single]
+									: []),
+								...multi.filter((u) => /^https?:\/\/\S+$/i.test(String(u))),
+							];
+							const hasUrls = fromTask.length > 0;
+							const taskUrls = hasUrls ? fromTask : fallbackUrls;
+							return { ...t, params: { ...t.params, urls: taskUrls } };
+						});
 
-		const sourceByUrl = Object.fromEntries(
-			scrapedSources.map((s) => [
-				s.url,
-				{
-					url: s.url,
-					markdown: s.markdown || "",
-					title: s.title || "",
-					links: s.links || [],
-				},
-			]),
-		);
+						if (hasImages) {
+							tasksToRun = tasksToRun.map((t) =>
+								t.type === "image-reading" &&
+								(!Array.isArray(t.params?.images) ||
+									t.params.images.length === 0)
+									? { ...t, params: { ...t.params, images: bodyImages } }
+									: t,
+							);
+						}
 
-		// Flatten all scraped sources into a simple reference list for the final payload
-		const allSourceReferences = scrapedSources
-			.filter((s) => s && s.url)
-			.map((s) => ({
-				url: s.url,
-				title: s.title || "",
-			}));
-
-		const validTasks = tasksToRun.filter(
-			(t) => t && TASK_TYPES.includes(t.type),
-		);
-
-		// CRITICAL: When URLs are provided to scrape and scraping fails, do NOT create any asset.
-		// End the task immediately — never fall back to AI-only content when scrape was expected.
-		const CONTENT_TYPES_NEEDING_SOURCES = [
-			"blog",
-			"article",
-			"newsletter",
-			"substack",
-			"linkedin",
-			"twitter",
-			"table",
-			"landing-page-generator",
-			"image-gallery-creator",
-			"infographics-svg-generator",
-		];
-		const contentTasksNeedingScrape = validTasks.filter(
-			(t) =>
-				CONTENT_TYPES_NEEDING_SOURCES.includes(t.type) &&
-				!t.params?.useCrawlResult,
-		);
-		if (
-			urlsToScrape.length > 0 &&
-			scrapedSources.length === 0 &&
-			contentTasksNeedingScrape.length > 0
-		) {
-			const errPayload = {
-				error:
-					"Scraping failed for all provided URLs. Cannot create content without source data. The AI will not generate assets when URLs are provided and scrape fails.",
-				scrapeErrors:
-					scrapeErrors.length > 0
-						? scrapeErrors
-						: ["No content could be extracted from the URLs."],
-				creditsUsed,
-				creditsDistribution,
-				tokenUsage,
-			};
-			console.error(
-				"[inkgest-agent] Aborting: scrape failed for URLs, not running content tasks.",
-				"urls:",
-				urlsToScrape,
-				"scrapeErrors:",
-				errPayload.scrapeErrors,
-			);
-			controller.enqueue(
-				encoder.encode(
-					send({
-						type: "end",
-						error: errPayload.error,
-						executed: [],
-						references: allSourceReferences,
-						scrapeErrors: errPayload.scrapeErrors,
-						creditsUsed: errPayload.creditsUsed,
-						creditsDistribution: errPayload.creditsDistribution,
-						tokenUsage: errPayload.tokenUsage,
-					}),
-				),
-			);
-			controller.close();
-			return;
-		}
-
-		state = {
-			tokenUsage: { ...tokenUsage },
-			creditsUsed,
-			creditsDistribution: [...creditsDistribution],
-			/** After crawl-url tasks run, filled with { url, markdown, title, links }[] for useCrawlResult content tasks */
-			crawlUrlSources: [],
-			/** After image-reading task runs, filled with same shape as scrape sources for blog/article etc. */
-			imageReadingSources: [],
-			/** Top-level list of all scraped source references (URLs + optional titles) */
-			references: allSourceReferences,
-		};
-
-		/** Build sources array from a crawl-url executed result for use in blog/table/article */
-		function buildSourcesFromCrawlResult(executed) {
-			const sources = [];
-			if (executed.homePageData && executed.homePageData.markdown != null) {
-				const hp = executed.homePageData;
-				sources.push({
-					url: executed.url || hp.url || "",
-					markdown: hp.markdown || "",
-					title: hp.data?.metadata?.title || hp.data?.title || "",
-					links: Array.isArray(hp.data?.links) ? hp.data.links : [],
-				});
-			}
-			(executed.nestedResults || []).forEach((r) => {
-				if (r.url) {
-					sources.push({
-						url: r.url,
-						markdown: r.markdown || "",
-						title: r.data?.metadata?.title || r.data?.title || "",
-						links: Array.isArray(r.data?.links) ? r.data.links : [],
-					});
-				}
-			});
-			return sources;
-		}
-
-		async function runOneTask(task) {
-			const params = task.params || {};
-			const urls = (Array.isArray(params.urls) ? params.urls : []).filter((u) =>
-				/^https?:\/\/\S+$/i.test(String(u)),
-			);
-			try {
-				if (task.type === "scrape") {
-					if (urls.length === 0) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: "No valid URLs",
-						};
-					}
-					const preScraped = urls.map((u) => sourceByUrl[u]).filter(Boolean);
-					let sources = preScraped;
-					if (sources.length < urls.length) {
-						const missingUrls = urls.filter((u) => !sourceByUrl[u]);
-						const missingYoutube = missingUrls.filter(isYoutubeUrl);
-						const missingReddit = missingUrls.filter(isRedditUrl);
-						const missingRegular = missingUrls.filter(
-							(u) => !isYoutubeUrl(u) && !isRedditUrl(u),
-						);
-						const [regularScraped, youtubeScraped, redditScraped] =
-							await Promise.all([
-								missingRegular.length > 0
-									? scrapeUrlsViaApi(scrapeBase, missingRegular, {
+						// When router inferred URLs (in tasks) but we didn't scrape (urlsToScrape was empty), scrape now
+						if (
+							scrapedSources.length === 0 &&
+							fallbackUrls.length > 0 &&
+							urlsToScrape.length === 0
+						) {
+							const lateReddit = fallbackUrls.filter(isRedditUrl);
+							const lateYoutube = fallbackUrls.filter(isYoutubeUrl);
+							const lateRegular = fallbackUrls.filter(
+								(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
+							);
+							const [reg, yt, rd] = await Promise.all([
+								lateRegular.length > 0
+									? scrapeUrlsViaApi(scrapeBase, lateRegular, {
 											includeImages: true,
 											aiSummary: true,
 										})
 									: { sources: [], errors: [] },
-								missingYoutube.length > 0
-									? scrapeYoutubeViaApi(apiBase, missingYoutube)
+								lateYoutube.length > 0
+									? scrapeYoutubeViaApi(apiBase, lateYoutube)
 									: { sources: [], errors: [] },
-								missingReddit.length > 0
-									? scrapeRedditViaApi(apiBase, missingReddit)
+								lateReddit.length > 0
+									? scrapeRedditViaApi(apiBase, lateReddit)
 									: { sources: [], errors: [] },
 							]);
-						let redditTask = redditScraped;
-						if (
-							missingReddit.length > 0 &&
-							redditScraped.sources?.length === 0 &&
-							redditScraped.errors?.length > 0
-						) {
-							redditTask = await scrapeUrlsViaApi(scrapeBase, missingReddit, {
-								includeImages: true,
-								aiSummary: true,
-							});
+							let lateRedditFinal = rd;
+							if (
+								lateReddit.length > 0 &&
+								rd.sources?.length === 0 &&
+								rd.errors?.length > 0
+							) {
+								lateRedditFinal = await scrapeUrlsViaApi(
+									scrapeBase,
+									lateReddit,
+									{
+										includeImages: true,
+										aiSummary: true,
+									},
+								);
+								if (lateRedditFinal.sources?.length > 0) {
+									console.log(
+										"[inkgest-agent] Reddit fallback (Puppeteer) succeeded (late scrape)",
+									);
+								}
+							}
+							scrapedSources = [
+								...(reg.sources || []),
+								...(yt.sources || []),
+								...(lateRedditFinal.sources || []),
+							];
+							if (reg.errors?.length) scrapeErrors.push(...reg.errors);
+							if (yt.errors?.length) scrapeErrors.push(...yt.errors);
+							if (lateRedditFinal.sources?.length === 0 && rd.errors?.length)
+								scrapeErrors.push(...rd.errors);
 						}
-						sources = [
-							...preScraped,
-							...(regularScraped.sources || []),
-							...(youtubeScraped.sources || []),
-							...(redditTask.sources || []),
-						];
-					}
-					if (sources.length === 0) {
-						console.error(
-							"[inkgest-agent] Scrape task failed: no content for URLs",
-							urls,
+
+						// Fallback: when only scrape is suggested but user wants a deliverable (summarise, blog, etc.), add article task
+						const wantsDeliverable =
+							/summarise|summarize|blog|article|create a|write a|from this (link|tweet|post|url)/i.test(
+								userPrompt,
+							);
+						const onlyScrape =
+							tasksToRun.length === 1 &&
+							tasksToRun[0]?.type === "scrape" &&
+							urlsToScrape.length > 0;
+						if (onlyScrape && wantsDeliverable) {
+							const format = /blog/i.test(userPrompt) ? "blog" : "article";
+							tasksToRun = [
+								...tasksToRun,
+								{
+									type: format,
+									label: `Create ${format} from scraped content`,
+									params: {
+										urls: urlsToScrape,
+										prompt:
+											format === "blog"
+												? "Create a blog post from this content"
+												: "Summarize the key points and takeaways",
+									},
+								},
+							];
+						}
+
+						const sourceByUrl = Object.fromEntries(
+							scrapedSources.map((s) => [
+								s.url,
+								{
+									url: s.url,
+									markdown: s.markdown || "",
+									title: s.title || "",
+									links: s.links || [],
+								},
+							]),
 						);
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: "Scrape failed for all URLs",
-						};
-					}
-					const content = sources
-						.map(
-							(s, i) =>
-								`--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`,
-						)
-						.join("\n\n");
-					const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
-					const images = sources
-						.flatMap((s) => s.links || [])
-						.filter((l) =>
-							imgExts.test(typeof l === "string" ? l : l?.url || ""),
-						)
-						.map((l) => (typeof l === "string" ? l : l?.url || ""))
-						.filter(Boolean)
-						.slice(0, 20);
-					state.creditsDistribution.push({
-						task: "scrape",
-						label: task.label,
-						credits: CREDITS.scrape,
-					});
-					state.creditsUsed += CREDITS.scrape;
-					return {
-						taskLabel: task.label,
-						success: true,
-						executed: {
-							type: "scrape",
-							label: task.label,
-							content,
-							title: sources[0]?.title || urls[0],
-							images,
-							urls: sources.map((s) => s.url),
-							result: { content, images, urls: sources.map((s) => s.url) },
-						},
-					};
-				}
 
-				if (task.type === "crawl-url") {
-					const seedUrl = params.url || urls[0];
-					if (!seedUrl || !/^https?:\/\//i.test(String(seedUrl))) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: "No valid URL for crawl-url",
-						};
-					}
-					const takeScreenshot = params.takeScreenshot === true;
-					const scrapeContent = params.scrapeContent === true;
-					const timeoutMs = scrapeContent ? 10 * 60 * 1000 : 5 * 60 * 1000;
-					const res = await fetch(`${scrapeBase}/crawl-url`, {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({
-							url: seedUrl,
-							takeScreenshot,
-							scrapeContent,
-							timeout: Math.min(timeoutMs, 300000),
-						}),
-						signal: AbortSignal.timeout(timeoutMs),
-					});
-					const data = await res.json().catch(() => ({}));
-					state.creditsDistribution.push({
-						task: "crawl-url",
-						label: task.label,
-						credits: CREDITS["crawl-url"],
-					});
-					state.creditsUsed += CREDITS["crawl-url"];
-					if (!res.ok) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: data?.error || `HTTP ${res.status}`,
-						};
-					}
-					const crawlExecuted = {
-						type: "crawl-url",
-						label: task.label,
-						url: seedUrl,
-						allUrls: data.allUrls || [],
-						homePageData: data.homePageData,
-						nestedResults: data.nestedResults,
-						screenshots: data.screenshots || [],
-					};
-					// Build sources for client rendering (same shape as scrape / useCrawlResult)
-					const crawlSources = buildSourcesFromCrawlResult(crawlExecuted);
-					if (crawlSources.length > 0) {
-						crawlExecuted.sources = crawlSources.map((s) => ({
-							url: s.url,
-							title: s.title,
-							markdown: s.markdown,
-							links: s.links,
-						}));
-						crawlExecuted.content = crawlSources
-							.map(
-								(s, i) =>
-									`--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`,
-							)
-							.join("\n\n");
-						const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
-						crawlExecuted.images = crawlSources
-							.flatMap((s) => s.links || [])
-							.filter((l) =>
-								imgExts.test(typeof l === "string" ? l : l?.url || ""),
-							)
-							.map((l) => (typeof l === "string" ? l : l?.url || ""))
-							.filter(Boolean)
-							.slice(0, 20);
-						crawlExecuted.result = {
-							content: crawlExecuted.content,
-							images: crawlExecuted.images,
-							sources: crawlExecuted.sources,
-						};
-					} else {
-						crawlExecuted.result = { content: "", images: [], sources: [] };
-					}
-					return {
-						taskLabel: task.label,
-						success: true,
-						executed: crawlExecuted,
-					};
-				}
+						// Flatten all scraped sources into a simple reference list for the final payload
+						const allSourceReferences = scrapedSources
+							.filter((s) => s && s.url)
+							.map((s) => ({
+								url: s.url,
+								title: s.title || "",
+							}));
 
-				if (task.type === "image-reading") {
-					const imgs = Array.isArray(params.images) ? params.images : [];
-					if (imgs.length === 0) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: "image-reading requires params.images (array of { url } or { base64, mimeType })",
-						};
-					}
-					const imageReadingRes = await fetch(`${apiBase}/image-reading`, {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({
-							images: imgs,
-							extractContent: true,
-							convertToCode: params.convertToCode === true,
-						}),
-						signal: AbortSignal.timeout(120_000),
-					});
-					const imageReadingData = await imageReadingRes.json().catch(() => ({}));
-					state.creditsDistribution.push({
-						task: "image-reading",
-						label: task.label,
-						credits: CREDITS["image-reading"],
-					});
-					state.creditsUsed += CREDITS["image-reading"];
-					if (!imageReadingRes.ok || !imageReadingData.success) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: imageReadingData?.error || `HTTP ${imageReadingRes.status}`,
-						};
-					}
-					const markdown = imageReadingData.markdown || "";
-					if (markdown && state.imageReadingSources) {
-						state.imageReadingSources.push({
-							url: "image-reading",
-							title: "Image content",
-							markdown,
-							links: [],
-						});
-					}
-					return {
-						taskLabel: task.label,
-						success: true,
-						executed: {
-							type: "image-reading",
-							label: task.label,
-							results: imageReadingData.results || [],
-							markdown,
-							result: {
-								results: imageReadingData.results,
-								markdown,
-							},
-						},
-					};
-				}
+						const validTasks = tasksToRun.filter(
+							(t) => t && TASK_TYPES.includes(t.type),
+						);
 
-				if (task.type === "github-trending") {
-					const since = params.since || "weekly";
-					const language = params.language || "";
-					const category = params.category || "";
-					const per_page = Math.min(Number(params.per_page) || 25, 100);
-					const query = new URLSearchParams();
-					if (since) query.set("since", since);
-					if (language) query.set("language", language);
-					if (category) query.set("category", category);
-					query.set("per_page", String(per_page));
-					const trendingRes = await fetch(
-						`${apiBase}/github-trending?${query.toString()}`,
-						{ signal: AbortSignal.timeout(30_000) },
-					);
-					const trendingData = await trendingRes.json().catch(() => ({}));
-					state.creditsDistribution.push({
-						task: "github-trending",
-						label: task.label,
-						credits: CREDITS["github-trending"],
-					});
-					state.creditsUsed += CREDITS["github-trending"];
-					if (!trendingRes.ok || !trendingData.ok) {
-						return {
-							taskLabel: task.label,
-							success: false,
-							error: trendingData?.error || `HTTP ${trendingRes.status}`,
-						};
-					}
-					return {
-						taskLabel: task.label,
-						success: true,
-						executed: {
-							type: "github-trending",
-							label: task.label,
-							meta: trendingData.meta ?? {},
-							data: trendingData.data ?? [],
-							result: {
-								meta: trendingData.meta,
-								data: trendingData.data,
-							},
-						},
-					};
-				}
-
-				const skill = SKILLS[task.type];
-				if (!skill || task.type === "scrape") {
-					return {
-						taskLabel: task.label,
-						success: false,
-						error: "Unknown task type",
-					};
-				}
-
-				const useCrawlResult =
-					params.useCrawlResult === true && state.crawlUrlSources?.length > 0;
-				let preSources = useCrawlResult
-					? state.crawlUrlSources
-					: urls.map((u) => sourceByUrl[u]).filter(Boolean);
-				if (state.imageReadingSources?.length > 0) {
-					preSources = [...preSources, ...state.imageReadingSources];
-				}
-
-				// Scrape path uses aiSummary: true where possible; condense step below if sources are still huge.
-
-				// CRITICAL: Do NOT create content when URLs were provided but scrape failed.
-				if (
-					urls.length > 0 &&
-					!useCrawlResult &&
-					state.imageReadingSources?.length === 0 &&
-					preSources.length === 0
-				) {
-					const errMsg =
-						"Scraping failed for provided URLs. Cannot create content without source data.";
-					console.error(
-						"[inkgest-agent] Content task aborted (no scraped sources):",
-						task.type,
-						task.label,
-						"urls:",
-						urls,
-					);
-					return {
-						taskLabel: task.label,
-						success: false,
-						error: errMsg,
-					};
-				}
-
-				const sourcesForSkill = await condenseSourcesIfOverBudget(
-					openRouterKey,
-					task.type,
-					preSources,
-					addTokenUsage,
-					state,
-				);
-
-				const format = params.format || "substack";
-				const style = params.style || "casual";
-				const system = skill.buildSystemPrompt(
-					format,
-					style,
-					sourcesForSkill.length > 0,
-				);
-				const user = skill.buildUserContent(
-					params.prompt || userPrompt,
-					sourcesForSkill,
-				);
-
-				const cappedMaxTokens = Math.min(
-					skill.maxTokens,
-					INKGEST_SKILL_MAX_OUTPUT_TOKENS,
-				);
-
-				const { content: rawContent, usage: skillUsage } =
-					await openRouterChatMessages(
-						openRouterKey,
-						[
-							{ role: "system", content: system },
-							{ role: "user", content: user },
-						],
-						cappedMaxTokens,
-						task.type === "infographics-svg-generator"
-							? { response_format: { type: "json_object" } }
-							: {},
-					);
-				addTokenUsage(skillUsage);
-				state.tokenUsage.prompt_tokens += skillUsage?.prompt_tokens || 0;
-				state.tokenUsage.completion_tokens +=
-					skillUsage?.completion_tokens || 0;
-				state.tokenUsage.total_tokens += skillUsage?.total_tokens || 0;
-
-				const taskCredits = CREDITS[task.type] ?? 1;
-				state.creditsDistribution.push({
-					task: task.type,
-					label: task.label,
-					credits: taskCredits,
-				});
-				state.creditsUsed += taskCredits;
-
-				// Any skill with parseResponse: merge parsed data into executed so client always gets structured payload (infographics, images, table, etc.)
-				if (skill.parseResponse) {
-					const parsedData = skill.parseResponse(rawContent);
-					const executed = {
-						type: task.type,
-						label: task.label,
-						...parsedData,
-						result: parsedData,
-					};
-					if (task.type === "table") executed.sourceUrls = urls;
-					// Ensure client has content for rendering: infographics and image-gallery need structured data
-					if (
-						task.type === "infographics-svg-generator" &&
-						Array.isArray(executed.infographics)
-					) {
-						executed.content = JSON.stringify(executed.infographics);
-					}
-					if (task.type === "image-gallery-creator") {
-						executed.content = Array.isArray(executed.images)
-							? JSON.stringify(executed.images)
-							: "[]";
-						executed.result = {
-							images: executed.images || [],
-							content: executed.content,
-						};
-					}
-					return {
-						taskLabel: task.label,
-						success: true,
-						executed,
-					};
-				}
-
-				// Default: content-based skills (newsletter, blog, article, landing-page-generator, etc.)
-				let content = rawContent.trim();
-				// Strip markdown code fences from HTML so client can render (LLMs often wrap in ```html ... ```)
-				if (task.type === "landing-page-generator") {
-					const m = content.match(/^\s*```(?:html)?\s*\n?([\s\S]*?)\n?```\s*$/);
-					content = m
-						? m[1].trim()
-						: content
-								.replace(/^```(?:html)?\s*\n?/, "")
-								.replace(/\n?```\s*$/, "")
-								.trim();
-				}
-				const usedCondensedBrief =
-					sourcesForSkill.length === 1 &&
-					sourcesForSkill[0]?.title === "Condensed source brief";
-				const executed = {
-					type: task.type,
-					label: task.label,
-					content,
-					format: task.type === "newsletter" ? format : undefined,
-					sources: preSources.map((s) => ({ url: s.url, title: s.title })),
-					...(usedCondensedBrief ? { condensedSources: true } : {}),
-					params: { urls, prompt: params.prompt, format, style },
-				};
-				// So client can render: landing page HTML, raw content (flat + nested for task.html / task.result?.html)
-				if (task.type === "landing-page-generator") {
-					executed.html = content;
-					executed.result = {
-						html: content,
-						content,
-						sources: executed.sources,
-					};
-				}
-				return {
-					taskLabel: task.label,
-					success: true,
-					executed,
-				};
-			} catch (e) {
-				return {
-					taskLabel: task.label,
-					success: false,
-					error: e?.message || "Task failed",
-				};
-			}
-		}
-
-				controller.enqueue(
-					encoder.encode(
-						send({
-							type: "start",
-							success: true,
-							thinking: parsed.thinking || "",
-							message: hasExecuteTasks
-								? `Running ${validTasks.length} task(s) (staged: crawl → images → data fetches → content).`
-								: parsed.message || "Here's what I suggest.",
-							suggestedTasks,
-						}),
-					),
-				);
-
-				if (validTasks.length === 0) {
-					controller.enqueue(
-						encoder.encode(
-							send({
-								type: "end",
-								executed: [],
-								errors: undefined,
+						// CRITICAL: When URLs are provided to scrape and scraping fails, do NOT create any asset.
+						// End the task immediately — never fall back to AI-only content when scrape was expected.
+						const CONTENT_TYPES_NEEDING_SOURCES = [
+							"blog",
+							"article",
+							"newsletter",
+							"substack",
+							"linkedin",
+							"twitter",
+							"table",
+							"landing-page-generator",
+							"image-gallery-creator",
+							"infographics-svg-generator",
+						];
+						const contentTasksNeedingScrape = validTasks.filter(
+							(t) =>
+								CONTENT_TYPES_NEEDING_SOURCES.includes(t.type) &&
+								!t.params?.useCrawlResult,
+						);
+						if (
+							urlsToScrape.length > 0 &&
+							scrapedSources.length === 0 &&
+							contentTasksNeedingScrape.length > 0
+						) {
+							const errPayload = {
+								error:
+									"Scraping failed for all provided URLs. Cannot create content without source data. The AI will not generate assets when URLs are provided and scrape fails.",
 								scrapeErrors:
-									scrapeErrors.length > 0 ? scrapeErrors : undefined,
-								// Top-level list of all source references (empty when no URLs)
-								references: state.references || [],
+									scrapeErrors.length > 0
+										? scrapeErrors
+										: ["No content could be extracted from the URLs."],
 								creditsUsed,
 								creditsDistribution,
 								tokenUsage,
-							}),
-						),
-					);
-					controller.close();
-					return;
-				}
-
-				const crawlUrlTasks = validTasks.filter((t) => t.type === "crawl-url");
-				const imageReadingTasks = validTasks.filter(
-					(t) => t.type === "image-reading",
-				);
-				const otherTasks = validTasks.filter(
-					(t) => t.type !== "crawl-url" && t.type !== "image-reading",
-				);
-				const prefetchTaskTypes = new Set(["scrape", "github-trending"]);
-				const prefetchTasks = otherTasks.filter((t) =>
-					prefetchTaskTypes.has(t.type),
-				);
-				const contentTasks = otherTasks.filter(
-					(t) => !prefetchTaskTypes.has(t.type),
-				);
-
-					const executed = [];
-					const errors = [];
-
-					// Phase 1a: run crawl-url tasks first so we have crawlUrlSources for useCrawlResult content tasks
-					if (crawlUrlTasks.length > 0) {
-						const results = await Promise.all(
-							crawlUrlTasks.map((t) => runOneTask(t)),
-						);
-						results.forEach((r, i) => {
+							};
+							console.error(
+								"[inkgest-agent] Aborting: scrape failed for URLs, not running content tasks.",
+								"urls:",
+								urlsToScrape,
+								"scrapeErrors:",
+								errPayload.scrapeErrors,
+							);
 							controller.enqueue(
 								encoder.encode(
 									send({
-										type: "task",
-										index: validTasks.indexOf(crawlUrlTasks[i]),
-										...r,
+										type: "end",
+										error: errPayload.error,
+										executed: [],
+										references: allSourceReferences,
+										scrapeErrors: errPayload.scrapeErrors,
+										creditsUsed: errPayload.creditsUsed,
+										creditsDistribution: errPayload.creditsDistribution,
+										tokenUsage: errPayload.tokenUsage,
 									}),
 								),
 							);
-							if (r.success && r.executed) {
-								executed.push(r.executed);
-								if (
-									r.executed.homePageData ||
-									(r.executed.nestedResults && r.executed.nestedResults.length)
-								) {
-									state.crawlUrlSources.push(
-										...buildSourcesFromCrawlResult(r.executed),
-									);
+							controller.close();
+							return;
+						}
+
+						state = {
+							tokenUsage: { ...tokenUsage },
+							creditsUsed,
+							creditsDistribution: [...creditsDistribution],
+							/** After crawl-url tasks run, filled with { url, markdown, title, links }[] for useCrawlResult content tasks */
+							crawlUrlSources: [],
+							/** After image-reading task runs, filled with same shape as scrape sources for blog/article etc. */
+							imageReadingSources: [],
+							/** Top-level list of all scraped source references (URLs + optional titles) */
+							references: allSourceReferences,
+						};
+
+						/** Build sources array from a crawl-url executed result for use in blog/table/article */
+						function buildSourcesFromCrawlResult(executed) {
+							const sources = [];
+							if (
+								executed.homePageData &&
+								executed.homePageData.markdown != null
+							) {
+								const hp = executed.homePageData;
+								sources.push({
+									url: executed.url || hp.url || "",
+									markdown: hp.markdown || "",
+									title: hp.data?.metadata?.title || hp.data?.title || "",
+									links: Array.isArray(hp.data?.links) ? hp.data.links : [],
+								});
+							}
+							(executed.nestedResults || []).forEach((r) => {
+								if (r.url) {
+									sources.push({
+										url: r.url,
+										markdown: r.markdown || "",
+										title: r.data?.metadata?.title || r.data?.title || "",
+										links: Array.isArray(r.data?.links) ? r.data.links : [],
+									});
 								}
-							} else {
-								console.error(
-									"[inkgest-agent] Task failed:",
-									r.taskLabel,
-									"error:",
-									r.error,
-								);
-								errors.push({ task: r.taskLabel, error: r.error });
-							}
-						});
-					}
+							});
+							return sources;
+						}
 
-					// Phase 1b: run image-reading so we have imageReadingSources for blog/article/newsletter etc.
-					if (imageReadingTasks.length > 0) {
-						const results = await Promise.all(
-							imageReadingTasks.map((t) => runOneTask(t)),
+						async function runOneTask(task) {
+							const params = task.params || {};
+							const urls = (
+								Array.isArray(params.urls) ? params.urls : []
+							).filter((u) => /^https?:\/\/\S+$/i.test(String(u)));
+							try {
+								if (task.type === "scrape") {
+									if (urls.length === 0) {
+										return {
+											taskLabel: task.label,
+											success: false,
+											error: "No valid URLs",
+										};
+									}
+									const preScraped = urls
+										.map((u) => sourceByUrl[u])
+										.filter(Boolean);
+									let sources = preScraped;
+									if (sources.length < urls.length) {
+										const missingUrls = urls.filter((u) => !sourceByUrl[u]);
+										const missingYoutube = missingUrls.filter(isYoutubeUrl);
+										const missingReddit = missingUrls.filter(isRedditUrl);
+										const missingRegular = missingUrls.filter(
+											(u) => !isYoutubeUrl(u) && !isRedditUrl(u),
+										);
+										const [regularScraped, youtubeScraped, redditScraped] =
+											await Promise.all([
+												missingRegular.length > 0
+													? scrapeUrlsViaApi(scrapeBase, missingRegular, {
+															includeImages: true,
+															aiSummary: true,
+														})
+													: { sources: [], errors: [] },
+												missingYoutube.length > 0
+													? scrapeYoutubeViaApi(apiBase, missingYoutube)
+													: { sources: [], errors: [] },
+												missingReddit.length > 0
+													? scrapeRedditViaApi(apiBase, missingReddit)
+													: { sources: [], errors: [] },
+											]);
+										let redditTask = redditScraped;
+										if (
+											missingReddit.length > 0 &&
+											redditScraped.sources?.length === 0 &&
+											redditScraped.errors?.length > 0
+										) {
+											redditTask = await scrapeUrlsViaApi(
+												scrapeBase,
+												missingReddit,
+												{
+													includeImages: true,
+													aiSummary: true,
+												},
+											);
+										}
+										sources = [
+											...preScraped,
+											...(regularScraped.sources || []),
+											...(youtubeScraped.sources || []),
+											...(redditTask.sources || []),
+										];
+									}
+									if (sources.length === 0) {
+										console.error(
+											"[inkgest-agent] Scrape task failed: no content for URLs",
+											urls,
+										);
+										return {
+											taskLabel: task.label,
+											success: false,
+											error: "Scrape failed for all URLs",
+										};
+									}
+									const content = sources
+										.map(
+											(s, i) =>
+												`--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`,
+										)
+										.join("\n\n");
+									const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
+									const images = sources
+										.flatMap((s) => s.links || [])
+										.filter((l) =>
+											imgExts.test(typeof l === "string" ? l : l?.url || ""),
+										)
+										.map((l) => (typeof l === "string" ? l : l?.url || ""))
+										.filter(Boolean)
+										.slice(0, 20);
+									state.creditsDistribution.push({
+										task: "scrape",
+										label: task.label,
+										credits: CREDITS.scrape,
+									});
+									state.creditsUsed += CREDITS.scrape;
+									return {
+										taskLabel: task.label,
+										success: true,
+										executed: {
+											type: "scrape",
+											label: task.label,
+											content,
+											title: sources[0]?.title || urls[0],
+											images,
+											urls: sources.map((s) => s.url),
+											result: {
+												content,
+												images,
+												urls: sources.map((s) => s.url),
+											},
+										},
+									};
+								}
+
+								if (task.type === "crawl-url") {
+									const seedUrl = params.url || urls[0];
+									if (!seedUrl || !/^https?:\/\//i.test(String(seedUrl))) {
+										return {
+											taskLabel: task.label,
+											success: false,
+											error: "No valid URL for crawl-url",
+										};
+									}
+									const takeScreenshot = params.takeScreenshot === true;
+									const scrapeContent = params.scrapeContent === true;
+									const timeoutMs = scrapeContent
+										? 10 * 60 * 1000
+										: 5 * 60 * 1000;
+									const res = await fetch(`${scrapeBase}/crawl-url`, {
+										method: "POST",
+										headers: { "Content-Type": "application/json" },
+										body: JSON.stringify({
+											url: seedUrl,
+											takeScreenshot,
+											scrapeContent,
+											timeout: Math.min(timeoutMs, 300000),
+										}),
+										signal: AbortSignal.timeout(timeoutMs),
+									});
+									const data = await res.json().catch(() => ({}));
+									state.creditsDistribution.push({
+										task: "crawl-url",
+										label: task.label,
+										credits: CREDITS["crawl-url"],
+									});
+									state.creditsUsed += CREDITS["crawl-url"];
+									if (!res.ok) {
+										return {
+											taskLabel: task.label,
+											success: false,
+											error: data?.error || `HTTP ${res.status}`,
+										};
+									}
+									const crawlExecuted = {
+										type: "crawl-url",
+										label: task.label,
+										url: seedUrl,
+										allUrls: data.allUrls || [],
+										homePageData: data.homePageData,
+										nestedResults: data.nestedResults,
+										screenshots: data.screenshots || [],
+									};
+									// Build sources for client rendering (same shape as scrape / useCrawlResult)
+									const crawlSources =
+										buildSourcesFromCrawlResult(crawlExecuted);
+									if (crawlSources.length > 0) {
+										crawlExecuted.sources = crawlSources.map((s) => ({
+											url: s.url,
+											title: s.title,
+											markdown: s.markdown,
+											links: s.links,
+										}));
+										crawlExecuted.content = crawlSources
+											.map(
+												(s, i) =>
+													`--- Source ${i + 1}: ${s.url} ---\n\n${s.title ? `# ${s.title}\n\n` : ""}${s.markdown}`,
+											)
+											.join("\n\n");
+										const imgExts = /\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|$)/i;
+										crawlExecuted.images = crawlSources
+											.flatMap((s) => s.links || [])
+											.filter((l) =>
+												imgExts.test(typeof l === "string" ? l : l?.url || ""),
+											)
+											.map((l) => (typeof l === "string" ? l : l?.url || ""))
+											.filter(Boolean)
+											.slice(0, 20);
+										crawlExecuted.result = {
+											content: crawlExecuted.content,
+											images: crawlExecuted.images,
+											sources: crawlExecuted.sources,
+										};
+									} else {
+										crawlExecuted.result = {
+											content: "",
+											images: [],
+											sources: [],
+										};
+									}
+									return {
+										taskLabel: task.label,
+										success: true,
+										executed: crawlExecuted,
+									};
+								}
+
+								if (task.type === "image-reading") {
+									const imgs = Array.isArray(params.images)
+										? params.images
+										: [];
+									if (imgs.length === 0) {
+										return {
+											taskLabel: task.label,
+											success: false,
+											error:
+												"image-reading requires params.images (array of { url } or { base64, mimeType })",
+										};
+									}
+									const imageReadingRes = await fetch(
+										`${apiBase}/image-reading`,
+										{
+											method: "POST",
+											headers: { "Content-Type": "application/json" },
+											body: JSON.stringify({
+												images: imgs,
+												extractContent: true,
+												convertToCode: params.convertToCode === true,
+											}),
+											signal: AbortSignal.timeout(120_000),
+										},
+									);
+									const imageReadingData = await imageReadingRes
+										.json()
+										.catch(() => ({}));
+									state.creditsDistribution.push({
+										task: "image-reading",
+										label: task.label,
+										credits: CREDITS["image-reading"],
+									});
+									state.creditsUsed += CREDITS["image-reading"];
+									if (!imageReadingRes.ok || !imageReadingData.success) {
+										return {
+											taskLabel: task.label,
+											success: false,
+											error:
+												imageReadingData?.error ||
+												`HTTP ${imageReadingRes.status}`,
+										};
+									}
+									const markdown = imageReadingData.markdown || "";
+									if (markdown && state.imageReadingSources) {
+										state.imageReadingSources.push({
+											url: "image-reading",
+											title: "Image content",
+											markdown,
+											links: [],
+										});
+									}
+									return {
+										taskLabel: task.label,
+										success: true,
+										executed: {
+											type: "image-reading",
+											label: task.label,
+											results: imageReadingData.results || [],
+											markdown,
+											result: {
+												results: imageReadingData.results,
+												markdown,
+											},
+										},
+									};
+								}
+
+								if (task.type === "github-trending") {
+									const since = params.since || "weekly";
+									const language = params.language || "";
+									const category = params.category || "";
+									const per_page = Math.min(Number(params.per_page) || 25, 100);
+									const query = new URLSearchParams();
+									if (since) query.set("since", since);
+									if (language) query.set("language", language);
+									if (category) query.set("category", category);
+									query.set("per_page", String(per_page));
+									const trendingRes = await fetch(
+										`${apiBase}/github-trending?${query.toString()}`,
+										{ signal: AbortSignal.timeout(30_000) },
+									);
+									const trendingData = await trendingRes
+										.json()
+										.catch(() => ({}));
+									state.creditsDistribution.push({
+										task: "github-trending",
+										label: task.label,
+										credits: CREDITS["github-trending"],
+									});
+									state.creditsUsed += CREDITS["github-trending"];
+									if (!trendingRes.ok || !trendingData.ok) {
+										return {
+											taskLabel: task.label,
+											success: false,
+											error:
+												trendingData?.error || `HTTP ${trendingRes.status}`,
+										};
+									}
+									return {
+										taskLabel: task.label,
+										success: true,
+										executed: {
+											type: "github-trending",
+											label: task.label,
+											meta: trendingData.meta ?? {},
+											data: trendingData.data ?? [],
+											result: {
+												meta: trendingData.meta,
+												data: trendingData.data,
+											},
+										},
+									};
+								}
+
+								const skill = SKILLS[task.type];
+								if (!skill || task.type === "scrape") {
+									return {
+										taskLabel: task.label,
+										success: false,
+										error: "Unknown task type",
+									};
+								}
+
+								const useCrawlResult =
+									params.useCrawlResult === true &&
+									state.crawlUrlSources?.length > 0;
+								let preSources = useCrawlResult
+									? state.crawlUrlSources
+									: urls.map((u) => sourceByUrl[u]).filter(Boolean);
+								if (state.imageReadingSources?.length > 0) {
+									preSources = [...preSources, ...state.imageReadingSources];
+								}
+
+								// Scrape path uses aiSummary: true where possible; condense step below if sources are still huge.
+
+								// CRITICAL: Do NOT create content when URLs were provided but scrape failed.
+								if (
+									urls.length > 0 &&
+									!useCrawlResult &&
+									state.imageReadingSources?.length === 0 &&
+									preSources.length === 0
+								) {
+									const errMsg =
+										"Scraping failed for provided URLs. Cannot create content without source data.";
+									console.error(
+										"[inkgest-agent] Content task aborted (no scraped sources):",
+										task.type,
+										task.label,
+										"urls:",
+										urls,
+									);
+									return {
+										taskLabel: task.label,
+										success: false,
+										error: errMsg,
+									};
+								}
+
+								const sourcesForSkill = await condenseSourcesIfOverBudget(
+									openRouterKey,
+									task.type,
+									preSources,
+									addTokenUsage,
+									state,
+								);
+
+								const format = params.format || "substack";
+								const style = params.style || "casual";
+								const system = skill.buildSystemPrompt(
+									format,
+									style,
+									sourcesForSkill.length > 0,
+								);
+								const user = skill.buildUserContent(
+									params.prompt || userPrompt,
+									sourcesForSkill,
+								);
+
+								const cappedMaxTokens = Math.min(
+									skill.maxTokens,
+									INKGEST_SKILL_MAX_OUTPUT_TOKENS,
+								);
+
+								const { content: rawContent, usage: skillUsage } =
+									await openRouterChatMessages(
+										openRouterKey,
+										[
+											{ role: "system", content: system },
+											{ role: "user", content: user },
+										],
+										cappedMaxTokens,
+										task.type === "infographics-svg-generator"
+											? { response_format: { type: "json_object" } }
+											: {},
+									);
+								addTokenUsage(skillUsage);
+								state.tokenUsage.prompt_tokens +=
+									skillUsage?.prompt_tokens || 0;
+								state.tokenUsage.completion_tokens +=
+									skillUsage?.completion_tokens || 0;
+								state.tokenUsage.total_tokens += skillUsage?.total_tokens || 0;
+
+								const taskCredits = CREDITS[task.type] ?? 1;
+								state.creditsDistribution.push({
+									task: task.type,
+									label: task.label,
+									credits: taskCredits,
+								});
+								state.creditsUsed += taskCredits;
+
+								// Any skill with parseResponse: merge parsed data into executed so client always gets structured payload (infographics, images, table, etc.)
+								if (skill.parseResponse) {
+									const parsedData = skill.parseResponse(rawContent);
+									const executed = {
+										type: task.type,
+										label: task.label,
+										...parsedData,
+										result: parsedData,
+									};
+									if (task.type === "table") executed.sourceUrls = urls;
+									// Ensure client has content for rendering: infographics and image-gallery need structured data
+									if (
+										task.type === "infographics-svg-generator" &&
+										Array.isArray(executed.infographics)
+									) {
+										executed.content = JSON.stringify(executed.infographics);
+									}
+									if (task.type === "image-gallery-creator") {
+										executed.content = Array.isArray(executed.images)
+											? JSON.stringify(executed.images)
+											: "[]";
+										executed.result = {
+											images: executed.images || [],
+											content: executed.content,
+										};
+									}
+									return {
+										taskLabel: task.label,
+										success: true,
+										executed,
+									};
+								}
+
+								// Default: content-based skills (newsletter, blog, article, landing-page-generator, etc.)
+								let content = rawContent.trim();
+								// Strip markdown code fences from HTML so client can render (LLMs often wrap in ```html ... ```)
+								if (task.type === "landing-page-generator") {
+									const m = content.match(
+										/^\s*```(?:html)?\s*\n?([\s\S]*?)\n?```\s*$/,
+									);
+									content = m
+										? m[1].trim()
+										: content
+												.replace(/^```(?:html)?\s*\n?/, "")
+												.replace(/\n?```\s*$/, "")
+												.trim();
+								}
+								const usedCondensedBrief =
+									sourcesForSkill.length === 1 &&
+									sourcesForSkill[0]?.title === "Condensed source brief";
+								const executed = {
+									type: task.type,
+									label: task.label,
+									content,
+									format: task.type === "newsletter" ? format : undefined,
+									sources: preSources.map((s) => ({
+										url: s.url,
+										title: s.title,
+									})),
+									...(usedCondensedBrief ? { condensedSources: true } : {}),
+									params: { urls, prompt: params.prompt, format, style },
+								};
+								// So client can render: landing page HTML, raw content (flat + nested for task.html / task.result?.html)
+								if (task.type === "landing-page-generator") {
+									executed.html = content;
+									executed.result = {
+										html: content,
+										content,
+										sources: executed.sources,
+									};
+								}
+								return {
+									taskLabel: task.label,
+									success: true,
+									executed,
+								};
+							} catch (e) {
+								return {
+									taskLabel: task.label,
+									success: false,
+									error: e?.message || "Task failed",
+								};
+							}
+						}
+
+						controller.enqueue(
+							encoder.encode(
+								send({
+									type: "start",
+									success: true,
+									thinking: parsed.thinking || "",
+									message: hasExecuteTasks
+										? `Running ${validTasks.length} task(s) (staged: crawl → images → data fetches → content).`
+										: parsed.message || "Here's what I suggest.",
+									suggestedTasks,
+								}),
+							),
 						);
-						results.forEach((r, i) => {
+
+						if (validTasks.length === 0) {
 							controller.enqueue(
 								encoder.encode(
 									send({
-										type: "task",
-										index: validTasks.indexOf(imageReadingTasks[i]),
-										...r,
+										type: "end",
+										executed: [],
+										errors: undefined,
+										scrapeErrors:
+											scrapeErrors.length > 0 ? scrapeErrors : undefined,
+										// Top-level list of all source references (empty when no URLs)
+										references: state.references || [],
+										creditsUsed,
+										creditsDistribution,
+										tokenUsage,
 									}),
 								),
 							);
-							if (r.success && r.executed) executed.push(r.executed);
-							else if (r.error) {
-								console.error(
-									"[inkgest-agent] Task failed:",
-									r.taskLabel,
-									"error:",
-									r.error,
-								);
-								errors.push({ task: r.taskLabel, error: r.error });
-							}
-						});
-					}
+							controller.close();
+							return;
+						}
 
-					// Phase 2a: data-fetch tasks (scrape / github-trending) in parallel
-					if (prefetchTasks.length > 0) {
-						const results = await Promise.all(
-							prefetchTasks.map((t) => runOneTask(t)),
+						// Deduplicate: skip crawl-url when the target URL was already scraped
+						// in the global scrape phase. Seed crawlUrlSources from the existing
+						// scraped data so useCrawlResult content tasks (blog, article, etc.)
+						// still receive source material without a redundant full-site crawl.
+						const deduplicatedTasks = validTasks.filter((t) => {
+							if (t.type !== "crawl-url") return true;
+							const targetUrl =
+								t.params?.url ||
+								(Array.isArray(t.params?.urls) ? t.params.urls[0] : null);
+							if (targetUrl && sourceByUrl[targetUrl]) {
+								const existing = sourceByUrl[targetUrl];
+								if (
+									existing &&
+									!state.crawlUrlSources.some((s) => s.url === existing.url)
+								) {
+									state.crawlUrlSources.push(existing);
+								}
+								console.log(
+									"[inkgest-agent] Skipping redundant crawl-url (already scraped):",
+									targetUrl,
+								);
+								return false;
+							}
+							return true;
+						});
+
+						const crawlUrlTasks = deduplicatedTasks.filter(
+							(t) => t.type === "crawl-url",
 						);
-						results.forEach((r, i) => {
-							controller.enqueue(
-								encoder.encode(
-									send({
-										type: "task",
-										index: validTasks.indexOf(prefetchTasks[i]),
-										...r,
-									}),
-								),
-							);
-							if (r.success && r.executed) executed.push(r.executed);
-							else if (r.error) {
-								console.error(
-									"[inkgest-agent] Task failed:",
-									r.taskLabel,
-									"error:",
-									r.error,
-								);
-								errors.push({ task: r.taskLabel, error: r.error });
-							}
-						});
-					}
-
-					// Phase 2b: content / LLM tasks in parallel (after global scrape + prefetch)
-					if (contentTasks.length > 0) {
-						const results = await Promise.all(
-							contentTasks.map((t) => runOneTask(t)),
+						const imageReadingTasks = deduplicatedTasks.filter(
+							(t) => t.type === "image-reading",
 						);
-						results.forEach((r, i) => {
-							controller.enqueue(
-								encoder.encode(
-									send({
-										type: "task",
-										index: validTasks.indexOf(contentTasks[i]),
-										...r,
-									}),
-								),
-							);
-							if (r.success && r.executed) executed.push(r.executed);
-							else if (r.error) {
-								console.error(
-									"[inkgest-agent] Task failed:",
-									r.taskLabel,
-									"error:",
-									r.error,
-								);
-								errors.push({ task: r.taskLabel, error: r.error });
-							}
-						});
-					}
+						const otherTasks = deduplicatedTasks.filter(
+							(t) => t.type !== "crawl-url" && t.type !== "image-reading",
+						);
+						const prefetchTaskTypes = new Set(["scrape", "github-trending"]);
+						const prefetchTasks = otherTasks.filter((t) =>
+							prefetchTaskTypes.has(t.type),
+						);
+						const contentTasks = otherTasks.filter(
+							(t) => !prefetchTaskTypes.has(t.type),
+						);
 
-					controller.enqueue(
-						encoder.encode(
-							send({
-								type: "end",
-								executed,
-								// Top-level list of all source references (empty when no URLs)
-								references: state.references || [],
-								errors: errors.length > 0 ? errors : undefined,
-								scrapeErrors:
-									scrapeErrors.length > 0 ? scrapeErrors : undefined,
-								creditsUsed: state.creditsUsed,
-								creditsDistribution: state.creditsDistribution,
-								tokenUsage: state.tokenUsage,
-							}),
-						),
-					);
-					controller.close();
+						const executed = [];
+						const errors = [];
+
+						// Phase 1a: run crawl-url tasks first so we have crawlUrlSources for useCrawlResult content tasks
+						if (crawlUrlTasks.length > 0) {
+							const results = await Promise.all(
+								crawlUrlTasks.map((t) => runOneTask(t)),
+							);
+							results.forEach((r, i) => {
+								controller.enqueue(
+									encoder.encode(
+										send({
+											type: "task",
+											index: deduplicatedTasks.indexOf(crawlUrlTasks[i]),
+											...r,
+										}),
+									),
+								);
+								if (r.success && r.executed) {
+									executed.push(r.executed);
+									if (
+										r.executed.homePageData ||
+										(r.executed.nestedResults &&
+											r.executed.nestedResults.length)
+									) {
+										state.crawlUrlSources.push(
+											...buildSourcesFromCrawlResult(r.executed),
+										);
+									}
+								} else {
+									console.error(
+										"[inkgest-agent] Task failed:",
+										r.taskLabel,
+										"error:",
+										r.error,
+									);
+									errors.push({ task: r.taskLabel, error: r.error });
+								}
+							});
+						}
+
+						// Phase 1b: run image-reading so we have imageReadingSources for blog/article/newsletter etc.
+						if (imageReadingTasks.length > 0) {
+							const results = await Promise.all(
+								imageReadingTasks.map((t) => runOneTask(t)),
+							);
+							results.forEach((r, i) => {
+								controller.enqueue(
+									encoder.encode(
+										send({
+											type: "task",
+											index: deduplicatedTasks.indexOf(imageReadingTasks[i]),
+											...r,
+										}),
+									),
+								);
+								if (r.success && r.executed) executed.push(r.executed);
+								else if (r.error) {
+									console.error(
+										"[inkgest-agent] Task failed:",
+										r.taskLabel,
+										"error:",
+										r.error,
+									);
+									errors.push({ task: r.taskLabel, error: r.error });
+								}
+							});
+						}
+
+						// Phase 2a: data-fetch tasks (scrape / github-trending) in parallel
+						if (prefetchTasks.length > 0) {
+							const results = await Promise.all(
+								prefetchTasks.map((t) => runOneTask(t)),
+							);
+							results.forEach((r, i) => {
+								controller.enqueue(
+									encoder.encode(
+										send({
+											type: "task",
+											index: deduplicatedTasks.indexOf(prefetchTasks[i]),
+											...r,
+										}),
+									),
+								);
+								if (r.success && r.executed) executed.push(r.executed);
+								else if (r.error) {
+									console.error(
+										"[inkgest-agent] Task failed:",
+										r.taskLabel,
+										"error:",
+										r.error,
+									);
+									errors.push({ task: r.taskLabel, error: r.error });
+								}
+							});
+						}
+
+						// Phase 2b: content / LLM tasks in parallel (after global scrape + prefetch)
+						if (contentTasks.length > 0) {
+							const results = await Promise.all(
+								contentTasks.map((t) => runOneTask(t)),
+							);
+							results.forEach((r, i) => {
+								controller.enqueue(
+									encoder.encode(
+										send({
+											type: "task",
+											index: deduplicatedTasks.indexOf(contentTasks[i]),
+											...r,
+										}),
+									),
+								);
+								if (r.success && r.executed) executed.push(r.executed);
+								else if (r.error) {
+									console.error(
+										"[inkgest-agent] Task failed:",
+										r.taskLabel,
+										"error:",
+										r.error,
+									);
+									errors.push({ task: r.taskLabel, error: r.error });
+								}
+							});
+						}
+
+						controller.enqueue(
+							encoder.encode(
+								send({
+									type: "end",
+									executed,
+									// Top-level list of all source references (empty when no URLs)
+									references: state.references || [],
+									errors: errors.length > 0 ? errors : undefined,
+									scrapeErrors:
+										scrapeErrors.length > 0 ? scrapeErrors : undefined,
+									creditsUsed: state.creditsUsed,
+									creditsDistribution: state.creditsDistribution,
+									tokenUsage: state.tokenUsage,
+								}),
+							),
+						);
+						controller.close();
 					} catch (innerErr) {
 						console.error("[inkgest-agent] stream pipeline", innerErr);
 						try {
@@ -5891,7 +6603,8 @@ async function captureOneScreenshotWithPage(page, options) {
 				if (!body) return false;
 				const rect = body.getBoundingClientRect();
 				const textLen = (body.innerText || "").trim().length;
-				const hasMedia = document.images.length > 0 || document.querySelector("video, canvas");
+				const hasMedia =
+					document.images.length > 0 || document.querySelector("video, canvas");
 				return (
 					(rs === "interactive" || rs === "complete") &&
 					rect.width > 0 &&
@@ -6176,16 +6889,18 @@ async function isLikelyStaticSite(url) {
 			maxRedirects: 5,
 			headers: {
 				"User-Agent": userAgents.random().toString(),
-				Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+				Accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 				"Accept-Language": "en-US,en;q=0.9",
 			},
 		});
 		const html = typeof resp?.data === "string" ? resp.data : "";
 		if (!html) return false;
 		const scriptTags = (html.match(/<script[\s>]/gi) || []).length;
-		const inlineHydrationHints = /__NEXT_DATA__|__NUXT__|window\.__INITIAL_STATE__|id="root"|id="__next"|data-reactroot|sveltekit|astro-island/i.test(
-			html,
-		);
+		const inlineHydrationHints =
+			/__NEXT_DATA__|__NUXT__|window\.__INITIAL_STATE__|id="root"|id="__next"|data-reactroot|sveltekit|astro-island/i.test(
+				html,
+			);
 		// Simple heuristic: fewer scripts and no framework hydration hints => likely static.
 		return scriptTags <= 3 && !inlineHydrationHints;
 	} catch {
@@ -6223,23 +6938,28 @@ async function smartCaptureScreenshot(url, options = {}) {
 	} = options;
 
 	const staticSite =
-		forceMode === "static" ? true : forceMode === "dynamic" ? false : await isLikelyStaticSite(url);
+		forceMode === "static"
+			? true
+			: forceMode === "dynamic"
+				? false
+				: await isLikelyStaticSite(url);
 
 	if (staticSite) {
-		const { buffer, metadata, markdown, dimensions } = await browserPool.withPage((page) =>
-			captureOneScreenshotWithPage(page, {
-				url,
-				device,
-				waitUntil,
-				waitForSelector,
-				timeout,
-				contentReadyTimeout,
-				postLoadWaitMs,
-				fullPage,
-				coords,
-				blockDistractions,
-			}),
-		);
+		const { buffer, metadata, markdown, dimensions } =
+			await browserPool.withPage((page) =>
+				captureOneScreenshotWithPage(page, {
+					url,
+					device,
+					waitUntil,
+					waitForSelector,
+					timeout,
+					contentReadyTimeout,
+					postLoadWaitMs,
+					fullPage,
+					coords,
+					blockDistractions,
+				}),
+			);
 		const screenshot = await uploadScreenshotBuffer(buffer);
 		return {
 			success: true,
@@ -6267,20 +6987,21 @@ async function smartCaptureScreenshot(url, options = {}) {
 
 	if (!result?.success || !result?.screenshot) {
 		// If dynamic path fails, fallback to direct screenshot capture to avoid hard failure.
-		const { buffer, metadata, markdown, dimensions } = await browserPool.withPage((page) =>
-			captureOneScreenshotWithPage(page, {
-				url,
-				device,
-				waitUntil,
-				waitForSelector,
-				timeout,
-				contentReadyTimeout,
-				postLoadWaitMs,
-				fullPage,
-				coords,
-				blockDistractions,
-			}),
-		);
+		const { buffer, metadata, markdown, dimensions } =
+			await browserPool.withPage((page) =>
+				captureOneScreenshotWithPage(page, {
+					url,
+					device,
+					waitUntil,
+					waitForSelector,
+					timeout,
+					contentReadyTimeout,
+					postLoadWaitMs,
+					fullPage,
+					coords,
+					blockDistractions,
+				}),
+			);
 		const screenshot = await uploadScreenshotBuffer(buffer);
 		return {
 			success: true,
@@ -6300,7 +7021,8 @@ async function smartCaptureScreenshot(url, options = {}) {
 		screenshot: result.screenshot,
 		metadata: result?.data?.metadata || null,
 		markdown: result?.markdown || null,
-		dimensions: SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop,
+		dimensions:
+			SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop,
 	};
 }
 
@@ -7591,7 +8313,8 @@ app.post("/scrape-reddit", async (c) => {
 function extractYouTubeVideoId(idOrUrl) {
 	if (!idOrUrl || typeof idOrUrl !== "string") return null;
 	const s = idOrUrl.trim();
-	const youtuBe = /^(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})(?:\?|$)/;
+	const youtuBe =
+		/^(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})(?:\?|$)/;
 	const watch = /(?:v=)([a-zA-Z0-9_-]{11})(?:&|$)/;
 	const m = s.match(youtuBe) || s.match(watch);
 	if (m) return m[1];
@@ -8078,7 +8801,8 @@ async function normalizeImageInput(img) {
 		if (!res.ok) throw new Error(`Failed to fetch image: ${res.status}`);
 		const buf = await res.arrayBuffer();
 		const base64 = Buffer.from(buf).toString("base64");
-		const mimeType = res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+		const mimeType =
+			res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
 		return { base64, mimeType };
 	}
 	return null;
@@ -8092,15 +8816,14 @@ async function normalizeImageInput(img) {
 app.post("/image-reading", async (c) => {
 	try {
 		const body = await c.req.json().catch(() => ({}));
-		const {
-			images = [],
-			convertToCode = false,
-			extractContent = true,
-		} = body;
+		const { images = [], convertToCode = false, extractContent = true } = body;
 
 		if (!Array.isArray(images) || images.length === 0) {
 			return c.json(
-				{ success: false, error: "images array is required and must not be empty" },
+				{
+					success: false,
+					error: "images array is required and must not be empty",
+				},
 				400,
 			);
 		}
@@ -8116,7 +8839,10 @@ app.post("/image-reading", async (c) => {
 		}
 		if (normalized.length === 0) {
 			return c.json(
-				{ success: false, error: "No valid image could be loaded from images array" },
+				{
+					success: false,
+					error: "No valid image could be loaded from images array",
+				},
 				400,
 			);
 		}
@@ -8145,7 +8871,8 @@ app.post("/image-reading", async (c) => {
 						],
 					});
 					const text =
-						contentRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+						contentRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+						"";
 					result.content = text || "(No text extracted)";
 					markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
 				} catch (e) {
@@ -8738,7 +9465,7 @@ Rules:
 });
 
 // Google News Scraping Endpoint
-app.post("/scrap-google-news", async (c) => {
+app.post("/scrape-google-news", async (c) => {
 	const operationId = performanceMonitor.startOperation("scrap_google_news");
 
 	try {
@@ -8755,152 +9482,62 @@ app.post("/scrap-google-news", async (c) => {
 			);
 		}
 
-		// Validate limit parameter
-		const articleLimit = Math.min(Math.max(parseInt(limit) || 20, 1), 50); // Between 1 and 50 articles
+		const articleLimit = Math.min(Math.max(parseInt(limit) || 20, 1), 50);
 
-		// Construct Google News search URL
 		const searchQuery = encodeURIComponent(`${city} ${state}`);
 		const googleNewsUrl = `https://news.google.com/search?q=${searchQuery}&hl=en&gl=US&ceid=US%3Aen`;
 
 		console.log(`Scraping Google News for: ${city}, ${state}`);
-		console.log(`URL: ${googleNewsUrl}`);
 
-		// Use axios to fetch the page
-		const response = await axios.get(googleNewsUrl, {
-			headers: {
-				"User-Agent": userAgents.toString(),
-				Accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.5",
-				"Accept-Encoding": "gzip, deflate, br",
-				DNT: "1",
-				Connection: "keep-alive",
-				"Upgrade-Insecure-Requests": "1",
-			},
+		const scrapeResult = await scrapeSingleUrlWithPuppeteer(googleNewsUrl, {
+			includeSemanticContent: true,
+			includeLinks: true,
+			includeImages: false,
+			extractMetadata: true,
 			timeout: 30000,
 		});
 
-		const $ = load(response.data);
-		const newsArticles = [];
+		const scrapedData = scrapeResult?.data ?? scrapeResult?.scrapedData ?? {};
+		const rawLinks = scrapedData?.links ?? [];
+		const headings = [
+			...(scrapedData?.content?.h3 ?? []),
+			...(scrapedData?.content?.h4 ?? []),
+		];
 
-		// Parse Google News articles
-		$("article").each((index, element) => {
-			if (index >= articleLimit) return false; // Limit to specified number of articles
-
-			const $article = $(element);
-
-			// Extract article data
-			const titleElement = $article.find("h3 a, h4 a").first();
-			const title = titleElement.text().trim();
-			const link = titleElement.attr("href");
-
-			const sourceElement = $article.find(
-				'[data-testid="source-name"], .wEwyrc, .NUnG9d',
+		// Google News article links contain "/articles/" or "/read/" in the path
+		const articleLinks = rawLinks.filter((link) => {
+			const href = link?.href ?? "";
+			return (
+				href.includes("/articles/") ||
+				href.includes("/read/") ||
+				href.includes("news.google.com/stories")
 			);
-			const source = sourceElement.text().trim();
-
-			const timeElement = $article.find("time, .OSrXXb");
-			const timeText = timeElement.text().trim();
-
-			const snippetElement = $article.find(".GI74Re, .Y3v8qd");
-			const snippet = snippetElement.text().trim();
-
-			// Check for image presence
-			const imageElement = $article.find("img").first();
-			const hasImage = imageElement.length > 0;
-			let imageUrl = null;
-
-			if (hasImage) {
-				const src = imageElement.attr("src");
-				if (src) {
-					// Convert relative URLs to absolute URLs
-					if (src.startsWith("//")) {
-						imageUrl = `https:${src}`;
-					} else if (src.startsWith("/")) {
-						imageUrl = `https://news.google.com${src}`;
-					} else if (src.startsWith("./")) {
-						imageUrl = `https://news.google.com${src.substring(1)}`;
-					} else if (!src.startsWith("http")) {
-						imageUrl = `https://news.google.com/${src}`;
-					} else {
-						imageUrl = src;
-					}
-				}
-			}
-
-			if (title && link) {
-				newsArticles.push({
-					title,
-					link: link.startsWith("./")
-						? `https://news.google.com${link.substring(1)}`
-						: link,
-					source: source || "Unknown",
-					time: timeText || "Unknown",
-					snippet: snippet || "",
-					imageUrl: imageUrl || null,
-					index: index + 1,
-				});
-			}
 		});
 
-		// If no articles found with the above selectors, try alternative selectors
-		if (newsArticles.length === 0) {
-			$(".JtKRv").each((index, element) => {
-				if (index >= articleLimit) return false;
-
-				const $item = $(element);
-				const titleElement = $item.find("h3 a, h4 a").first();
-				const title = titleElement.text().trim();
-				const link = titleElement.attr("href");
-
-				const sourceElement = $item.find(".wEwyrc, .NUnG9d");
-				const source = sourceElement.text().trim();
-
-				const timeElement = $item.find("time, .OSrXXb");
-				const timeText = timeElement.text().trim();
-
-				const snippetElement = $item.find(".GI74Re, .Y3v8qd");
-				const snippet = snippetElement.text().trim();
-
-				// Check for image presence
-				const imageElement = $item.find("img").first();
-				const hasImage = imageElement.length > 0;
-				let imageUrl = null;
-
-				if (hasImage) {
-					const src = imageElement.attr("src");
-					if (src) {
-						// Convert relative URLs to absolute URLs
-						if (src.startsWith("//")) {
-							imageUrl = `https:${src}`;
-						} else if (src.startsWith("/")) {
-							imageUrl = `https://news.google.com${src}`;
-						} else if (src.startsWith("./")) {
-							imageUrl = `https://news.google.com${src.substring(1)}`;
-						} else if (!src.startsWith("http")) {
-							imageUrl = `https://news.google.com/${src}`;
-						} else {
-							imageUrl = src;
-						}
-					}
-				}
-
-				if (title && link) {
-					newsArticles.push({
-						title,
-						link: link.startsWith("./")
-							? `https://news.google.com${link.substring(1)}`
-							: link,
-						source: source || "Unknown",
-						time: timeText || "Unknown",
-						snippet: snippet || "",
-						hasImage,
-						imageUrl: imageUrl || null,
-						index: index + 1,
-					});
-				}
-			});
-		}
+		const news = articleLinks.slice(0, articleLimit).map((link, index) => {
+			const title =
+				link.text?.trim() ||
+				headings[index] ||
+				link.title?.trim() ||
+				"Untitled";
+			const url = link.href;
+			let source = "Unknown";
+			try {
+				source = new URL(url).hostname.replace(/^www\./, "");
+			} catch {}
+			return {
+				title,
+				url,
+				source,
+				snippet: link.title?.trim() || "",
+				metadata: {
+					ogTitle: scrapedData?.metadata?.["og:title"] ?? null,
+					ogDescription: scrapedData?.metadata?.["og:description"] ?? null,
+					pageTitle: scrapedData?.title ?? null,
+				},
+				index: index + 1,
+			};
+		});
 
 		performanceMonitor.endOperation(operationId);
 
@@ -8908,13 +9545,13 @@ app.post("/scrap-google-news", async (c) => {
 			success: true,
 			query: `${city}, ${state}`,
 			limit: articleLimit,
-			totalArticles: newsArticles.length,
-			articles: newsArticles,
+			total: news.length,
+			news,
 			scrapedAt: new Date().toISOString(),
 			url: googleNewsUrl,
 		});
 	} catch (error) {
-		console.error("Error in /scrap-google-news endpoint:", error);
+		console.error("Error in /scrape-google-news endpoint:", error);
 		performanceMonitor.endOperation(operationId);
 
 		return c.json(
