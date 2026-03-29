@@ -28,6 +28,7 @@ import {
 	isRedditUrl,
 	ROUTER_SYSTEM_PROMPT,
 	parseAgentResponse,
+	fastRouter,
 	SKILLS,
 	TASK_TYPES,
 	CREDITS,
@@ -5326,7 +5327,17 @@ app.post("/inkgest-agent", async (c) => {
 								};
 							}
 
-							// Plan phase: LLM decides tasks first (no parallel scrape).
+						// Plan phase: try instant rule-based router first; fall back to LLM only
+						// when the prompt is too ambiguous for pattern matching.
+						const fastResult = fastRouter(userPrompt, hasImages);
+						if (fastResult.confidence >= 0.85) {
+							parsed = fastResult;
+							console.log(
+								"[inkgest-agent] Fast router used — skipped LLM (confidence:",
+								fastResult.confidence,
+								")",
+							);
+						} else {
 							const routerResult = await openRouterChatMessages(
 								openRouterKey,
 								messages,
@@ -5360,6 +5371,7 @@ app.post("/inkgest-agent", async (c) => {
 								controller.close();
 								return;
 							}
+						}
 
 							const promptUrls = extractUrlsFromText(userPrompt).slice(0, 10);
 							suggestedTasks = (
@@ -5394,31 +5406,44 @@ app.post("/inkgest-agent", async (c) => {
 								}
 							}
 
-							// Scrape phase: merge URLs from user message + planned tasks, then fetch in parallel.
-							urlsToScrape = [
-								...new Set([
-									...promptUrls,
-									...collectHttpUrlsFromTasks(suggestedTasks),
-								]),
-							].slice(0, 10);
-							redditUrls = urlsToScrape.filter(isRedditUrl);
-							youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
-							regularUrls = urlsToScrape.filter(
-								(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
-							);
+						// Scrape phase: merge URLs from user message + planned tasks, then fetch in parallel.
+						urlsToScrape = [
+							...new Set([
+								...promptUrls,
+								...collectHttpUrlsFromTasks(suggestedTasks),
+							]),
+						].slice(0, 10);
+						redditUrls = urlsToScrape.filter(isRedditUrl);
+						youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
+						regularUrls = urlsToScrape.filter(
+							(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
+						);
 
-							const scraped =
-								urlsToScrape.length > 0
-									? await scrapeAllUrls()
-									: { sources: [], errors: [] };
-							scrapedSources = scraped.sources || [];
-							if (scraped.errors?.length) {
-								scrapeErrors.push(...scraped.errors);
-								console.error(
-									"[inkgest-agent] Scrape errors (after plan):",
-									scraped.errors,
-								);
-							}
+						// Stream plan immediately — client shows URLs + tasks before waiting for scrape.
+						controller.enqueue(
+							encoder.encode(
+								send({
+									type: "plan",
+									thinking: parsed.thinking || "",
+									message: parsed.message || "Starting scrape and task execution.",
+									suggestedTasks,
+									urlsToScrape,
+								}),
+							),
+						);
+
+						const scraped =
+							urlsToScrape.length > 0
+								? await scrapeAllUrls()
+								: { sources: [], errors: [] };
+						scrapedSources = scraped.sources || [];
+						if (scraped.errors?.length) {
+							scrapeErrors.push(...scraped.errors);
+							console.error(
+								"[inkgest-agent] Scrape errors (after plan):",
+								scraped.errors,
+							);
+						}
 						} else {
 							if (urlsToScrape.length > 0) {
 								const [regularScraped, youtubeScraped, redditScraped] =
@@ -5486,11 +5511,31 @@ app.post("/inkgest-agent", async (c) => {
 							}
 						}
 
-						let tasksToRun = hasExecuteTasks
-							? executeTasks
-							: parsed.shouldExecute === true
-								? suggestedTasks
-								: [];
+					// Stream scrape outcome — client shows per-URL success/failure before tasks start.
+					controller.enqueue(
+						encoder.encode(
+							send({
+								type: "scrape_status",
+								urlsToScrape,
+								scraped: scrapedSources.map((s) => ({
+									url: s.url,
+									title: s.title || "",
+									success: true,
+								})),
+								failed: scrapeErrors.map((e) =>
+									typeof e === "string"
+										? { url: "unknown", error: e }
+										: { url: e?.url || "unknown", error: e?.error || String(e) },
+								),
+							}),
+						),
+					);
+
+					let tasksToRun = hasExecuteTasks
+						? executeTasks
+						: parsed.shouldExecute === true
+							? suggestedTasks
+							: [];
 
 						// Ensure every task has params.urls — scrape/content tasks need URLs.
 						// Router may put URL in params.url (singular) or params.urls; inherit from other tasks when missing.
@@ -6244,19 +6289,21 @@ app.post("/inkgest-agent", async (c) => {
 							}
 						}
 
-						controller.enqueue(
-							encoder.encode(
-								send({
-									type: "start",
-									success: true,
-									thinking: parsed.thinking || "",
-									message: hasExecuteTasks
-										? `Running ${validTasks.length} task(s) (staged: crawl → images → data fetches → content).`
-										: parsed.message || "Here's what I suggest.",
-									suggestedTasks,
-								}),
-							),
-						);
+				controller.enqueue(
+					encoder.encode(
+						send({
+							type: "start",
+							success: true,
+							taskCount: validTasks.length,
+							message: hasExecuteTasks
+								? `Running ${validTasks.length} task(s).`
+								: validTasks.length > 0
+									? `Executing ${validTasks.length} task(s).`
+									: parsed.message || "Here's what I suggest.",
+							suggestedTasks,
+						}),
+					),
+				);
 
 						if (validTasks.length === 0) {
 							controller.enqueue(
