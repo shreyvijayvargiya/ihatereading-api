@@ -5170,6 +5170,23 @@ const openRouterKey = process.env.OPENROUTER_API_KEY;
 
 app.post("/inkgest-agent", async (c) => {
 	try {
+		const authHeader =
+			c.req.header("Authorization") || c.req.header("authorization");
+		const authToken = authHeader?.startsWith("Bearer ")
+			? authHeader.slice(7).trim()
+			: authHeader?.trim();
+		if (!authToken) {
+			return c.json(
+				{
+					error: "Authentication required",
+					code: "MISSING_AUTH_TOKEN",
+					details:
+						"Provide a Bearer token in the Authorization header: Authorization: Bearer <token>",
+				},
+				401,
+			);
+		}
+
 		if (!openRouterKey || !String(openRouterKey).trim()) {
 			return c.json(
 				{
@@ -6589,7 +6606,6 @@ app.post("/inkgest-agent", async (c) => {
 			},
 		});
 	} catch (error) {
-		console.error("[inkgest-agent]", error);
 		const message = error?.message || "Agent failed";
 		const cause = error?.cause;
 		const isAbort =
