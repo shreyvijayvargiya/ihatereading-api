@@ -43,6 +43,11 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { GoogleGenAI } from "@google/genai";
 import browserPool from "./browser-pool.js";
 import fs from "fs";
+import fsp from "fs/promises";
+import { exec } from "child_process";
+import { promisify } from "util";
+import os from "os";
+import { UTApi, UTFile } from "uploadthing/server";
 import NodeCache from "node-cache";
 import { fetch, ProxyAgent } from "undici";
 import { z } from "zod";
@@ -57,6 +62,8 @@ import {
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, ".env") });
+
+const utapi = new UTApi({ token: process.env.UPLOADTHING_TOKEN });
 
 // Safely parse JSON from an AI response that may include markdown fences or trailing text
 function parseAIJson(raw) {
@@ -4852,7 +4859,7 @@ app.post("/scrape", async (c) => {
 		timeout = 30000,
 		includeSemanticContent = true,
 		includeImages = true,
-		includeLinks = true,
+	includeLinks = true,
 		extractMetadata = true,
 		includeCache = false,
 		useProxy = false,
@@ -7010,17 +7017,13 @@ async function isLikelyStaticSite(url) {
 }
 
 async function uploadScreenshotBuffer(buffer) {
-	const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
-	const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-	const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
-	await file.save(buffer, {
-		metadata: {
-			contentType: "image/png",
-			cacheControl: "public, max-age=3600",
-		},
-	});
-	await file.makePublic();
-	return `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+	const fileName = `screenshot-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
+	const utFile = new UTFile([buffer], fileName, { type: "image/png" });
+	const [response] = await utapi.uploadFiles([utFile]);
+	if (response.error) {
+		throw new Error(`UploadThing upload failed: ${response.error.message}`);
+	}
+	return response.data.ufsUrl;
 }
 
 async function smartCaptureScreenshot(url, options = {}) {
@@ -10306,6 +10309,201 @@ ${JSON.stringify(structured)}`;
 		console.error(err);
 		return c.json({ success: false, error: "Generation failed" }, 500);
 	}
+});
+
+// ─── agent-browser helpers ───────────────────────────────────────────────────
+
+const execAsync = promisify(exec);
+const AGENT_BROWSER_BIN = new URL(
+	"./node_modules/.bin/agent-browser",
+	import.meta.url,
+).pathname;
+
+/**
+ * Navigate to a URL and return the accessibility-tree markdown via agent-browser.
+ * The `open` command keeps browser state alive so `snapshot` sees the navigated page.
+ */
+async function agentBrowserScrape(url, { timeout = 30000 } = {}) {
+	const { stdout } = await execAsync(
+		`"${AGENT_BROWSER_BIN}" open ${JSON.stringify(url)} && "${AGENT_BROWSER_BIN}" snapshot`,
+		{ timeout, shell: true },
+	);
+	return stdout.trim();
+}
+
+/**
+ * Navigate to a URL, take a screenshot, upload it to UploadThing, and return the public URL.
+ */
+async function agentBrowserScreenshot(url, { timeout = 50000, fullPage = false } = {}) {
+	const tmpPath = path.join(os.tmpdir(), `ab-screenshot-${uuidv4()}.png`);
+	const fullPageFlag = fullPage ? " --full" : "";
+	await execAsync(
+		`"${AGENT_BROWSER_BIN}" open ${JSON.stringify(url)} && "${AGENT_BROWSER_BIN}" screenshot${fullPageFlag} ${JSON.stringify(tmpPath)}`,
+		{ timeout, shell: true },
+	);
+	const buffer = await fsp.readFile(tmpPath);
+	await fsp.unlink(tmpPath).catch(() => {});
+
+	const fileName = `screenshot-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
+	const utFile = new UTFile([buffer], fileName, { type: "image/png" });
+	const [response] = await utapi.uploadFiles([utFile]);
+	if (response.error) {
+		throw new Error(`UploadThing upload failed: ${response.error.message}`);
+	}
+	return response.data.ufsUrl;
+}
+
+// ─── agent-browser endpoints ─────────────────────────────────────────────────
+
+app.post("/agent-scrape", async (c) => {
+	const { url, timeout = 30000 } = await c.req.json();
+
+	if (!url || !isValidURL(url)) {
+		return c.json({ success: false, error: "URL is required or invalid" }, 400);
+	}
+
+	try {
+		const markdown = await agentBrowserScrape(url, { timeout });
+		return c.json({
+			success: true,
+			url,
+			markdown,
+			data: {},
+			summary: null,
+			screenshot: null,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.error("❌ agent-browser scrape error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to scrape URL using agent-browser",
+				details: error?.message || String(error),
+				url,
+			},
+			500,
+		);
+	}
+});
+
+app.post("/agent-scrape-multiple", async (c) => {
+	const { urls, timeout = 30000 } = await c.req.json();
+	const MAX_URLS = 20;
+
+	if (!Array.isArray(urls) || urls.length === 0) {
+		return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+	}
+	if (urls.length > MAX_URLS) {
+		return c.json(
+			{ success: false, error: `Maximum ${MAX_URLS} URLs per request` },
+			400,
+		);
+	}
+
+	const results = await Promise.all(
+		urls.map(async (u) => {
+			const inputUrl = typeof u === "string" ? u : (u?.url ?? u);
+			if (!inputUrl || !isValidURL(inputUrl)) {
+				return {
+					url: inputUrl || "invalid",
+					success: false,
+					error: "Invalid or missing URL",
+					markdown: null,
+					data: {},
+					summary: null,
+					screenshot: null,
+				};
+			}
+			try {
+				const markdown = await agentBrowserScrape(inputUrl, { timeout });
+				return { url: inputUrl, success: true, markdown, data: {}, summary: null, screenshot: null };
+			} catch (err) {
+				return {
+					url: inputUrl,
+					success: false,
+					error: err?.message || "Scraping failed",
+					markdown: null,
+					data: {},
+					summary: null,
+					screenshot: null,
+				};
+			}
+		}),
+	);
+
+	return c.json({ success: true, results, timestamp: new Date().toISOString() });
+});
+
+app.post("/agent-screenshot", async (c) => {
+	const { url, timeout = 50000, fullPage = false } = await c.req.json();
+
+	if (!url || !isValidURL(url)) {
+		return c.json({ success: false, error: "URL is required or invalid" }, 400);
+	}
+
+	try {
+		const screenshotUrl = await agentBrowserScreenshot(url, { timeout, fullPage });
+		return c.json({
+			success: true,
+			url,
+			screenshot: screenshotUrl,
+			markdown: null,
+			metadata: {},
+			timestamp: new Date().toISOString(),
+		});
+	} catch (error) {
+		console.error("❌ agent-browser screenshot error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to take screenshot using agent-browser",
+				details: error?.message || String(error),
+				url,
+			},
+			500,
+		);
+	}
+});
+
+app.post("/agent-screenshot-multiple", async (c) => {
+	const { urls, timeout = 50000, fullPage = false } = await c.req.json();
+	const MAX_URLS = 20;
+
+	if (!Array.isArray(urls) || urls.length === 0) {
+		return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+	}
+	if (urls.length > MAX_URLS) {
+		return c.json(
+			{ success: false, error: `Maximum ${MAX_URLS} URLs per request` },
+			400,
+		);
+	}
+
+	const list = urls.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
+	if (list.length === 0) {
+		return c.json({ success: false, error: "No valid URLs" }, 400);
+	}
+
+	const results = await Promise.all(
+		list.map(async (url) => {
+			try {
+				const screenshotUrl = await agentBrowserScreenshot(url, { timeout, fullPage });
+				return { url, success: true, screenshot: screenshotUrl, markdown: null, metadata: {} };
+			} catch (err) {
+				return {
+					url,
+					success: false,
+					screenshot: null,
+					markdown: null,
+					metadata: null,
+					error: err?.message || "Screenshot failed",
+				};
+			}
+		}),
+	);
+
+	return c.json({ success: true, results, timestamp: new Date().toISOString() });
 });
 
 const port = 3002;
