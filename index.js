@@ -10370,6 +10370,544 @@ app.post("/api/codegen", async (c) => {
 	});
 });
 
+// ─── Asset Generation — shared skill runner ───────────────────────────────────
+//
+// Maps URL-friendly route :type param → SKILLS key
+const ASSET_SKILL_MAP = {
+	blog:         "blog",
+	article:      "article",
+	email:        "newsletter",
+	newsletter:   "newsletter",
+	linkedin:     "linkedin",
+	twitter:      "twitter",
+	substack:     "substack",
+	infographics: "infographics-svg-generator",
+	table:        "table",
+};
+
+/**
+ * Scrape a list of URLs, then run the requested SKILL against the scraped sources.
+ * Returns the parsed result object (content string or structured JSON depending on skill).
+ */
+async function runSkillAsset(skillType, { urls = [], prompt = "", format = "substack", style = "casual" } = {}) {
+	const skill = SKILLS[skillType];
+	if (!skill || skill.maxTokens <= 1) {
+		throw new Error(`"${skillType}" is not a content-generation skill`);
+	}
+
+	// Scrape each URL in parallel; silently drop failures
+	const sources = [];
+	if (urls.length > 0) {
+		const settled = await Promise.allSettled(
+			urls.slice(0, 10).map(async (url) => {
+				const r = await scrapeSingleUrlWithPuppeteer(url, {
+					includeSemanticContent: true,
+					extractMetadata:        true,
+					includeImages:          true,
+					includeLinks:           true,
+					timeout:                30_000,
+				});
+				return {
+					url,
+					markdown: r.markdown || "",
+					title:    r.data?.title || "",
+					links:    r.data?.links  || [],
+				};
+			}),
+		);
+		for (const r of settled) {
+			if (r.status === "fulfilled" && r.value.markdown) sources.push(r.value);
+		}
+	}
+
+	const system  = skill.buildSystemPrompt(format, style, sources.length > 0);
+	const user    = skill.buildUserContent(String(prompt).trim(), sources);
+	const isJson  = skillType === "infographics-svg-generator" || skillType === "table";
+	const maxOut  = Math.min(skill.maxTokens, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
+
+	const { content } = await openRouterChatMessages(
+		process.env.OPENROUTER_API_KEY,
+		[{ role: "system", content: system }, { role: "user", content: user }],
+		maxOut,
+		isJson ? { response_format: { type: "json_object" } } : {},
+	);
+
+	if (skill.parseResponse) return skill.parseResponse(content);
+
+	// Table: try to parse as JSON, fall back to raw string
+	if (skillType === "table") {
+		try {
+			const j = JSON.parse(content.replace(/```json|```/gi, "").trim());
+			return { columns: j.columns || [], rows: j.rows || [] };
+		} catch {
+			return { content: content.trim() };
+		}
+	}
+
+	return { content: content.trim() };
+}
+
+// ─── POST /generate/:type ─────────────────────────────────────────────────────
+// Supported :type values (see ASSET_SKILL_MAP):
+//   blog | article | email | newsletter | linkedin | twitter | substack | infographics | table
+//
+// Request body: { urls?: string[], prompt?: string, format?: string, style?: string }
+// Response: { success, type, skillType, urls, content|infographics|columns/rows, timestamp }
+app.post("/generate/:type", async (c) => {
+	// ── Auth ──────────────────────────────────────────────────────────────────
+	const genAuthHdr   = c.req.header("Authorization") || c.req.header("authorization");
+	const genAuthToken = genAuthHdr?.startsWith("Bearer ") ? genAuthHdr.slice(7).trim() : genAuthHdr?.trim();
+	if (!genAuthToken) {
+		return c.json(
+			{ error: "Authentication required", code: "MISSING_AUTH_TOKEN",
+			  details: "Provide a Bearer token in the Authorization header" },
+			401,
+		);
+	}
+
+	// ── Rate limit (20 req / 10 min per IP) ──────────────────────────────────
+	const GEN_RATE_LIMIT     = 20;
+	const GEN_RATE_WINDOW_MS = 10 * 60 * 1000;
+	const genIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip")  ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const genRl = rateLimit(genIp, GEN_RATE_LIMIT, GEN_RATE_WINDOW_MS);
+	if (!genRl.allowed) {
+		c.header("Retry-After",       String(genRl.retryAfter));
+		c.header("X-RateLimit-Limit", String(GEN_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window",    "10 minutes");
+		return c.json(
+			{ success: false, error: "Rate limit exceeded", retryAfter: genRl.retryAfter },
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit",     String(GEN_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(genRl.remaining));
+	c.header("X-RateLimit-Window",    "10 minutes");
+
+	// ── Resolve skill type ────────────────────────────────────────────────────
+	const typeName  = c.req.param("type").toLowerCase();
+	const skillType = ASSET_SKILL_MAP[typeName];
+	if (!skillType) {
+		return c.json(
+			{ error: `Unknown type "${typeName}". Supported: ${Object.keys(ASSET_SKILL_MAP).join(", ")}` },
+			400,
+		);
+	}
+
+	if (!process.env.OPENROUTER_API_KEY) {
+		return c.json({ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" }, 503);
+	}
+
+	let body;
+	try { body = await c.req.json(); } catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	const {
+		urls    = [],
+		prompt  = "",
+		format  = "substack",
+		style   = "casual",
+	} = body;
+
+	const urlList = (Array.isArray(urls) ? urls : [urls])
+		.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
+
+	if (urlList.length === 0 && !String(prompt).trim()) {
+		return c.json({ error: "Provide at least one URL or a prompt" }, 400);
+	}
+
+	try {
+		const result = await runSkillAsset(skillType, { urls: urlList, prompt, format, style });
+		return c.json({
+			success:   true,
+			type:      typeName,
+			skillType,
+			urls:      urlList,
+			...result,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (err) {
+		console.error(`[/generate/${typeName}]`, err?.message);
+		return c.json({ success: false, error: err?.message || "Generation failed" }, 500);
+	}
+});
+
+// ─── /ai-resume-builder — LinkedIn + GitHub + projects → streamed resume code ──
+//
+// POST /ai-resume-builder
+// Body: {
+//   linkedinUrl?:  string,        // LinkedIn profile page
+//   githubUrl?:    string,        // GitHub profile (github.com/user) OR repo URL
+//   projectUrls?:  string[],      // portfolio / project pages (up to 5)
+//   prompt?:       string,        // extra style/colour/layout instructions
+//   format?:       "react"|"html" // default "react"
+// }
+//
+// Streams generated resume code as SSE:
+//   data: {"delta":"..."}   — incremental code chunk
+//   data: [DONE]            — stream complete
+//   data: {"error":"..."}   — on failure
+
+const RESUME_SYSTEM_PROMPT = `You are an elite frontend engineer specialising in beautiful, modern personal resumes and portfolio websites.
+You receive structured data scraped from a person's LinkedIn profile, GitHub account, and portfolio/project pages.
+Your task is to generate a stunning, fully self-contained personal resume page that showcases the person's real background.
+
+Output rules:
+- Output ONLY the raw code — no markdown fences, no explanations, no comments.
+- For "react" format: a single default-exported React functional component.
+  • Use Tailwind CSS utility classes for ALL styling — no inline styles, no separate CSS files.
+  • Import React at the top. The component must be renderable without any props.
+  • Add a Google Fonts <style> tag inside the component for any custom fonts used.
+- For "html" format: a complete HTML5 document with <script src="https://cdn.tailwindcss.com"></script>.
+  All styling must use Tailwind utility classes only.
+
+Design requirements:
+- Create a premium, visually distinctive layout — NOT a generic white paper resume.
+- Use a bold typographic hierarchy, generous spacing, and a coherent colour palette.
+- Sections to include (only if data is available): Hero/header with name + title,
+  About/Summary, Work Experience (company, role, dates, description), Education,
+  Skills (as visual tags or a grid), Projects (with links if available), GitHub stats
+  (repos, stars, top languages), and Contact links.
+- Use the person's ACTUAL data from the sources — do not invent or placeholder anything.
+- Make links (<a> tags) functional using the real URLs provided.
+- Do NOT output anything except the code itself.`;
+
+/** Detect whether a GitHub URL is a user profile or a repo, returning structured info. */
+function parseGitHubUrl(url) {
+	try {
+		const u = new URL(url);
+		if (u.hostname !== "github.com") return null;
+		const parts = u.pathname.replace(/^\//, "").split("/").filter(Boolean);
+		if (parts.length === 1) return { type: "user", username: parts[0] };
+		if (parts.length >= 2) return { type: "repo", owner: parts[0], repo: parts[1] };
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+app.post("/ai-resume-builder", async (c) => {
+	// ── Auth ──────────────────────────────────────────────────────────────────
+	const resumeAuthHdr   = c.req.header("Authorization") || c.req.header("authorization");
+	const resumeAuthToken = resumeAuthHdr?.startsWith("Bearer ")
+		? resumeAuthHdr.slice(7).trim()
+		: resumeAuthHdr?.trim();
+	if (!resumeAuthToken) {
+		return c.json(
+			{ error: "Authentication required", code: "MISSING_AUTH_TOKEN",
+			  details: "Provide a Bearer token in the Authorization header" },
+			401,
+		);
+	}
+
+	// ── Rate limit (10 req / 10 min per IP) ──────────────────────────────────
+	const RESUME_RATE_LIMIT     = 10;
+	const RESUME_RATE_WINDOW_MS = 10 * 60 * 1000;
+	const resumeIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const resumeRl = rateLimit(resumeIp, RESUME_RATE_LIMIT, RESUME_RATE_WINDOW_MS);
+	if (!resumeRl.allowed) {
+		c.header("Retry-After",           String(resumeRl.retryAfter));
+		c.header("X-RateLimit-Limit",     String(RESUME_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window",    "10 minutes");
+		return c.json(
+			{ success: false, error: "Rate limit exceeded", retryAfter: resumeRl.retryAfter },
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit",     String(RESUME_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(resumeRl.remaining));
+	c.header("X-RateLimit-Window",    "10 minutes");
+
+	if (!process.env.OPENROUTER_API_KEY) {
+		return c.json({ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" }, 503);
+	}
+
+	let body;
+	try { body = await c.req.json(); } catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	const {
+		linkedinUrl  = "",
+		githubUrl    = "",
+		projectUrls  = [],
+		prompt: extraPrompt = "",
+		format: rawFormat   = "react",
+	} = body;
+
+	const format = rawFormat === "html" ? "html" : "react";
+
+	const isValidUrl = (u) => typeof u === "string" && /^https?:\/\//i.test(u);
+
+	if (!isValidUrl(linkedinUrl) && !isValidUrl(githubUrl) && !projectUrls.some(isValidUrl)) {
+		return c.json(
+			{ error: "Provide at least one of linkedinUrl, githubUrl, or projectUrls" },
+			400,
+		);
+	}
+
+	// ── 1. Scrape all sources in parallel ────────────────────────────────────
+	const scrapeOpts = {
+		includeSemanticContent: true,
+		extractMetadata:        true,
+		includeImages:          true,
+		includeLinks:           true,
+		timeout:                35_000,
+	};
+
+	const contextSections = [];
+
+	/** Scrape a URL with Puppeteer and return a formatted context block. */
+	async function scrapeToContext(url, label) {
+		try {
+			const result = await scrapeSingleUrlWithPuppeteer(url, scrapeOpts);
+			const d   = result.data ?? {};
+			const md  = result.markdown ?? "";
+			const sc  = d.content?.semanticContent ?? {};
+
+			const headings = ["h1", "h2", "h3", "h4"]
+				.flatMap((t) => (d.content?.[t] ?? []).map((v) => `${t.toUpperCase()}: ${v}`))
+				.join("\n");
+
+			const paragraphs = (sc.paragraphs ?? []).filter(Boolean).slice(0, 60).join("\n");
+			const listItems  = [
+				...(sc.unorderedLists ?? []).flat(),
+				...(sc.orderedLists   ?? []).flat(),
+			].filter(Boolean).slice(0, 40).join("\n");
+
+			return [
+				`## ${label} — ${url}`,
+				d.title           && `Title: ${d.title}`,
+				headings          && `### Headings\n${headings}`,
+				paragraphs        && `### Paragraphs\n${paragraphs}`,
+				listItems         && `### List items\n${listItems}`,
+				md                && `### Full markdown (truncated)\n${md.slice(0, 5_000)}`,
+			].filter(Boolean).join("\n\n");
+		} catch (err) {
+			console.warn(`[resume-builder] scrape failed for ${url}:`, err?.message);
+			return `## ${label} — ${url}\n(scrape failed: ${err?.message})`;
+		}
+	}
+
+	/** Fetch GitHub user data + top repos via GitHub API. */
+	async function fetchGitHubUserContext(username) {
+		const ghHeaders = {
+			Accept:       "application/vnd.github.v3+json",
+			"User-Agent": "ai-resume-builder/1.0",
+			...(process.env.GITHUB_TOKEN ? { Authorization: `token ${process.env.GITHUB_TOKEN}` } : {}),
+		};
+		const lines = [`## GitHub Profile — https://github.com/${username}`];
+		try {
+			const userRes = await fetch(`https://api.github.com/users/${username}`, {
+				headers: ghHeaders, signal: AbortSignal.timeout(10_000),
+			});
+			if (userRes.ok) {
+				const u = await userRes.json();
+				if (u.name)       lines.push(`Name: ${u.name}`);
+				if (u.bio)        lines.push(`Bio: ${u.bio}`);
+				if (u.company)    lines.push(`Company: ${u.company}`);
+				if (u.location)   lines.push(`Location: ${u.location}`);
+				if (u.blog)       lines.push(`Website: ${u.blog}`);
+				if (u.email)      lines.push(`Email: ${u.email}`);
+				lines.push(`Followers: ${u.followers ?? 0} | Following: ${u.following ?? 0} | Public repos: ${u.public_repos ?? 0}`);
+			}
+		} catch (e) {
+			lines.push(`(GitHub user API unavailable: ${e?.message})`);
+		}
+		try {
+			const reposRes = await fetch(
+				`https://api.github.com/users/${username}/repos?sort=stargazers&per_page=10&type=owner`,
+				{ headers: ghHeaders, signal: AbortSignal.timeout(10_000) },
+			);
+			if (reposRes.ok) {
+				const repos = await reposRes.json();
+				if (Array.isArray(repos) && repos.length > 0) {
+					lines.push("\n### Top Repositories");
+					for (const r of repos.slice(0, 8)) {
+						const desc = r.description ? ` — ${r.description}` : "";
+						const lang = r.language     ? ` [${r.language}]`   : "";
+						lines.push(`- **${r.name}**${lang}${desc} | ⭐ ${r.stargazers_count ?? 0} | ${r.html_url}`);
+					}
+					// Collect unique languages
+					const langs = [...new Set(repos.map((r) => r.language).filter(Boolean))];
+					if (langs.length > 0) lines.push(`\n### Languages: ${langs.join(", ")}`);
+				}
+			}
+		} catch (e) {
+			lines.push(`(GitHub repos API unavailable: ${e?.message})`);
+		}
+		return lines.join("\n");
+	}
+
+	/** Fetch a GitHub repo and build context via analyzeRepo. */
+	async function fetchGitHubRepoContext(owner, repo) {
+		const lines = [`## GitHub Repo — https://github.com/${owner}/${repo}`];
+		try {
+			const ast = await analyzeRepo(owner, repo, undefined, { maxFiles: 20, maxDepth: 2 });
+			if (ast) {
+				if (ast.description) lines.push(`Description: ${ast.description}`);
+				if (ast.language)    lines.push(`Primary language: ${ast.language}`);
+				if (ast.stars)       lines.push(`Stars: ${ast.stars}`);
+				if (ast.topics?.length) lines.push(`Topics: ${ast.topics.join(", ")}`);
+				if (ast.readme)      lines.push(`\n### README (truncated)\n${String(ast.readme).slice(0, 3_000)}`);
+			}
+		} catch (e) {
+			lines.push(`(repo analysis failed: ${e?.message})`);
+		}
+		return lines.join("\n");
+	}
+
+	// Gather all async scrape tasks
+	const tasks = [];
+
+	if (isValidUrl(linkedinUrl)) {
+		tasks.push(scrapeToContext(linkedinUrl, "LinkedIn Profile"));
+	}
+
+	if (isValidUrl(githubUrl)) {
+		const parsed = parseGitHubUrl(githubUrl);
+		if (parsed?.type === "user") {
+			tasks.push(fetchGitHubUserContext(parsed.username));
+		} else if (parsed?.type === "repo") {
+			tasks.push(fetchGitHubRepoContext(parsed.owner, parsed.repo));
+		} else {
+			tasks.push(scrapeToContext(githubUrl, "GitHub"));
+		}
+	}
+
+	const validProjects = projectUrls.filter(isValidUrl).slice(0, 5);
+	for (const [i, pUrl] of validProjects.entries()) {
+		tasks.push(scrapeToContext(pUrl, `Project ${i + 1}`));
+	}
+
+	const settled = await Promise.allSettled(tasks);
+	for (const r of settled) {
+		if (r.status === "fulfilled" && r.value) contextSections.push(r.value);
+	}
+
+	if (contextSections.length === 0) {
+		return c.json(
+			{ error: "All scraping attempts failed — no source data to build a resume from." },
+			422,
+		);
+	}
+
+	// ── 2. Build the full user message ───────────────────────────────────────
+	const userMessage = [
+		`Generate a ${format === "react" ? "React + Tailwind CSS component" : "complete Tailwind CSS HTML page"} for a personal resume/portfolio website.`,
+		"Use ALL the real data provided below. Do not use placeholder or lorem-ipsum text.",
+		"",
+		...contextSections,
+		extraPrompt && `\nExtra instructions from user: ${extraPrompt}`,
+	].filter((x) => x !== false && x !== undefined).join("\n\n");
+
+	const model = process.env.RESUME_MODEL || process.env.CODEGEN_MODEL || "anthropic/claude-sonnet-4-5";
+
+	// ── 3. Stream from OpenRouter ────────────────────────────────────────────
+	let openRouterRes;
+	try {
+		openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization:  `Bearer ${process.env.OPENROUTER_API_KEY}`,
+				"HTTP-Referer": "https://ihatereading.in",
+				"X-Title":      "IHateReading AI Resume Builder",
+			},
+			body: JSON.stringify({
+				model,
+				stream:   true,
+				messages: [
+					{ role: "system", content: RESUME_SYSTEM_PROMPT },
+					{ role: "user",   content: userMessage },
+				],
+				temperature: 0.25,
+				max_tokens:  8000,
+			}),
+		});
+	} catch (fetchErr) {
+		return c.json({ error: `Failed to reach OpenRouter: ${fetchErr.message}` }, 502);
+	}
+
+	if (!openRouterRes.ok) {
+		let detail = `OpenRouter ${openRouterRes.status}`;
+		try { const e = await openRouterRes.json(); detail = e?.error?.message || detail; } catch {}
+		return c.json({ error: detail }, openRouterRes.status);
+	}
+
+	// ── 4. Pipe SSE stream back to client ────────────────────────────────────
+	const encoder       = new TextEncoder();
+	const upstreamReader  = openRouterRes.body.getReader();
+	const upstreamDecoder = new TextDecoder();
+
+	const outputStream = new ReadableStream({
+		async start(controller) {
+			let sseBuffer = "";
+			try {
+				while (true) {
+					const { done, value } = await upstreamReader.read();
+					if (done) break;
+
+					sseBuffer += upstreamDecoder.decode(value, { stream: true });
+					const lines = sseBuffer.split("\n");
+					sseBuffer = lines.pop();
+
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed.startsWith("data: ")) continue;
+						const payload = trimmed.slice(6);
+						if (payload === "[DONE]") {
+							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+							controller.close();
+							return;
+						}
+						let parsed;
+						try { parsed = JSON.parse(payload); } catch { continue; }
+						if (parsed?.error) {
+							controller.enqueue(encoder.encode(
+								`data: ${JSON.stringify({ error: parsed.error.message || "OpenRouter error" })}\n\n`,
+							));
+							controller.close();
+							return;
+						}
+						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
+						if (delta) {
+							controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`));
+						}
+					}
+				}
+				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+				controller.close();
+			} catch (err) {
+				try {
+					controller.enqueue(encoder.encode(
+						`data: ${JSON.stringify({ error: err?.message || "Stream error" })}\n\n`,
+					));
+					controller.close();
+				} catch {}
+			}
+		},
+	});
+
+	return new Response(outputStream, {
+		headers: {
+			"Content-Type":  "text/event-stream",
+			"Cache-Control": "no-cache",
+			"Connection":    "keep-alive",
+		},
+	});
+});
+
 const port = 3002;
 console.log(`Server is running on port ${port}`);
 
