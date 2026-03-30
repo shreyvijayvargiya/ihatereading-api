@@ -3199,365 +3199,6 @@ app.post("/google-maps-agent", async (c) => {
 	});
 });
 
-// ─── AI Blog Generator ────────────────────────────────────────────────────────
-// 1. Scrape all supplied URLs in parallel (aiSummary:true per URL to compress)
-// 2. Condense summaries further if combined size still risks context overflow
-// 3. Generate 5 distinct, stunning blog posts in parallel via OpenRouter
-// Each blog has a different angle, tone, and structure but shares the same
-// source material. Backlinks and images from the scraped pages are woven in.
-app.post("/ai-blog-generator-url-scraper", async (c) => {
-	const {
-		urls,
-		topic = "",
-		count = 5,
-		// maxCharsPerUrl: how many characters of scraped content to send per URL.
-		// Lower = fewer input tokens = fits smaller credit budgets.
-		maxCharsPerUrl = 400,
-		// maxOutputTokens: cap on generated output tokens per blog.
-		// Must stay below your available OpenRouter credits minus input token cost.
-		maxOutputTokens = 380,
-	} = await c.req.json();
-
-	if (!Array.isArray(urls) || urls.length === 0) {
-		return c.json(
-			{ success: false, error: "'urls' must be a non-empty array" },
-			400,
-		);
-	}
-
-	const tokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-	const addUsage = (u) => {
-		tokenUsage.promptTokens += u?.promptTokens ?? 0;
-		tokenUsage.completionTokens += u?.completionTokens ?? 0;
-		tokenUsage.totalTokens += u?.totalTokens ?? 0;
-	};
-
-	// ── Step 1: Scrape all URLs in parallel, aiSummary=true to keep each
-	//            scrape small enough to concatenate safely later
-	const scrapeResults = await Promise.allSettled(
-		urls.map((url) =>
-			scrapeSingleUrlWithPuppeteer(url, {
-				includeSemanticContent: true,
-				includeImages: true,
-				includeLinks: true,
-				extractMetadata: true,
-				aiSummary: true,
-				timeout: 30000,
-			}).catch((err) => ({
-				url,
-				error: err.message,
-				summary: null,
-				markdown: null,
-			})),
-		),
-	);
-
-	// Collect successful scrapes
-	const scraped = scrapeResults.map((r, i) => {
-		const url = urls[i];
-		if (r.status === "fulfilled") {
-			const v = r.value;
-			return {
-				url,
-				title: v.data?.title || v.data?.metadata?.title || "",
-				summary: v.summary || "",
-				// Trim raw markdown as a fallback if summary is empty
-				markdown: (v.markdown || "").slice(0, 1500),
-				images: (v.data?.images || [])
-					.slice(0, 5)
-					.map((img) =>
-						typeof img === "string" ? img : img?.src || img?.url || "",
-					)
-					.filter(Boolean),
-				links: (v.data?.links || [])
-					.slice(0, 8)
-					.map((l) => (typeof l === "string" ? l : l?.href || l?.url || ""))
-					.filter(Boolean),
-				error: null,
-			};
-		}
-		return {
-			url,
-			title: "",
-			summary: "",
-			markdown: "",
-			images: [],
-			links: [],
-			error: r.reason?.message || "failed",
-		};
-	});
-
-	const successfulScrapes = scraped.filter((s) => s.summary || s.markdown);
-	if (successfulScrapes.length === 0) {
-		return c.json({ success: false, error: "All URLs failed to scrape" }, 422);
-	}
-
-	// ── Step 2: Build context string ─────────────────────────────────────────
-	// Each URL's content is capped at maxCharsPerUrl chars to control input
-	// token cost. Keeping this small is the primary lever against credit errors.
-	const perUrlCap = Math.min(
-		Math.max(100, Number(maxCharsPerUrl) || 400),
-		3000,
-	);
-
-	const rawContext = successfulScrapes
-		.map((s, i) => {
-			const body = (s.summary || s.markdown).slice(0, perUrlCap);
-			const imgLine = s.images.length
-				? `Images: ${s.images.slice(0, 3).join(", ")}`
-				: "";
-			const linkLine = s.links.length
-				? `Links: ${s.links.slice(0, 3).join(", ")}`
-				: "";
-			return `[${i + 1}] ${s.title || s.url} (${s.url})\n${imgLine}${imgLine ? "\n" : ""}${linkLine}${linkLine ? "\n" : ""}\n${body}`;
-		})
-		.join("\n\n");
-
-	// Collect image + backlink pools (kept small to save input tokens)
-	const allImages = [
-		...new Set(successfulScrapes.flatMap((s) => s.images)),
-	].slice(0, 5);
-	const allBacklinks = [
-		...new Set(successfulScrapes.flatMap((s) => [s.url, ...s.links])),
-	].slice(0, 8);
-	const imageHint = allImages.length ? `\nImages: ${allImages.join(", ")}` : "";
-	const linkHint = allBacklinks.length
-		? `\nLinks: ${allBacklinks.join(", ")}`
-		: "";
-
-	const outTokens = Math.min(
-		Math.max(100, Number(maxOutputTokens) || 380),
-		4096,
-	);
-
-	// ── Step 3: Validate count and pick angles ────────────────────────────────
-	const blogCount = Math.min(Math.max(1, Number(count) || 5), 10);
-
-	const ALL_BLOG_ANGLES = [
-		{
-			id: "deep-dive",
-			label: "Deep-Dive Analysis",
-			tone: "authoritative, long-form analytical",
-			structure:
-				"Introduction → Background → Core Analysis (3-4 sections) → Expert Insights → Conclusion",
-			audience: "professionals and enthusiasts who want depth",
-		},
-		{
-			id: "beginners-guide",
-			label: "Beginner's Guide",
-			tone: "friendly, approachable, jargon-free",
-			structure:
-				"Hook → Why It Matters → Step-by-Step Breakdown → Common Mistakes → Next Steps",
-			audience: "newcomers and curious readers with no prior knowledge",
-		},
-		{
-			id: "listicle",
-			label: "Power Listicle",
-			tone: "punchy, scannable, energetic",
-			structure:
-				"Catchy intro → 7-10 numbered points, each with a subheading + 2-3 sentences + relevant link or image",
-			audience: "busy readers who skim for quick takeaways",
-		},
-		{
-			id: "opinion-thought-leadership",
-			label: "Opinion / Thought Leadership",
-			tone: "bold, opinionated, provocative but grounded",
-			structure:
-				"Strong contrarian hook → Thesis statement → 3 arguments with evidence → Counter-argument addressed → Rallying conclusion",
-			audience: "industry insiders and decision-makers who enjoy debate",
-		},
-		{
-			id: "case-study",
-			label: "Case Study / Story-Driven",
-			tone: "narrative, storytelling, human-focused",
-			structure:
-				"Story hook → Problem setup → Journey/Solution → Results & Data → Lessons Learned → Call to Action",
-			audience: "readers who connect through stories and real-world examples",
-		},
-		{
-			id: "how-to-tutorial",
-			label: "How-To Tutorial",
-			tone: "practical, instructional, clear",
-			structure:
-				"Goal statement → Prerequisites → Numbered steps with code/examples → Troubleshooting tips → Summary",
-			audience:
-				"developers and practitioners who want to build or implement something",
-		},
-		{
-			id: "trends-roundup",
-			label: "Trends & Roundup",
-			tone: "journalistic, curated, forward-looking",
-			structure:
-				"Week-in-review intro → 5-7 trend highlights with commentary → What to watch next → Closing take",
-			audience: "tech followers who want a curated digest of what's happening",
-		},
-		{
-			id: "comparison",
-			label: "Comparison & Pros/Cons",
-			tone: "balanced, objective, analytical",
-			structure:
-				"Context → Side-by-side comparison table → Deep-dive on each option → Verdict for different use cases",
-			audience: "decision-makers evaluating tools, frameworks, or approaches",
-		},
-		{
-			id: "interview-qa",
-			label: "Interview / Q&A Style",
-			tone: "conversational, insightful, personal",
-			structure:
-				"Introduction of subject → 6-8 Q&A pairs → Key takeaways → Closing thoughts",
-			audience:
-				"readers who enjoy human perspectives and behind-the-scenes insights",
-		},
-		{
-			id: "newsletter",
-			label: "Newsletter Edition",
-			tone: "warm, personal, concise",
-			structure:
-				"Personal opening note → 3-5 curated stories with brief commentary → Tool or resource spotlight → Sign-off",
-			audience:
-				"subscribers who want a friendly weekly digest they can read in 5 minutes",
-		},
-	];
-
-	const BLOG_ANGLES = ALL_BLOG_ANGLES.slice(0, blogCount);
-
-	// Use XML-style delimiters so the LLM never has to escape markdown inside JSON.
-	// We parse the sections out ourselves — far more reliable than JSON-in-JSON.
-	const SYSTEM_PROMPT = (
-		angle,
-	) => `You are an elite content strategist and award-winning blogger writing for a high-traffic publication.
-
-BLOG ANGLE: ${angle.label}
-TONE: ${angle.tone}
-TARGET AUDIENCE: ${angle.audience}
-STRUCTURE: ${angle.structure}
-${topic ? `TOPIC FOCUS: ${topic}` : ""}
-
-REQUIREMENTS:
-- Write in the ${angle.tone} tone for ${angle.audience}.
-- Use markdown: H2/H3 headings, bold phrases, bullets where useful.
-- Embed images inline: ![alt](url) — use URLs from the Images list.
-- Hyperlink sources inline: [text](url) — use URLs from the Links list.
-- End with a short Call to Action paragraph.
-
-OUTPUT — write CONTENT first (it gets all available tokens), then the short metadata fields:
-<CONTENT>
-full markdown blog here — write freely, no escaping
-</CONTENT>
-<TITLE>headline under 70 chars</TITLE>
-<META>SEO meta description under 155 chars</META>
-<TAGS>tag1,tag2,tag3</TAGS>
-<FEATURED_IMAGE>one image url or empty</FEATURED_IMAGE>`;
-
-	const USER_CONTENT = (angle) =>
-		`Write a ${angle.label} blog post.\nResearch:\n${rawContext}${imageHint}${linkHint}`;
-
-	// Parse delimited response — CONTENT is first so it gets the most tokens.
-	// Title/meta/tags are after and may be absent if the model ran out of budget;
-	// we fall back to extracting the title from the first heading in the content.
-	function parseDelimitedBlog(text) {
-		const extract = (tag) => {
-			// Handle both closed tags and unclosed (truncated) CONTENT block
-			if (tag === "CONTENT") {
-				const open = text.indexOf("<CONTENT>");
-				if (open === -1) return "";
-				const close = text.indexOf("</CONTENT>", open);
-				// If closing tag is missing (truncated), take everything after opening tag
-				return (
-					close === -1 ? text.slice(open + 9) : text.slice(open + 9, close)
-				).trim();
-			}
-			const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
-			return m ? m[1].trim() : "";
-		};
-		const content = extract("CONTENT");
-		if (!content) throw new Error("no content found");
-		let title = extract("TITLE");
-		// Fallback: grab first markdown heading from content
-		if (!title) {
-			const h = content.match(/^#{1,3}\s+(.+)/m);
-			title = h ? h[1].trim() : "";
-		}
-		const metaDescription = extract("META");
-		const tagsRaw = extract("TAGS");
-		const featuredImage = extract("FEATURED_IMAGE");
-		return {
-			title,
-			metaDescription,
-			suggestedTags: tagsRaw
-				? tagsRaw
-						.split(",")
-						.map((t) => t.trim())
-						.filter(Boolean)
-				: [],
-			featuredImage,
-			content,
-			wordCount: content.split(/\s+/).filter(Boolean).length,
-		};
-	}
-
-	// ── Step 4: Generate 5 blogs sequentially ────────────────────────────────
-	// Sequential (not parallel) to avoid OpenRouter rate-limit rejections when
-	// sending 5 large-context requests simultaneously. jsonMode OFF — embedding
-	// long markdown inside a JSON string causes Gemini to truncate silently.
-	const blogs = [];
-	for (const angle of BLOG_ANGLES) {
-		try {
-			const { text, usage } = await callOpenRouter(
-				[
-					{ role: "system", content: SYSTEM_PROMPT(angle) },
-					{ role: "user", content: USER_CONTENT(angle) },
-				],
-				{ jsonMode: false, maxTokens: outTokens },
-			);
-			addUsage(usage);
-			try {
-				const parsed = parseDelimitedBlog(text);
-				blogs.push({ angle: angle.id, label: angle.label, ...parsed });
-			} catch {
-				// Delimiter parse failed — try JSON as last resort, else keep raw
-				try {
-					const parsed = parseJsonFromLLM(text);
-					blogs.push({ angle: angle.id, label: angle.label, ...parsed });
-				} catch {
-					blogs.push({
-						angle: angle.id,
-						label: angle.label,
-						content: text,
-						parseError: true,
-						rawLength: text.length,
-					});
-				}
-			}
-		} catch (err) {
-			blogs.push({ angle: angle.id, label: angle.label, error: err.message });
-		}
-		// Small breathing room between calls
-		await new Promise((r) => setTimeout(r, 300));
-	}
-
-	return c.json({
-		success: true,
-		topic: topic || null,
-		blogs,
-		metadata: {
-			urlsProvided: urls.length,
-			urlsScrapedSuccessfully: successfulScrapes.length,
-			urlsFailed: scraped.filter((s) => s.error).length,
-			scrapedUrls: scraped.map((s) => ({
-				url: s.url,
-				success: !s.error,
-				error: s.error,
-			})),
-			blogsRequested: blogCount,
-			blogsGenerated: blogs.filter((b) => !b.error).length,
-			maxCharsPerUrl: perUrlCap,
-			maxOutputTokens: outTokens,
-			tokenUsage,
-			timestamp: new Date().toISOString(),
-		},
-	});
-});
 
 // Enhanced Bing Search endpoint using Axios
 app.post("/bing-search", async (c) => {
@@ -7263,310 +6904,6 @@ app.post("/screenshot-multiple", async (c) => {
 	}
 });
 
-app.post("/take-metadata", async (c) => {
-	try {
-		const { url } = await c.req.json();
-
-		if (!url) {
-			return c.json(
-				{
-					success: false,
-					error: "URL is required",
-				},
-				400,
-			);
-		}
-
-		// Validate URL format
-		try {
-			new URL(url);
-		} catch (error) {
-			return c.json(
-				{
-					success: false,
-					error: "Invalid URL format",
-				},
-				400,
-			);
-		}
-
-		try {
-			// Fetch the webpage content
-			const response = await axios.get(url, {
-				headers: {
-					"User-Agent": userAgents.random().toString(),
-					Accept:
-						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-					"Accept-Language": "en-US,en;q=0.9",
-					"Accept-Encoding": "gzip, deflate, br",
-					DNT: "1",
-					Connection: "keep-alive",
-					"Upgrade-Insecure-Requests": "1",
-				},
-				timeout: 30000,
-				maxRedirects: 5,
-			});
-
-			// Load HTML content with Cheerio
-			const $ = load(response.data);
-
-			// Extract basic metadata
-			const metadata = {
-				url: url,
-				title: $("title").text().trim() || $("h1").first().text().trim(),
-				description: "",
-				author: "",
-				pubDate: "",
-				image: "",
-				robots: "",
-				keywords: "",
-				language: "",
-				viewport: "",
-				favicon: "",
-				openGraph: {},
-				twitterCard: {},
-				allMetaTags: {},
-			};
-
-			// Extract description from various meta tags
-			metadata.description =
-				$('meta[name="description"]').attr("content") ||
-				$('meta[property="og:description"]').attr("content") ||
-				$('meta[name="twitter:description"]').attr("content") ||
-				$('meta[name="summary"]').attr("content") ||
-				"";
-
-			// Extract author
-			metadata.author =
-				$('meta[name="author"]').attr("content") ||
-				$('meta[property="article:author"]').attr("content") ||
-				$('meta[name="twitter:creator"]').attr("content") ||
-				$('link[rel="author"]').attr("href") ||
-				"";
-
-			// Extract publication date
-			metadata.pubDate =
-				$('meta[property="article:published_time"]').attr("content") ||
-				$('meta[name="date"]').attr("content") ||
-				$('meta[name="pubdate"]').attr("content") ||
-				$('meta[name="DC.date.issued"]').attr("content") ||
-				$("time[datetime]").first().attr("datetime") ||
-				"";
-
-			// Extract main image
-			metadata.image =
-				$('meta[property="og:image"]').attr("content") ||
-				$('meta[name="twitter:image"]').attr("content") ||
-				$('meta[name="image"]').attr("content") ||
-				$("img").first().attr("src") ||
-				"";
-
-			if (
-				metadata.image.startsWith("http") ||
-				metadata.image.startsWith("//") ||
-				metadata.image.startsWith("data:image/") ||
-				metadata.image.startsWith("blob:") ||
-				metadata.image.startsWith("file:") ||
-				metadata.image.startsWith("mailto:")
-			) {
-				metadata.image = "";
-			}
-			// Extract robots meta
-			metadata.robots = $('meta[name="robots"]').attr("content") || "";
-
-			// Extract keywords
-			metadata.keywords = $('meta[name="keywords"]').attr("content") || "";
-
-			// Extract language
-			metadata.language =
-				$("html").attr("lang") ||
-				$('meta[http-equiv="content-language"]').attr("content") ||
-				$('meta[name="language"]').attr("content") ||
-				"";
-
-			// Extract viewport
-			metadata.viewport = $('meta[name="viewport"]').attr("content") || "";
-
-			// Extract charset
-			metadata.charset =
-				$("meta[charset]").attr("charset") ||
-				$('meta[http-equiv="content-type"]').attr("content") ||
-				"";
-
-			// Extract theme color
-			metadata.themeColor = $('meta[name="theme-color"]').attr("content") || "";
-
-			// Extract all meta tags
-			$("meta").each((i, element) => {
-				const $meta = $(element);
-				const name =
-					$meta.attr("name") ||
-					$meta.attr("property") ||
-					$meta.attr("http-equiv");
-				const content = $meta.attr("content");
-				if (name && content) {
-					metadata.allMetaTags[name] = content;
-				}
-			});
-
-			// Extract Open Graph tags
-			$('meta[property^="og:"]').each((i, element) => {
-				const $meta = $(element);
-				const property = $meta.attr("property");
-				const content = $meta.attr("content");
-				if (property && content) {
-					// If the content starts with "http", "blob:", "image:", or "data:", set the value to an empty string
-					if (
-						content.startsWith("http") ||
-						content.startsWith("blob:") ||
-						content.startsWith("image:") ||
-						content.startsWith("data:")
-					) {
-						return;
-					} else {
-						metadata.openGraph[property] = content;
-					}
-				}
-			});
-
-			// Extract Twitter Card tags
-			$('meta[name^="twitter:"]').each((i, element) => {
-				const $meta = $(element);
-				const name = $meta.attr("name");
-				const content = $meta.attr("content");
-				if (name && content) {
-					if (
-						content.startsWith("http") ||
-						content.startsWith("blob:") ||
-						content.startsWith("image:") ||
-						content.startsWith("data:")
-					) {
-						return;
-					} else {
-						metadata.twitterCard[name] = content;
-					}
-				}
-			});
-
-			// Extract favicon
-			metadata.favicon =
-				$('link[rel="icon"]').attr("href") ||
-				$('link[rel="shortcut icon"]').attr("href") ||
-				$('link[rel="favicon"]').attr("href") ||
-				"";
-
-			removeEmptyKeys(metadata);
-			return c.json({
-				success: true,
-				metadata: metadata,
-				timestamp: new Date().toISOString(),
-			});
-		} catch (fetchError) {
-			console.error("❌ Error fetching URL:", fetchError);
-
-			// Handle specific HTTP status codes
-			if (fetchError.response) {
-				const status = fetchError.response.status;
-
-				// Handle page not found (404) and other client errors
-				if (status === 404) {
-					return c.json(
-						{
-							success: true,
-							metadata: null,
-							message: "Page not found - the requested URL does not exist",
-							status: 404,
-							timestamp: new Date().toISOString(),
-						},
-						200,
-					);
-				}
-
-				// Handle other client errors (4xx)
-				if (status >= 400 && status < 500) {
-					return c.json(
-						{
-							success: true,
-							metadata: null,
-							message: `Client error - the server returned status ${status}`,
-							status: status,
-							timestamp: new Date().toISOString(),
-						},
-						200,
-					);
-				}
-
-				// Handle server errors (5xx)
-				if (status >= 500) {
-					return c.json(
-						{
-							success: true,
-							metadata: null,
-							message: `Server error - the target server returned status ${status}`,
-							status: status,
-							timestamp: new Date().toISOString(),
-						},
-						200,
-					);
-				}
-			}
-
-			// Handle network errors (DNS, connection issues, etc.)
-			if (
-				fetchError.code === "ENOTFOUND" ||
-				fetchError.code === "ECONNREFUSED" ||
-				fetchError.code === "ETIMEDOUT"
-			) {
-				return c.json(
-					{
-						success: true,
-						metadata: null,
-						message: "Network error - unable to reach the requested URL",
-						error: fetchError.code,
-						timestamp: new Date().toISOString(),
-					},
-					200,
-				);
-			}
-
-			// Handle timeout errors
-			if (fetchError.code === "ECONNABORTED") {
-				return c.json(
-					{
-						success: true,
-						metadata: null,
-						message: "Request timeout - the server took too long to respond",
-						timestamp: new Date().toISOString(),
-					},
-					200,
-				);
-			}
-
-			// Handle other errors
-			return c.json(
-				{
-					success: true,
-					metadata: null,
-					message: "Unable to fetch metadata from the requested URL",
-					error: fetchError.message,
-					timestamp: new Date().toISOString(),
-				},
-				200,
-			);
-		}
-	} catch (error) {
-		console.error("❌ Metadata API error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Internal server error",
-				details: error.message,
-			},
-			500,
-		);
-	}
-});
-
 app.post("/crawl-take-screenshots", async (c) => {
 	// Wrapper: forwards to /crawl-url with takeScreenshot: true and maps to legacy response shape
 	try {
@@ -8414,18 +7751,6 @@ app.post("/scrape-reddit", async (c) => {
 	}
 });
 
-function extractYouTubeVideoId(idOrUrl) {
-	if (!idOrUrl || typeof idOrUrl !== "string") return null;
-	const s = idOrUrl.trim();
-	const youtuBe =
-		/^(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})(?:\?|$)/;
-	const watch = /(?:v=)([a-zA-Z0-9_-]{11})(?:&|$)/;
-	const m = s.match(youtuBe) || s.match(watch);
-	if (m) return m[1];
-	if (/^[a-zA-Z0-9_-]{11}$/.test(s)) return s;
-	return null;
-}
-
 const YOUTUBE_BROWSER_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -8759,6 +8084,55 @@ app.post("/scrape-git", async (c) => {
 export default app;
 
 app.post("/image-to-code", async (c) => {
+	// ── Auth ──────────────────────────────────────────────────────────────────
+	const imgAuthHeader =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const imgAuthToken = imgAuthHeader?.startsWith("Bearer ")
+		? imgAuthHeader.slice(7).trim()
+		: imgAuthHeader?.trim();
+	if (!imgAuthToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details:
+					"Provide a Bearer token in the Authorization header: Authorization: Bearer <token>",
+			},
+			401,
+		);
+	}
+
+	// ── Rate limit (20 req / 10 min per IP) ──────────────────────────────────
+	const IMG_RATE_LIMIT = 20;
+	const IMG_RATE_WINDOW_MS = 10 * 60 * 1000;
+	const imgClientIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+
+	const imgRl = rateLimit(imgClientIp, IMG_RATE_LIMIT, IMG_RATE_WINDOW_MS);
+	if (!imgRl.allowed) {
+		c.header("Retry-After", String(imgRl.retryAfter));
+		c.header("X-RateLimit-Limit", String(IMG_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window", "10 minutes");
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				message: `You have exceeded ${IMG_RATE_LIMIT} requests per 10 minutes. Please retry after ${imgRl.retryAfter}s.`,
+				retryAfter: imgRl.retryAfter,
+				ip: imgClientIp,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(IMG_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(imgRl.remaining));
+	c.header("X-RateLimit-Window", "10 minutes");
+
+	// ── Parse request body ────────────────────────────────────────────────────
 	const contentType = c.req.header("content-type") || "";
 	let imageUrl;
 	let prompt;
@@ -8772,7 +8146,6 @@ app.post("/image-to-code", async (c) => {
 	} else if (contentType.includes("multipart/form-data")) {
 		try {
 			const formData = await c.req.formData();
-			// Accept either a file (field: image or file) or a URL (field: imageUrl)
 			const fileField = formData.get("image") || formData.get("file");
 			if (
 				fileField &&
@@ -8785,13 +8158,11 @@ app.post("/image-to-code", async (c) => {
 			}
 			imageUrl = formData.get("imageUrl");
 			prompt = formData.get("prompt");
-		} catch (err) {
+		} catch {
 			return c.json(
 				{
 					error:
 						"Invalid multipart/form-data payload. Use proper multipart encoding (-F in curl) or send JSON.",
-					detail:
-						"When Content-Type is multipart/form-data, the body must include correct CRLF and boundary formatting.",
 				},
 				400,
 			);
@@ -8809,10 +8180,10 @@ app.post("/image-to-code", async (c) => {
 	}
 
 	if (!prompt) {
-		return c.json({ error: "Prompt is required" }, 400);
+		return c.json({ error: "prompt is required" }, 400);
 	}
 
-	// Resolve image content: prefer uploaded file if present, else fetch from URL
+	// ── Resolve image → base64 ────────────────────────────────────────────────
 	if (!base64Data) {
 		if (!imageUrl) {
 			return c.json(
@@ -8820,74 +8191,168 @@ app.post("/image-to-code", async (c) => {
 				400,
 			);
 		}
-		const res = await fetch(imageUrl);
-		if (!res.ok) {
+		const imgFetchRes = await fetch(imageUrl);
+		if (!imgFetchRes.ok) {
 			return c.json({ error: "Failed to fetch image from imageUrl" }, 400);
 		}
-		mimeType = res.headers.get("content-type") || "image/png";
-		const arrayBuffer = await res.arrayBuffer();
-		base64Data = Buffer.from(arrayBuffer).toString("base64");
+		mimeType = imgFetchRes.headers.get("content-type") || "image/png";
+		base64Data = Buffer.from(await imgFetchRes.arrayBuffer()).toString("base64");
 	}
 
-	const aiResponse = await genai.models.generateContent({
-		model: "gemini-2.0-flash",
-		contents: [
+	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+	if (!openRouterApiKey) {
+		return c.json(
 			{
-				role: "model",
-				parts: [
-					{
-						text: `You are an expert React developer. Your task is to generate a single, complete React component based on the provided image and user prompt. 
+				error: "OpenRouter API key not configured",
+				code: "MISSING_API_KEY",
+			},
+			503,
+		);
+	}
+
+	// ── Stream from OpenRouter ────────────────────────────────────────────────
+	let imgCodeUpstreamRes;
+	try {
+		imgCodeUpstreamRes = await fetch(
+			"https://openrouter.ai/api/v1/chat/completions",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${openRouterApiKey}`,
+					"HTTP-Referer": "https://ihatereading.in",
+					"X-Title": "IHateReading Image-to-Code",
+				},
+				body: JSON.stringify({
+					model: "anthropic/claude-sonnet-4-5",
+					stream: true,
+					messages: [
+						{
+							role: "system",
+							content: `You are an expert React developer. Your task is to generate a single, complete React component based on the provided image and user prompt.
 
 Strict requirements:
-- Output only a single React component, in a string with react code block with language set to \`jsx\`.
+- Output only a single React component as raw JSX — no markdown fences, no explanations.
 - Use **Tailwind CSS** for all styling.
 - Use **lucide-react** and **react-icons** for any icons (import from these libraries as needed).
 - Do not use any other CSS frameworks or icon libraries.
-- The component should be self-contained and ready to use.
-- Do not include any explanations, comments, or extra text outside the code block.
-- If the image contains text, use placeholder text in English.
+- The component must be self-contained, default-exported, and ready to render.
 - If the image contains interactive elements, implement them as functional React code.
 - Do not include any import for Tailwind CSS (assume it is globally available).
-- Only output the code block with the component, nothing else.`,
-					},
-				],
+- Only output the raw JSX component code, nothing else.`,
+						},
+						{
+							role: "user",
+							content: [
+								{ type: "text", text: prompt },
+								{
+									type: "image_url",
+									image_url: { url: `data:${mimeType};base64,${base64Data}` },
+								},
+							],
+						},
+					],
+					temperature: 0.2,
+				}),
 			},
-			{
-				role: "user",
-				parts: [
-					{ text: prompt },
-					{ inlineData: { mimeType, data: base64Data } },
-				],
-			},
-		],
-	});
-	let text = aiResponse?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-	// If wrapped in a code fence, extract inner content
-	const fenceMatch = text.match(/```(?:jsx|tsx|javascript)?\n([\s\S]*?)```/i);
-	if (fenceMatch && fenceMatch[1]) {
-		text = fenceMatch[1];
+		);
+	} catch (fetchErr) {
+		return c.json(
+			{ error: `Failed to reach OpenRouter: ${fetchErr.message}` },
+			502,
+		);
 	}
 
-	// Convert literal escape sequences to actual characters
-	const code = text
-		.replace(/\\r/g, "")
-		.replace(/\\t/g, "\t")
-		.replace(/\\n/g, "\n");
+	if (!imgCodeUpstreamRes.ok) {
+		let detail = `OpenRouter ${imgCodeUpstreamRes.status}`;
+		try {
+			const errJson = await imgCodeUpstreamRes.json();
+			detail = errJson?.error?.message || detail;
+		} catch {}
+		return c.json({ error: detail }, imgCodeUpstreamRes.status);
+	}
 
-	// Flat version for detectors that cannot handle newlines
-	const code_flat = code
-		.replace(/\r?\n/g, " ")
-		.replace(/\t/g, " ")
-		.replace(/\s{2,}/g, " ")
-		.trim();
+	// ── Pipe OpenRouter SSE → client SSE ─────────────────────────────────────
+	const imgEncoder = new TextEncoder();
+	const imgUpstreamReader = imgCodeUpstreamRes.body.getReader();
+	const imgUpstreamDecoder = new TextDecoder();
 
-	return c.json({
-		success: true,
-		code,
-		code_flat,
-		inputTokens: aiResponse.usageMetadata.promptTokenCount,
-		outputTokens: aiResponse.usageMetadata.candidatesTokenCount,
+	const imgOutputStream = new ReadableStream({
+		async start(controller) {
+			let sseBuffer = "";
+			try {
+				while (true) {
+					const { done, value } = await imgUpstreamReader.read();
+					if (done) break;
+
+					sseBuffer += imgUpstreamDecoder.decode(value, { stream: true });
+					const lines = sseBuffer.split("\n");
+					sseBuffer = lines.pop();
+
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed.startsWith("data: ")) continue;
+
+						const payload = trimmed.slice(6);
+						if (payload === "[DONE]") {
+							controller.enqueue(imgEncoder.encode("data: [DONE]\n\n"));
+							controller.close();
+							return;
+						}
+
+						let parsed;
+						try {
+							parsed = JSON.parse(payload);
+						} catch {
+							continue;
+						}
+
+						if (parsed?.error) {
+							controller.enqueue(
+								imgEncoder.encode(
+									`data: ${JSON.stringify({ error: parsed.error.message || "OpenRouter error" })}\n\n`,
+								),
+							);
+							controller.close();
+							return;
+						}
+
+						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
+						if (delta) {
+							controller.enqueue(
+								imgEncoder.encode(
+									`data: ${JSON.stringify({ delta })}\n\n`,
+								),
+							);
+						}
+					}
+				}
+
+				controller.enqueue(imgEncoder.encode("data: [DONE]\n\n"));
+				controller.close();
+			} catch (err) {
+				try {
+					controller.enqueue(
+						imgEncoder.encode(
+							`data: ${JSON.stringify({ error: err.message })}\n\n`,
+						),
+					);
+					controller.close();
+				} catch {}
+			} finally {
+				imgUpstreamReader.releaseLock();
+			}
+		},
+	});
+
+	return new Response(imgOutputStream, {
+		status: 200,
+		headers: {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache",
+			Connection: "keep-alive",
+			"X-Accel-Buffering": "no",
+		},
 	});
 });
 
@@ -10504,6 +9969,405 @@ app.post("/agent-screenshot-multiple", async (c) => {
 	);
 
 	return c.json({ success: true, results, timestamp: new Date().toISOString() });
+});
+
+// ─── /api/codegen — URL → React / Tailwind HTML streamed codegen ─────────────
+//
+// POST /api/codegen?format=react|html&model=<openrouter-model-id>
+// Body: { url: string, prompt?: string, context?: string }
+//
+// Scrapes the given URL, then streams generated code back as SSE:
+//   data: {"delta":"..."}   — incremental chunk
+//   data: [DONE]            — stream finished
+//   data: {"error":"..."}   — on failure
+
+const CODEGEN_SYSTEM_PROMPT = `You are an expert frontend engineer specialising in pixel-accurate UI reproduction.
+You are given rich data about a reference web page: its title, structured headings, paragraphs,
+list items, images, OG/meta tags, CSS colour palette, font families, CSS custom properties,
+and the full set of CSS/Tailwind class names used on the page.
+Your job is to reproduce that page's UI as clean, production-ready code.
+
+Rules:
+- Output ONLY the raw code — no markdown fences, no explanations, no comments.
+- For "react" format: return a single default-exported React functional component.
+  • Use Tailwind CSS utility classes for all styling — no inline styles, no separate CSS files.
+  • Import React at the top. The component must be self-contained and renderable.
+  • Use the exact colours from the "Colour palette" section (convert hex/rgb to the nearest
+    Tailwind colour or add them as arbitrary values, e.g. bg-[#1a1a2e]).
+  • Use the font families listed; load them from Google Fonts via a <style> tag if needed
+    (wrap in a React Fragment or use a dangerouslySetInnerHTML trick at the top of the component).
+- For "html" format: return a complete HTML document with Tailwind CDN included
+  via <script src="https://cdn.tailwindcss.com"></script>.
+  All styling must use Tailwind utility classes only.
+- Layout & structure:
+  • Reproduce every major section visible in the headings/content data.
+  • Use the image src URLs provided — do not make up or substitute image URLs.
+  • Match the colour palette, spacing rhythm, and typography hierarchy as closely as possible.
+  • If Tailwind class names are provided, reuse them where they make semantic sense.
+- Do NOT include placeholder lorem-ipsum text — use the actual content from the page data.
+- Do NOT output anything except the code itself.`;
+
+app.post("/api/codegen", async (c) => {
+	// ── Auth ──────────────────────────────────────────────────────────────────
+	const authHeader =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const authToken = authHeader?.startsWith("Bearer ")
+		? authHeader.slice(7).trim()
+		: authHeader?.trim();
+	if (!authToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details:
+					"Provide a Bearer token in the Authorization header: Authorization: Bearer <token>",
+			},
+			401,
+		);
+	}
+
+	// ── Rate limit (20 req / 10 min per IP) ──────────────────────────────────
+	const CODEGEN_RATE_LIMIT = 20;
+	const CODEGEN_RATE_WINDOW_MS = 10 * 60 * 1000;
+	const clientIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+
+	const rl = rateLimit(clientIp, CODEGEN_RATE_LIMIT, CODEGEN_RATE_WINDOW_MS);
+	if (!rl.allowed) {
+		c.header("Retry-After", String(rl.retryAfter));
+		c.header("X-RateLimit-Limit", String(CODEGEN_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window", "10 minutes");
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				message: `You have exceeded ${CODEGEN_RATE_LIMIT} requests per 10 minutes. Please retry after ${rl.retryAfter}s.`,
+				retryAfter: rl.retryAfter,
+				ip: clientIp,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(CODEGEN_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(rl.remaining));
+	c.header("X-RateLimit-Window", "10 minutes");
+
+	// ── Validate query params ─────────────────────────────────────────────────
+	const format = (c.req.query("format") || "react").toLowerCase();
+	const modelOverride = c.req.query("model") || "";
+
+	if (format !== "react" && format !== "html") {
+		return c.json({ error: 'format must be "react" or "html"' }, 400);
+	}
+
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	const { url, prompt: extraPrompt = "", context = "" } = body;
+
+	if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+		return c.json({ error: "A valid `url` field is required" }, 400);
+	}
+
+	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+	if (!openRouterApiKey) {
+		return c.json(
+			{
+				error: "OpenRouter API key not configured",
+				code: "MISSING_API_KEY",
+				details: "Set OPENROUTER_API_KEY in your environment for codegen to work.",
+			},
+			503,
+		);
+	}
+
+	// ── 1. Scrape the URL — Puppeteer for rich content + raw fetch for CSS ──────
+	let scrapeData = null;
+	let scrapeMarkdown = "";
+	let cssHints = "";
+
+	// 1a. Puppeteer scrape — semantic content, metadata, images, headings
+	try {
+		const scrapeResult = await scrapeSingleUrlWithPuppeteer(url, {
+			includeSemanticContent: true,
+			extractMetadata: true,
+			includeImages: true,
+			includeLinks: false,
+			timeout: 30_000,
+		});
+		scrapeData   = scrapeResult.data   ?? null;
+		scrapeMarkdown = scrapeResult.markdown ?? "";
+	} catch (scrapeErr) {
+		console.warn("[codegen] puppeteer scrape failed:", scrapeErr?.message);
+	}
+
+	// 1b. Raw HTML fetch — extract inline styles, <style> blocks, CSS variables,
+	//     Tailwind/utility class names, and computed colour/font hints.
+	try {
+		const rawRes = await fetch(url, {
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (compatible; CodegenBot/1.0; +https://ihatereading.in)",
+				Accept: "text/html,application/xhtml+xml",
+			},
+			signal: AbortSignal.timeout(15_000),
+		});
+		if (rawRes.ok) {
+			const html = await rawRes.text();
+			const dom  = new JSDOM(html);
+			const doc  = dom.window.document;
+
+			// Inline <style> blocks — grab first 8 KB
+			const styleText = Array.from(doc.querySelectorAll("style"))
+				.map((s) => s.textContent || "")
+				.join("\n")
+				.slice(0, 8_000);
+
+			// CSS custom property declarations (--color-*, --font-*, etc.)
+			const cssVarMatches = [...styleText.matchAll(/--([\w-]+)\s*:\s*([^;}{]+)/g)]
+				.slice(0, 60)
+				.map(([, name, val]) => `--${name}: ${val.trim()}`);
+
+			// Inline style attributes on elements — capture colours & fonts
+			const inlineStyles = Array.from(
+				doc.querySelectorAll("[style]"),
+			)
+				.map((el) => el.getAttribute("style") || "")
+				.filter(Boolean)
+				.slice(0, 50)
+				.join("; ");
+
+			// Collect all class names — useful when Tailwind/utility classes are used
+			const allClasses = [
+				...new Set(
+					Array.from(doc.querySelectorAll("[class]"))
+						.flatMap((el) =>
+							(el.getAttribute("class") || "").split(/\s+/).filter(Boolean),
+						),
+				),
+			]
+				.slice(0, 300)
+				.join(" ");
+
+			// Background / text colours declared in stylesheets
+			const colourRe = /(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|hsl[a]?\([^)]+\))/g;
+			const colours = [...new Set(styleText.match(colourRe) ?? [])].slice(0, 30);
+
+			// Font families from CSS
+			const fontRe = /font-family\s*:\s*([^;}{]+)/g;
+			const fonts = [
+				...new Set([...styleText.matchAll(fontRe)].map(([, f]) => f.trim())),
+			].slice(0, 10);
+
+			cssHints = [
+				colours.length   && `Colour palette: ${colours.join(", ")}`,
+				fonts.length     && `Font families: ${fonts.join(", ")}`,
+				cssVarMatches.length && `CSS custom properties:\n${cssVarMatches.join("\n")}`,
+				allClasses       && `CSS/Tailwind class names used: ${allClasses}`,
+				inlineStyles     && `Inline styles sample: ${inlineStyles.slice(0, 1_000)}`,
+			]
+				.filter(Boolean)
+				.join("\n\n");
+		}
+	} catch (cssErr) {
+		console.warn("[codegen] CSS fetch failed:", cssErr?.message);
+	}
+
+	// ── 2. Build the user prompt ───────────────────────────────────────────────
+	const sc = scrapeData?.content?.semanticContent ?? {};
+
+	// Structured content sections
+	const headings = ["h1", "h2", "h3", "h4", "h5", "h6"]
+		.flatMap((tag) => (scrapeData?.content?.[tag] ?? []).map((t) => `${tag.toUpperCase()}: ${t}`))
+		.join("\n");
+
+	const paragraphs = (sc.paragraphs ?? [])
+		.filter(Boolean)
+		.slice(0, 80)
+		.join("\n");
+
+	const listItems = [
+		...(sc.unorderedLists ?? []).flat(),
+		...(sc.orderedLists ?? []).flat(),
+	]
+		.filter(Boolean)
+		.slice(0, 60)
+		.join("\n");
+
+	const images = (scrapeData?.images ?? [])
+		.slice(0, 20)
+		.map((img) => `src="${img.src}" alt="${img.alt}" (${img.width}x${img.height})`)
+		.join("\n");
+
+	const metadata = scrapeData?.metadata
+		? Object.entries(scrapeData.metadata)
+				.slice(0, 30)
+				.map(([k, v]) => `${k}: ${v}`)
+				.join("\n")
+		: "";
+
+	const pageContext = [
+		scrapeData?.title && `Page title: ${scrapeData.title}`,
+		`URL: ${url}`,
+		metadata          && `## Metadata (OG / Twitter / meta)\n${metadata}`,
+		headings          && `## Headings\n${headings}`,
+		paragraphs        && `## Paragraphs\n${paragraphs}`,
+		listItems         && `## List items\n${listItems}`,
+		images            && `## Images\n${images}`,
+		scrapeMarkdown    && `## Full page markdown\n${scrapeMarkdown.slice(0, 6_000)}`,
+		cssHints          && `## CSS / Design tokens\n${cssHints}`,
+	]
+		.filter(Boolean)
+		.join("\n\n");
+
+	const userMessage = [
+		`Reproduce the UI of the following web page as ${format === "react" ? "a React + Tailwind CSS component" : "a complete Tailwind CSS HTML page"}.`,
+		`Use ALL the information below — headings, content, images, colours, fonts, and class names — to make the reproduction as accurate as possible.`,
+		pageContext || `URL: ${url}`,
+		extraPrompt && `Additional instructions: ${extraPrompt}`,
+		context     && `Extra context: ${context}`,
+	]
+		.filter(Boolean)
+		.join("\n\n");
+
+	const model =
+		modelOverride ||
+		process.env.CODEGEN_MODEL ||
+		"anthropic/claude-sonnet-4-5";
+
+	// ── 3. Stream from OpenRouter ──────────────────────────────────────────────
+	let openRouterRes;
+	try {
+		openRouterRes = await fetch(
+			"https://openrouter.ai/api/v1/chat/completions",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${openRouterApiKey}`,
+					"HTTP-Referer": "https://ihatereading.in",
+					"X-Title": "IHateReading Codegen",
+				},
+				body: JSON.stringify({
+					model,
+					stream: true,
+					messages: [
+						{ role: "system", content: CODEGEN_SYSTEM_PROMPT },
+						{ role: "user", content: userMessage },
+					],
+					temperature: 0.2,
+				}),
+			},
+		);
+	} catch (fetchErr) {
+		return c.json(
+			{ error: `Failed to reach OpenRouter: ${fetchErr.message}` },
+			502,
+		);
+	}
+
+	if (!openRouterRes.ok) {
+		let detail = `OpenRouter ${openRouterRes.status}`;
+		try {
+			const errJson = await openRouterRes.json();
+			detail = errJson?.error?.message || detail;
+		} catch {}
+		return c.json({ error: detail }, openRouterRes.status);
+	}
+
+	// ── 4. Pipe OpenRouter SSE → client SSE ───────────────────────────────────
+	const encoder = new TextEncoder();
+	const upstreamReader = openRouterRes.body.getReader();
+	const upstreamDecoder = new TextDecoder();
+
+	const outputStream = new ReadableStream({
+		async start(controller) {
+			let sseBuffer = "";
+			try {
+				while (true) {
+					const { done, value } = await upstreamReader.read();
+					if (done) break;
+
+					sseBuffer += upstreamDecoder.decode(value, { stream: true });
+					const lines = sseBuffer.split("\n");
+					sseBuffer = lines.pop(); // hold incomplete line
+
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed.startsWith("data: ")) continue;
+
+						const payload = trimmed.slice(6);
+						if (payload === "[DONE]") {
+							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+							controller.close();
+							return;
+						}
+
+						let parsed;
+						try {
+							parsed = JSON.parse(payload);
+						} catch {
+							continue;
+						}
+
+						// OpenRouter streams error objects inside data payloads
+						if (parsed?.error) {
+							controller.enqueue(
+								encoder.encode(
+									`data: ${JSON.stringify({ error: parsed.error.message || "OpenRouter error" })}\n\n`,
+								),
+							);
+							controller.close();
+							return;
+						}
+
+						const delta =
+							parsed?.choices?.[0]?.delta?.content ?? null;
+						if (delta) {
+							controller.enqueue(
+								encoder.encode(
+									`data: ${JSON.stringify({ delta })}\n\n`,
+								),
+							);
+						}
+					}
+				}
+
+				// Stream ended without [DONE] — still signal completion
+				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+				controller.close();
+			} catch (err) {
+				try {
+					controller.enqueue(
+						encoder.encode(
+							`data: ${JSON.stringify({ error: err.message })}\n\n`,
+						),
+					);
+					controller.close();
+				} catch {}
+			} finally {
+				upstreamReader.releaseLock();
+			}
+		},
+	});
+
+	return new Response(outputStream, {
+		status: 200,
+		headers: {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache",
+			Connection: "keep-alive",
+			"X-Accel-Buffering": "no",
+		},
+	});
 });
 
 const port = 3002;
