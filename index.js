@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore, storage } from "./config/firebase.js";
+import { FieldValue } from "firebase-admin/firestore";
+import jwt from "jsonwebtoken";
 import chromium from "@sparticuz/chromium";
 import { supabase } from "./config/supabase.js";
 import { performance } from "perf_hooks";
@@ -9818,8 +9820,178 @@ async function agentBrowserScreenshot(url, { timeout = 50000, fullPage = false }
 	return response.data.ufsUrl;
 }
 
-// ─── agent-browser endpoints ─────────────────────────────────────────────────
+// ─── API Token Layer ──────────────────────────────────────────────────────────
+//
+// Step 1 — Token creation:   POST /api-token/create   { userId }
+// Step 2 — JWT middleware:   apiTokenMiddleware  (applied to 4 agent routes below)
+// Step 3 — Credit check:     verifyApiToken checks users/{userId}.credits > 0
+// Step 4 — Credit deduction: middleware deducts 1 credit after each successful call
 
+const JWT_SECRET         = process.env.JWT_SECRET || "ihatereading-api-jwt-secret";
+const API_TOKENS_COLL    = "apiTokens";
+const USERS_COLL         = "users";
+const API_CREDIT_COST    = 1;
+
+/** Create and persist a JWT API token for a given userId. */
+async function createApiToken(userId) {
+	const token = jwt.sign({ userId, type: "api_token" }, JWT_SECRET, { expiresIn: "1y" });
+	await firestore.collection(API_TOKENS_COLL).doc(userId).set(
+		{ token, userId, createdAt: new Date().toISOString(), isActive: true },
+		{ merge: true },
+	);
+	return token;
+}
+
+/**
+ * Verify a raw JWT token string end-to-end:
+ *   1. Decode + verify JWT signature
+ *   2. Confirm record in Firestore and token is active (not revoked)
+ *   3. Confirm user exists and has enough credits
+ */
+async function verifyApiToken(token) {
+	let payload;
+	try {
+		payload = jwt.verify(token, JWT_SECRET);
+	} catch (e) {
+		return { valid: false, error: "Invalid or expired API token", code: "INVALID_TOKEN" };
+	}
+
+	const { userId } = payload;
+	if (!userId) return { valid: false, error: "Token payload missing userId", code: "INVALID_TOKEN" };
+
+	const [tokenSnap, userSnap] = await Promise.all([
+		firestore.collection(API_TOKENS_COLL).doc(userId).get(),
+		firestore.collection(USERS_COLL).doc(userId).get(),
+	]);
+
+	if (!tokenSnap.exists) {
+		return { valid: false, error: "API token not found — generate one via /api-token/create", code: "TOKEN_NOT_FOUND" };
+	}
+	const tokenData = tokenSnap.data();
+	if (!tokenData.isActive) {
+		return { valid: false, error: "API token has been revoked", code: "TOKEN_REVOKED" };
+	}
+	if (tokenData.token !== token) {
+		return { valid: false, error: "Token does not match the active token for this user", code: "TOKEN_MISMATCH" };
+	}
+	if (!userSnap.exists) {
+		return { valid: false, error: "User not found", code: "USER_NOT_FOUND" };
+	}
+
+	const { credits = 0 } = userSnap.data();
+	if (credits < API_CREDIT_COST) {
+		return { valid: false, error: "Insufficient credits", code: "NO_CREDITS", credits };
+	}
+
+	return { valid: true, userId, credits };
+}
+
+/** Decrement the user's credit balance by API_CREDIT_COST (fire-and-forget safe). */
+async function deductCredit(userId) {
+	await firestore.collection(USERS_COLL).doc(userId).update({
+		credits:   FieldValue.increment(-API_CREDIT_COST),
+		updatedAt: new Date().toISOString(),
+	});
+}
+
+/**
+ * Hono middleware — validates API token, attaches userId to context, and
+ * deducts one credit after the downstream handler returns a 2xx response.
+ */
+async function apiTokenMiddleware(c, next) {
+	const authHdr  = c.req.header("Authorization") || c.req.header("authorization");
+	const rawToken = authHdr?.startsWith("Bearer ") ? authHdr.slice(7).trim() : authHdr?.trim();
+
+	if (!rawToken) {
+		return c.json(
+			{ error: "API token required", code: "MISSING_TOKEN",
+			  details: "Set Authorization: Bearer <token>. Create one via POST /api-token/create." },
+			401,
+		);
+	}
+
+	const result = await verifyApiToken(rawToken);
+	if (!result.valid) {
+		return c.json(
+			{ error: result.error, code: result.code, credits: result.credits ?? undefined },
+			result.code === "NO_CREDITS" ? 402 : 401,
+		);
+	}
+
+	c.set("userId",     result.userId);
+	c.set("apiCredits", result.credits);
+
+	await next();
+
+	// Deduct one credit after a successful (2xx) response
+	if (c.res.ok) {
+		deductCredit(result.userId).catch((e) =>
+			console.error("[api-token] credit deduction failed for", result.userId, e?.message),
+		);
+	}
+}
+
+// ── Step 1: Token management endpoints ───────────────────────────────────────
+
+/** POST /api-token/create — generate (or regenerate) an API token for a user. */
+app.post("/api-token/create", async (c) => {
+	let body;
+	try { body = await c.req.json(); } catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+	const { userId } = body;
+	if (!userId || typeof userId !== "string") {
+		return c.json({ error: "userId (string) is required" }, 400);
+	}
+	try {
+		const token = await createApiToken(userId);
+		return c.json({ success: true, token, userId, expiresIn: "1 year" });
+	} catch (err) {
+		console.error("[api-token/create]", err?.message);
+		return c.json({ error: err?.message || "Failed to create token" }, 500);
+	}
+});
+
+/** POST /api-token/revoke — invalidate the active token for a user. */
+app.post("/api-token/revoke", async (c) => {
+	let body;
+	try { body = await c.req.json(); } catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+	const { userId } = body;
+	if (!userId || typeof userId !== "string") {
+		return c.json({ error: "userId (string) is required" }, 400);
+	}
+	try {
+		await firestore.collection(API_TOKENS_COLL).doc(userId).update({ isActive: false });
+		return c.json({ success: true, message: "API token revoked" });
+	} catch (err) {
+		console.error("[api-token/revoke]", err?.message);
+		return c.json({ error: err?.message || "Failed to revoke token" }, 500);
+	}
+});
+
+/** GET /api-token/credits/:userId — check remaining credits for a user. */
+app.get("/api-token/credits/:userId", async (c) => {
+	const userId = c.req.param("userId");
+	try {
+		const snap = await firestore.collection(USERS_COLL).doc(userId).get();
+		if (!snap.exists) return c.json({ error: "User not found" }, 404);
+		const { credits = 0 } = snap.data();
+		return c.json({ success: true, userId, credits });
+	} catch (err) {
+		return c.json({ error: err?.message || "Failed to fetch credits" }, 500);
+	}
+});
+
+// ── Step 2: Apply apiTokenMiddleware to the 4 agent routes ───────────────────
+app.use("/agent-scrape",             apiTokenMiddleware);
+app.use("/agent-scrape-multiple",    apiTokenMiddleware);
+app.use("/agent-screenshot",         apiTokenMiddleware);
+app.use("/agent-screenshot-multiple", apiTokenMiddleware);
+
+
+// ─── agent-browser endpoints ─────────────────────────────────────────────────
 app.post("/agent-scrape", async (c) => {
 	const { url, timeout = 30000 } = await c.req.json();
 

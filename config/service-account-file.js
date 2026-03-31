@@ -14,6 +14,13 @@ const serviceAccount = {
 		"https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-ahovl%40ihatereading-4ba52.iam.gserviceaccount.com",
 };
 
+const serviceAccountInkgest = {
+	type: "service_account",
+	project_id: "inkgest-4ba52",
+	private_key_id: "c7262a2e1ac09707f11d0c33e8cdd0bd53d0d84b",	
+	
+}
+
 const serviceAccountProfiler = {
 	type: "service_account",
 	project_id: "profiler-c3e71",
