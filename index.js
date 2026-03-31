@@ -11,7 +11,6 @@ import { cpus } from "os";
 import UserAgent from "user-agents";
 import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
-import axios from "axios";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
 import {
@@ -3284,7 +3283,6 @@ app.post("/bing-search", async (c) => {
 			}
 		});
 
-		// Use response.data directly - axios already handles UTF-8
 		const dom = new JSDOM(response.html, {
 			contentType: "text/html",
 			includeNodeLocations: false,
@@ -3803,7 +3801,6 @@ app.post("/google-search", async (c) => {
 
 		const results = parseGoogleResults(response.html);
 
-		// Use response.data directly - axios already handles UTF-8
 		const dom = new JSDOM(response.html, {
 			contentType: "text/html",
 			includeNodeLocations: false,
@@ -6635,9 +6632,9 @@ function normalizeWebsiteUrl(input) {
 
 async function isLikelyStaticSite(url) {
 	try {
-		const resp = await axios.get(url, {
-			timeout: 12000,
-			maxRedirects: 5,
+		const resp = await fetch(url, {
+			signal: AbortSignal.timeout(12000),
+			redirect: "follow",
 			headers: {
 				"User-Agent": userAgents.random().toString(),
 				Accept:
@@ -6645,7 +6642,8 @@ async function isLikelyStaticSite(url) {
 				"Accept-Language": "en-US,en;q=0.9",
 			},
 		});
-		const html = typeof resp?.data === "string" ? resp.data : "";
+		if (!resp.ok) return false;
+		const html = await resp.text();
 		if (!html) return false;
 		const scriptTags = (html.match(/<script[\s>]/gi) || []).length;
 		const inlineHydrationHints =
@@ -7474,22 +7472,27 @@ app.post("/scrape-reddit", async (c) => {
 
 		try {
 			// Fetch Reddit JSON — minimal headers (no User-Agent) to avoid bot blocking
-			const response = await axios.get(jsonUrl, {
+			const response = await fetch(jsonUrl, {
 				headers: {
 					Accept: "application/json",
 				},
-				timeout: 30000,
-				maxRedirects: 5,
+				signal: AbortSignal.timeout(30000),
+				redirect: "follow",
 			});
+			if (!response.ok) {
+				const err = new Error(`HTTP ${response.status}`);
+				err.response = { status: response.status };
+				throw err;
+			}
 
-			const redditData = response.data;
+			const redditData = await response.json();
 
 			// Extract metadata from the original Reddit URL (without .json)
 			let redditMetadata = null;
 			// Fetch the webpage content
 			const newUrl = new URL(url.replace(".json", ""));
 			const hostname = newUrl.hostname;
-			const metadataResponse = await axios.get(`https://${hostname}`, {
+			const metadataResponse = await fetch(`https://${hostname}`, {
 				headers: {
 					"User-Agent": userAgents.random().toString(),
 					Accept:
@@ -7500,12 +7503,13 @@ app.post("/scrape-reddit", async (c) => {
 					Connection: "keep-alive",
 					"Upgrade-Insecure-Requests": "1",
 				},
-				timeout: 30000,
-				maxRedirects: 5,
+				signal: AbortSignal.timeout(30000),
+				redirect: "follow",
 			});
+			const metadataHtml = await metadataResponse.text();
 
 			// Load HTML content with Cheerio
-			const $ = load(metadataResponse.data);
+			const $ = load(metadataHtml);
 
 			// Extract basic metadata
 			const metadata = {
@@ -7688,12 +7692,13 @@ app.post("/scrape-reddit", async (c) => {
 					console.log("🔄 JSON API blocked, trying alternative approach...");
 
 					// Fallback: retry with minimal headers (no User-Agent)
-					const fallbackResponse = await axios.get(jsonUrl, {
+					const fallbackResp = await fetch(jsonUrl, {
 						headers: { Accept: "application/json" },
-						timeout: 30000,
+						signal: AbortSignal.timeout(30000),
 					});
+					if (!fallbackResp.ok) throw new Error(`HTTP ${fallbackResp.status}`);
 
-					const redditData = fallbackResponse.data;
+					const redditData = await fallbackResp.json();
 					const { markdown, posts } = parseRedditData(redditData, url);
 					const comments = parseRedditComments(redditData);
 					const commentsMarkdown =
@@ -7928,9 +7933,13 @@ app.post("/scrape-git", async (c) => {
 	const repo = repoMatch?.[2]?.replace(/\.git$/i, "");
 
 	try {
-		const response = await axios.get(newUrl.toString());
+		const response = await fetch(newUrl.toString(), {
+			signal: AbortSignal.timeout(30000),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const responseHtml = await response.text();
 
-		const $ = load(response.data);
+		const $ = load(responseHtml);
 		const metadata = {
 			title: $("title").text().trim(),
 			description: $("meta[name='description']").attr("content"),
@@ -9164,24 +9173,26 @@ app.post("/fetch-metadata", async (c) => {
 		}
 
 		try {
-			// Fetch the webpage content
-			const response = await axios.get(url, {
-				headers: {
-					"User-Agent": userAgents.random().toString(),
-					Accept:
-						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-					"Accept-Language": "en-US,en;q=0.9",
-					"Accept-Encoding": "gzip, deflate, br",
-					DNT: "1",
-					Connection: "keep-alive",
-					"Upgrade-Insecure-Requests": "1",
-				},
-				timeout: 30000,
-				maxRedirects: 5,
-			});
+		// Fetch the webpage content
+		const response = await fetch(url, {
+			headers: {
+				"User-Agent": userAgents.random().toString(),
+				Accept:
+					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+				"Accept-Encoding": "gzip, deflate, br",
+				DNT: "1",
+				Connection: "keep-alive",
+				"Upgrade-Insecure-Requests": "1",
+			},
+			signal: AbortSignal.timeout(30000),
+			redirect: "follow",
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const responseHtml = await response.text();
 
-			// Load HTML content with Cheerio
-			const $ = load(response.data);
+		// Load HTML content with Cheerio
+		const $ = load(responseHtml);
 
 			// Extract basic metadata
 			const metadata = {
@@ -9465,15 +9476,18 @@ app.get("/scrap-grokipedia", async (c) => {
 
 		console.log("Grokipedia URL:", url);
 
-		// Fetch HTML
-		const response = await axios.get(url, {
-			headers: {
-				"User-Agent":
-					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-			},
-		});
+	// Fetch HTML
+	const response = await fetch(url, {
+		headers: {
+			"User-Agent":
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+		},
+		signal: AbortSignal.timeout(30000),
+	});
+	if (!response.ok) throw new Error(`HTTP ${response.status}`);
+	const responseHtml = await response.text();
 
-		const $ = load(response.data);
+	const $ = load(responseHtml);
 
 		// Extract metadata
 		const title =
