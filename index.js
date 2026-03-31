@@ -4921,156 +4921,203 @@ app.post("/inkgest-agent", async (c) => {
 							}
 						}
 
-						if (!hasExecuteTasks) {
-							const urlLine = urlsToScrape.length
-								? `URLs found: ${urlsToScrape.join(", ")}`
-								: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
-							const imageLine = hasImages
-								? `Images provided: ${bodyImages.length} image(s). You MUST suggest an image-reading task with params.images (the executor will inject the actual images). Suggest blog, article, newsletter, or table to use the extracted image content.`
-								: "";
-							const userContent = `User message: ${userPrompt}\n\n${urlLine}${imageLine ? `\n\n${imageLine}` : ""}`;
-							const messages = [
-								{ role: "system", content: ROUTER_SYSTEM_PROMPT },
-								...chatHistory.slice(-6).map((m) => ({
-									role: m.role === "user" ? "user" : "assistant",
-									content: m.content,
-								})),
-								{ role: "user", content: userContent },
-							];
+					if (!hasExecuteTasks) {
+						// 1. Snapshot prompt URLs (already populated from extractedUrls above)
+						const promptUrls = [...urlsToScrape];
 
-							async function scrapeAllUrls() {
-								if (urlsToScrape.length === 0)
-									return { sources: [], errors: [] };
-								const [regularScraped, youtubeScraped, redditScraped] =
-									await Promise.all([
-										regularUrls.length > 0
-											? scrapeUrlsViaApi(scrapeBase, regularUrls, {
-													includeImages: true,
-													aiSummary: true,
-												})
-											: { sources: [], errors: [] },
-										youtubeUrls.length > 0
-											? scrapeYoutubeViaApi(apiBase, youtubeUrls)
-											: { sources: [], errors: [] },
-										redditUrls.length > 0
-											? scrapeRedditViaApi(apiBase, redditUrls)
-											: { sources: [], errors: [] },
-									]);
-								// Fallback: when Reddit API blocks (common in prod), try Puppeteer scrape
-								let redditFinal = redditScraped;
-								if (
-									redditUrls.length > 0 &&
-									redditScraped.sources?.length === 0 &&
-									redditScraped.errors?.length > 0
-								) {
-									redditFinal = await scrapeUrlsViaApi(scrapeBase, redditUrls, {
-										includeImages: true,
-										aiSummary: true,
-									});
-									if (redditFinal.sources?.length > 0) {
-										console.log(
-											"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
-											redditUrls.length,
-											"URL(s)",
-										);
-									}
+						const urlLine = promptUrls.length
+							? `URLs found: ${promptUrls.join(", ")}`
+							: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
+						const imageLine = hasImages
+							? `Images provided: ${bodyImages.length} image(s). You MUST suggest an image-reading task with params.images (the executor will inject the actual images). Suggest blog, article, newsletter, or table to use the extracted image content.`
+							: "";
+						const userContent = `User message: ${userPrompt}\n\n${urlLine}${imageLine ? `\n\n${imageLine}` : ""}`;
+						const messages = [
+							{ role: "system", content: ROUTER_SYSTEM_PROMPT },
+							...chatHistory.slice(-6).map((m) => ({
+								role: m.role === "user" ? "user" : "assistant",
+								content: m.content,
+							})),
+							{ role: "user", content: userContent },
+						];
+
+						// Scrape helper: explicit URL lists so it can be re-used for
+						// prompt URLs (parallel with router) and router-inferred URLs.
+						async function scrapeClassifiedUrls(regular, youtube, reddit) {
+							const [regularScraped, youtubeScraped, redditScraped] =
+								await Promise.all([
+									regular.length > 0
+										? scrapeUrlsViaApi(scrapeBase, regular, {
+												includeImages: true,
+												aiSummary: true,
+											})
+										: { sources: [], errors: [] },
+									youtube.length > 0
+										? scrapeYoutubeViaApi(apiBase, youtube)
+										: { sources: [], errors: [] },
+									reddit.length > 0
+										? scrapeRedditViaApi(apiBase, reddit)
+										: { sources: [], errors: [] },
+								]);
+							let redditFinal = redditScraped;
+							if (
+								reddit.length > 0 &&
+								redditScraped.sources?.length === 0 &&
+								redditScraped.errors?.length > 0
+							) {
+								redditFinal = await scrapeUrlsViaApi(scrapeBase, reddit, {
+									includeImages: true,
+									aiSummary: true,
+								});
+								if (redditFinal.sources?.length > 0) {
+									console.log(
+										"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
+										reddit.length,
+										"URL(s)",
+									);
 								}
+							}
+							return {
+								sources: [
+									...(regularScraped.sources || []),
+									...(youtubeScraped.sources || []),
+									...(redditFinal.sources || []),
+								],
+								errors: [
+									...(regularScraped.errors || []),
+									...(youtubeScraped.errors || []),
+									...(redditFinal.sources?.length > 0
+										? []
+										: redditScraped.errors || []),
+								],
+							};
+						}
+
+						// 2. PARALLEL: LLM/fast router + scrape prompt URLs simultaneously.
+						//    By the time the router resolves, scraping is already done.
+						const routerPromise = (async () => {
+							const fastResult = fastRouter(userPrompt, hasImages);
+							if (fastResult.confidence >= 0.85) {
+								console.log(
+									"[inkgest-agent] Fast router used — skipped LLM (confidence:",
+									fastResult.confidence,
+									")",
+								);
 								return {
-									sources: [
-										...(regularScraped.sources || []),
-										...(youtubeScraped.sources || []),
-										...(redditFinal.sources || []),
-									],
-									errors: [
-										...(regularScraped.errors || []),
-										...(youtubeScraped.errors || []),
-										...(redditFinal.sources?.length > 0
-											? []
-											: redditScraped.errors || []),
-									],
+									parsed: fastResult,
+									fast: true,
+									usage: null,
+									parseError: false,
 								};
 							}
-
-						// Plan phase: try instant rule-based router first; fall back to LLM only
-						// when the prompt is too ambiguous for pattern matching.
-						const fastResult = fastRouter(userPrompt, hasImages);
-						if (fastResult.confidence >= 0.85) {
-							parsed = fastResult;
-							console.log(
-								"[inkgest-agent] Fast router used — skipped LLM (confidence:",
-								fastResult.confidence,
-								")",
-							);
-						} else {
 							const routerResult = await openRouterChatMessages(
 								openRouterKey,
 								messages,
 							);
-							const raw = routerResult.content;
-							addTokenUsage(routerResult.usage);
+							try {
+								return {
+									parsed: parseAgentResponse(routerResult.content),
+									fast: false,
+									usage: routerResult.usage,
+									raw: routerResult.content,
+									parseError: false,
+								};
+							} catch (e) {
+								return {
+									parsed: null,
+									fast: false,
+									usage: routerResult.usage,
+									raw: routerResult.content,
+									parseError: true,
+								};
+							}
+						})();
+
+						const [routerOutcome, initialScrape] = await Promise.all([
+							routerPromise,
+							promptUrls.length > 0
+								? scrapeClassifiedUrls(regularUrls, youtubeUrls, redditUrls)
+								: Promise.resolve({ sources: [], errors: [] }),
+						]);
+
+						// Apply LLM router credits (fast router has no LLM cost)
+						if (!routerOutcome.fast && routerOutcome.usage) {
+							addTokenUsage(routerOutcome.usage);
 							creditsDistribution.push({
 								task: "thinking",
 								credits: CREDITS.thinking,
 							});
 							creditsUsed += CREDITS.thinking;
+						}
 
-							try {
-								parsed = parseAgentResponse(raw);
-							} catch (e) {
-								controller.enqueue(
-									encoder.encode(
-										send({
-											type: "end",
-											error:
-												"Agent could not parse your request. Try being more specific.",
-											raw: raw.slice(0, 500),
-											executed: [],
-											references: [],
-											creditsUsed,
-											creditsDistribution,
-											tokenUsage,
-										}),
-									),
-								);
-								controller.close();
-								return;
+						// Router parse failure → stream error and bail
+						if (routerOutcome.parseError) {
+							controller.enqueue(
+								encoder.encode(
+									send({
+										type: "end",
+										error:
+											"Agent could not parse your request. Try being more specific.",
+										raw: routerOutcome.raw?.slice(0, 500),
+										executed: [],
+										references: [],
+										creditsUsed,
+										creditsDistribution,
+										tokenUsage,
+									}),
+								),
+							);
+							controller.close();
+							return;
+						}
+
+						parsed = routerOutcome.parsed;
+
+						// 3. Collect initial (parallel) scrape results
+						scrapedSources = initialScrape.sources || [];
+						if (initialScrape.errors?.length) {
+							scrapeErrors.push(...initialScrape.errors);
+							console.error(
+								"[inkgest-agent] Scrape errors (parallel with router):",
+								initialScrape.errors,
+							);
+						}
+
+						// 4. Build suggested tasks from router output
+						suggestedTasks = (
+							Array.isArray(parsed.suggestedTasks)
+								? parsed.suggestedTasks
+								: []
+						).map((t) => {
+							const taskUrls =
+								Array.isArray(t.params?.urls) && t.params.urls.length > 0
+									? t.params.urls.filter((u) =>
+											/^https?:\/\/\S+$/i.test(String(u)),
+										)
+									: promptUrls;
+							return { ...t, params: { ...t.params, urls: taskUrls } };
+						});
+
+						if (hasImages) {
+							const imageReadingIdx = suggestedTasks.findIndex(
+								(t) => t.type === "image-reading",
+							);
+							const imageParams = { images: bodyImages };
+							if (imageReadingIdx >= 0) {
+								suggestedTasks[imageReadingIdx].params = {
+									...suggestedTasks[imageReadingIdx].params,
+									...imageParams,
+								};
+							} else {
+								suggestedTasks.unshift({
+									type: "image-reading",
+									label: "Read image(s)",
+									params: imageParams,
+								});
 							}
 						}
 
-							const promptUrls = extractUrlsFromText(userPrompt).slice(0, 10);
-							suggestedTasks = (
-								Array.isArray(parsed.suggestedTasks)
-									? parsed.suggestedTasks
-									: []
-							).map((t) => {
-								const taskUrls =
-									Array.isArray(t.params?.urls) && t.params.urls.length > 0
-										? t.params.urls.filter((u) =>
-												/^https?:\/\/\S+$/i.test(String(u)),
-											)
-										: promptUrls;
-								return { ...t, params: { ...t.params, urls: taskUrls } };
-							});
-							if (hasImages) {
-								const imageReadingIdx = suggestedTasks.findIndex(
-									(t) => t.type === "image-reading",
-								);
-								const imageParams = { images: bodyImages };
-								if (imageReadingIdx >= 0) {
-									suggestedTasks[imageReadingIdx].params = {
-										...suggestedTasks[imageReadingIdx].params,
-										...imageParams,
-									};
-								} else {
-									suggestedTasks.unshift({
-										type: "image-reading",
-										label: "Read image(s)",
-										params: imageParams,
-									});
-								}
-							}
-
-						// Scrape phase: merge URLs from user message + planned tasks, then fetch in parallel.
+						// 5. Merge prompt URLs + any URLs the router inferred
 						urlsToScrape = [
 							...new Set([
 								...promptUrls,
@@ -5083,7 +5130,7 @@ app.post("/inkgest-agent", async (c) => {
 							(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
 						);
 
-						// Stream plan immediately — client shows URLs + tasks before waiting for scrape.
+						// 6. Stream plan immediately — prompt URLs already scraped above
 						controller.enqueue(
 							encoder.encode(
 								send({
@@ -5096,19 +5143,33 @@ app.post("/inkgest-agent", async (c) => {
 							),
 						);
 
-						const scraped =
-							urlsToScrape.length > 0
-								? await scrapeAllUrls()
-								: { sources: [], errors: [] };
-						scrapedSources = scraped.sources || [];
-						if (scraped.errors?.length) {
-							scrapeErrors.push(...scraped.errors);
-							console.error(
-								"[inkgest-agent] Scrape errors (after plan):",
-								scraped.errors,
+						// 7. Scrape only NEW URLs the router inferred (not from the prompt)
+						const alreadyScrapedSet = new Set(scrapedSources.map((s) => s.url));
+						const newUrls = urlsToScrape.filter((u) => !alreadyScrapedSet.has(u));
+						if (newUrls.length > 0) {
+							const newReddit = newUrls.filter(isRedditUrl);
+							const newYoutube = newUrls.filter(isYoutubeUrl);
+							const newRegular = newUrls.filter(
+								(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
 							);
+							const additional = await scrapeClassifiedUrls(
+								newRegular,
+								newYoutube,
+								newReddit,
+							);
+							scrapedSources = [
+								...scrapedSources,
+								...(additional.sources || []),
+							];
+							if (additional.errors?.length) {
+								scrapeErrors.push(...additional.errors);
+								console.error(
+									"[inkgest-agent] Scrape errors (router-inferred URLs):",
+									additional.errors,
+								);
+							}
 						}
-						} else {
+					} else {
 							if (urlsToScrape.length > 0) {
 								const [regularScraped, youtubeScraped, redditScraped] =
 									await Promise.all([
