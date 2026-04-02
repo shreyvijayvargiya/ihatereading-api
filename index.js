@@ -3669,19 +3669,8 @@ app.post("/ddg-search", async (c) => {
 		await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
 		const html = await page.content();
-		const $ = load(html);
-
-		$("div.result").each((i, el) => {
-			const linkTag = $(el).find(".result__a");
-			const href = linkTag.attr("href") || "";
-			const title = linkTag.text().trim();
-			const description = $(el).find(".result__snippet").text().trim();
-
-			const url = decodeURIComponent(href.split("uddg=")[1].split("&rut")[0]);
-			if (href && title) {
-				results.push({ title, link: url, description });
-			}
-		});
+		const parsed = parseDuckDuckGoSerpHtml(html, 100);
+		results.push(...parsed);
 
 		return c.json({ query, results, timestamp: new Date().toISOString() });
 	} catch (err) {
@@ -3693,45 +3682,308 @@ app.post("/ddg-search", async (c) => {
 });
 
 function cleanGoogleUrl(url) {
+	if (!url || typeof url !== "string") return "";
 	try {
-		// If url starts with "/url?", prepend a fake host to parse
-		if (url.startsWith("/url?")) {
-			url = "https://google.com" + url;
+		let s = url.trim();
+		if (s.startsWith("/url?")) {
+			s = "https://www.google.com" + s;
 		}
-		if (!url.includes("https://")) {
-			url = "https://" + url.hostname + url;
-		}
-		const parsedUrl = new URL(url);
-		const realUrl = parsedUrl.searchParams.get("q");
-		if (realUrl) {
-			return realUrl; // cleaned URL
-		}
-		return url; // return original if no 'q' param
-	} catch (e) {
-		return url; // fallback to original url if parsing fails
+		const parsedUrl = new URL(s);
+		const q = parsedUrl.searchParams.get("q");
+		if (q) return decodeURIComponent(q);
+		const u = parsedUrl.searchParams.get("url");
+		if (u) return decodeURIComponent(u);
+		return s;
+	} catch {
+		return typeof url === "string" ? url : "";
 	}
 }
 
 function parseGoogleResults(html) {
 	const results = [];
 	const $ = load(html);
+	const seen = new Set();
 
-	$("div#search > div#rso").each((i, el) => {
-		const linkTag = $(el).find("a[href]").first();
-		const href = linkTag.attr("href") || "";
-		const title = $(el).find("h3").first().text().trim();
-		const description = $(el).find("div[style*='line']").first().text().trim();
-
-		console.log(href, title);
-		if (href && title) {
-			const link = cleanGoogleUrl(href);
-			if (link.startsWith("http")) {
-				results.push({ title, link, description });
-			}
+	function pushResult(title, href, description) {
+		const t = (title || "").trim();
+		if (!t) return;
+		const rawHref = href || "";
+		let link = cleanGoogleUrl(rawHref);
+		if (!link.startsWith("http")) return;
+		if (
+			link.includes("google.com/preferences") ||
+			link.startsWith("https://support.google.com") ||
+			link.startsWith("https://policies.google.com")
+		) {
+			return;
 		}
+		if (seen.has(link)) return;
+		seen.add(link);
+		results.push({
+			title: t,
+			link,
+			description: (description || "").trim(),
+		});
+	}
+
+	// Current desktop SERPs: one organic result per div.g (or nested)
+	$("div.g").each((_, el) => {
+		const block = $(el);
+		const h3 = block.find("h3").first();
+		if (!h3.length) return;
+		const title = h3.text().trim();
+		let a = h3.parent("a");
+		if (!a.length) a = h3.closest("a");
+		if (!a.length) {
+			a = block
+				.find("a[href]")
+				.filter((i, e) => {
+					const h = ($(e).attr("href") || "").trim();
+					return (
+						h.startsWith("http") ||
+						h.startsWith("/url?") ||
+						h.startsWith("//")
+					);
+				})
+				.first();
+		}
+		let href = (a.attr("href") || "").trim();
+		if (href.startsWith("//")) href = "https:" + href;
+		let description = block
+			.find(
+				"div.VwiC3b, div[style*='webkit-line-clamp'], div[data-sncf], span.aCOpRe",
+			)
+			.first()
+			.text()
+			.trim();
+		if (!description) {
+			description = block.find("div").not(block.find("div div")).last().text().trim();
+		}
+		pushResult(title, href, description);
 	});
 
+	// Fallback: older #rso layout (single column of blocks)
+	if (results.length === 0) {
+		$("div#rso > div").each((_, el) => {
+			const block = $(el);
+			const h3 = block.find("h3").first();
+			if (!h3.length) return;
+			const title = h3.text().trim();
+			const a = block.find("a[href]").first();
+			const href = (a.attr("href") || "").trim();
+			const description = block.find("div").filter((i, e) => {
+				const t = $(e).text();
+				return t.length > 20 && !$(e).find("h3").length;
+			}).first().text().trim();
+			pushResult(title, href, description);
+		});
+	}
+
 	return results;
+}
+
+function buildGoogleSearchUrl({
+	query,
+	language,
+	country,
+	num,
+	gbv = false,
+}) {
+	const params = new URLSearchParams({
+		q: query,
+		hl: language,
+		gl: country,
+		num: String(num),
+		pws: "0",
+	});
+	if (gbv) params.set("gbv", "1");
+	return `https://www.google.com/search?${params.toString()}`;
+}
+
+/** Dismiss EU / privacy interstitials so SERP can render (same issue as "empty" + About this page). */
+async function dismissGoogleConsent(page) {
+	const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+	const selectors = [
+		"#L2AGLb",
+		"button#L2AGLb",
+		'button[aria-label="Accept all"]',
+		'[aria-label="Accept all"]',
+		"[data-testid='uc-accept-all-button']",
+	];
+	for (const sel of selectors) {
+		try {
+			const el = await page.$(sel);
+			if (el) {
+				await el.click();
+				await pause(900);
+				return;
+			}
+		} catch {
+			/* try next */
+		}
+	}
+	try {
+		const clicked = await page.evaluate(() => {
+			const byId = document.getElementById("L2AGLb");
+			if (byId && byId.offsetParent !== null) {
+				byId.click();
+				return true;
+			}
+			const t = document.querySelector(
+				"[data-testid='uc-accept-all-button']",
+			);
+			if (t) {
+				t.click();
+				return true;
+			}
+			return false;
+		});
+		if (clicked) await pause(900);
+	} catch {
+		/* ignore */
+	}
+}
+
+function detectGoogleSerpBlocked(html) {
+	const h = (html || "").toLowerCase();
+	if (h.includes("unusual traffic from your computer network")) return "captcha";
+	if (
+		h.includes("before you continue") ||
+		(h.includes("about this page") && h.includes("terms of service"))
+	) {
+		return "consent_or_interstitial";
+	}
+	return null;
+}
+
+function extractDuckDuckGoRedirectUrl(href) {
+	if (!href || typeof href !== "string") return null;
+	try {
+		const u = href.startsWith("//") ? `https:${href}` : href;
+		if (u.startsWith("http")) {
+			const p = new URL(u);
+			const uddg = p.searchParams.get("uddg");
+			if (uddg) return decodeURIComponent(uddg);
+		}
+	} catch {
+		/* fall through */
+	}
+	const m = href.match(/uddg=([^&]+)/);
+	if (m) {
+		try {
+			return decodeURIComponent(m[1]);
+		} catch {
+			return m[1];
+		}
+	}
+	return null;
+}
+
+/** Parse DuckDuckGo HTML SERP (shared with /ddg-search). */
+function parseDuckDuckGoSerpHtml(html, maxResults = 50) {
+	const results = [];
+	const $ = load(html);
+	$("div.result").each((_, el) => {
+		if (results.length >= maxResults) return false;
+		const linkTag = $(el).find(".result__a");
+		const href = linkTag.attr("href") || "";
+		const title = linkTag.text().trim();
+		const description = $(el).find(".result__snippet").text().trim();
+		const link = extractDuckDuckGoRedirectUrl(href);
+		if (link && title) {
+			results.push({ title, link, description });
+		}
+	});
+	return results;
+}
+
+function webSearchResultsToMarkdown(results) {
+	return results
+		.map((r) => `## ${r.title}\n${r.description}\n\n${r.link}`)
+		.join("\n\n---\n\n");
+}
+
+/**
+ * When Google returns CAPTCHA / empty SERP, fetch DDG HTML without a browser.
+ * (Cannot "fix" Google captcha in Puppeteer — use Custom Search API or this fallback.)
+ */
+async function fetchWebResultsViaDuckDuckGo(query, maxResults = 10) {
+	const endpoints = [
+		`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+		`https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+	];
+	const headers = {
+		"User-Agent":
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Language": "en-US,en;q=0.9",
+	};
+	for (const searchUrl of endpoints) {
+		try {
+			const res = await fetch(searchUrl, { headers, redirect: "follow" });
+			if (!res.ok) continue;
+			const html = await res.text();
+			const results = parseDuckDuckGoSerpHtml(html, maxResults);
+			if (results.length > 0) {
+				return {
+					results,
+					searchUrl,
+					markdown: webSearchResultsToMarkdown(results),
+				};
+			}
+		} catch {
+			continue;
+		}
+	}
+	return { results: [], searchUrl: null, markdown: "" };
+}
+
+/** Official Google Custom Search JSON API (same family as Maps/Places APIs). */
+async function fetchGoogleCustomSearchApi({
+	query,
+	num = 10,
+	language = "en",
+	country = "us",
+}) {
+	const apiKey =
+		process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_API_KEY;
+	const cx = process.env.GOOGLE_CSE_ID;
+	if (!apiKey || !cx) {
+		return null;
+	}
+	const capped = Math.min(Math.max(Number(num) || 10, 1), 10);
+	const params = new URLSearchParams({
+		key: apiKey,
+		cx,
+		q: query,
+		num: String(capped),
+		hl: language,
+		gl: country,
+	});
+	const url = `https://www.googleapis.com/customsearch/v1?${params}`;
+	const res = await fetch(url);
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok) {
+		const msg =
+			data?.error?.message ||
+			`Custom Search API ${res.status}: ${JSON.stringify(data).slice(0, 200)}`;
+		throw new Error(msg);
+	}
+	const items = Array.isArray(data.items) ? data.items : [];
+	const results = items.map((it) => ({
+		title: it.title || "",
+		link: it.link || "",
+		description: it.snippet || "",
+	}));
+	const markdown = results
+		.map((r) => `## ${r.title}\n${r.description}\n\n${r.link}`)
+		.join("\n\n---\n\n");
+	return {
+		results,
+		markdown,
+		searchUrl: url.replace(apiKey, "REDACTED"),
+		source: "google-custom-search-api",
+	};
 }
 
 app.post("/google-search", async (c) => {
@@ -3741,11 +3993,36 @@ app.post("/google-search", async (c) => {
 		language = "en",
 		country = "us",
 		timeout = 30000,
+		/** When true, route Chrome through rotating proxies (Bright Data). Default false — direct connection, same idea as /scrape-google-maps. */
+		useProxy = false,
+		/** When true, skip Custom Search API and use headless browser only. */
+		forceBrowser = false,
+		/** When true, do not use DuckDuckGo HTML if Google shows CAPTCHA / empty SERP. */
+		skipDdgFallback = false,
 	} = await c.req.json();
 
+	if (!query || typeof query !== "string") {
+		return c.json({ error: "Query parameter is required" }, 400);
+	}
+
 	try {
+		if (!forceBrowser) {
+			const apiResult = await fetchGoogleCustomSearchApi({
+				query,
+				num,
+				language,
+				country,
+			});
+			if (apiResult) {
+				return c.json({
+					query,
+					...apiResult,
+				});
+			}
+		}
+
 		const puppeteer = (await import("puppeteer-core")).default;
-		const launchArgs = [
+		const ARGS = [
 			"--no-sandbox",
 			"--disable-setuid-sandbox",
 			"--disable-dev-shm-usage",
@@ -3753,70 +4030,153 @@ app.post("/google-search", async (c) => {
 			"--no-zygote",
 			"--single-process",
 		];
-		const selectedProxy = proxyManager.getNextProxy();
-		launchArgs.push(
-			`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
-		);
-		const browser = await puppeteer.launch({
-			executablePath:
-				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			headless: "new",
-			args: launchArgs,
-		});
-
-		const page = await browser.newPage();
-
-		await page.setUserAgent(
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-				"AppleWebKit/537.36 (KHTML, like Gecko) " +
-				"Chrome/123.0.0.0 Safari/537.36",
-		);
-
-		await page.setExtraHTTPHeaders({
-			"Accept-Language": "en-US,en;q=0.9",
-		});
-
-		// Authenticate proxy if credentials exist
-		if (selectedProxy.username && selectedProxy.password) {
-			await page.authenticate({
-				username: selectedProxy.username,
-				password: selectedProxy.password,
-			});
+		let selectedProxy = null;
+		if (useProxy) {
+			selectedProxy = proxyManager.getNextProxy();
+			ARGS.push(
+				`--proxy-server=http://${selectedProxy.host}:${selectedProxy.port}`,
+			);
 		}
 
-		await page.goto(
-			`https://www.google.com/search?q=${encodeURIComponent(
+		let browser;
+		try {
+			try {
+				const executablePath = await chromium.executablePath();
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath,
+					args: [...chromium.args, ...ARGS],
+					ignoreDefaultArgs: ["--disable-extensions"],
+				});
+			} catch {
+				browser = await puppeteer.launch({
+					headless: true,
+					executablePath:
+						"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+					args: ARGS,
+				});
+			}
+
+			const page = await browser.newPage();
+			await page.setViewport({ width: 1366, height: 768, deviceScaleFactor: 1 });
+
+			await page.setUserAgent(
+				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) " +
+					"Chrome/131.0.0.0 Safari/537.36",
+			);
+
+			await page.setExtraHTTPHeaders({
+				"Accept-Language": `${language}-${country.toUpperCase()},${language};q=0.9,en;q=0.8`,
+			});
+
+			if (
+				useProxy &&
+				selectedProxy?.username &&
+				selectedProxy?.password
+			) {
+				await page.authenticate({
+					username: selectedProxy.username,
+					password: selectedProxy.password,
+				});
+			}
+
+			let searchUrl = buildGoogleSearchUrl({
 				query,
-			)}&hl=${language}&gl=${country}&num=${num}&pws=0`,
-			{
-				waitUntil: "domcontentloaded",
-				timeout: timeout,
-			},
-		);
-		const response = await page.evaluate(() => {
-			return {
-				html: document.documentElement.outerHTML,
+				language,
+				country,
+				num,
+				gbv: false,
+			});
+			let usedGbvFallback = false;
+
+			const loadSerp = async (url) => {
+				await page.goto(url, {
+					waitUntil: "domcontentloaded",
+					timeout: timeout,
+				});
+				await dismissGoogleConsent(page);
+				await page
+					.waitForSelector("#rso, div.g, div.MjjYud", {
+						timeout: Math.min(12000, timeout),
+					})
+					.catch(() => {});
+				await new Promise((r) => setTimeout(r, 500));
+				const html = await page.evaluate(
+					() => document.documentElement.outerHTML,
+				);
+				return html;
 			};
-		});
 
-		const results = parseGoogleResults(response.html);
+			let html = await loadSerp(searchUrl);
+			let results = parseGoogleResults(html);
 
-		const dom = new JSDOM(response.html, {
-			contentType: "text/html",
-			includeNodeLocations: false,
-			storageQuota: 10000000,
-		});
-		const document = dom.window.document;
-		const { markdown } = await extractSemanticContentWithFormattedMarkdown(
-			document.body,
-		);
+			if (results.length === 0) {
+				searchUrl = buildGoogleSearchUrl({
+					query,
+					language,
+					country,
+					num,
+					gbv: true,
+				});
+				usedGbvFallback = true;
+				html = await loadSerp(searchUrl);
+				results = parseGoogleResults(html);
+			}
 
-		return c.json({
-			query,
-			results,
-			searchUrl: response.config.url,
-			markdown: markdown,
-		});
+			const blockedReason = detectGoogleSerpBlocked(html);
+			const googleSearchUrl = searchUrl;
+
+			let finalResults = results;
+			let finalMarkdown;
+			let finalSearchUrl = searchUrl;
+			let sourceTag = useProxy ? "puppeteer-proxy" : "puppeteer-direct";
+
+			const dom = new JSDOM(html, {
+				contentType: "text/html",
+				includeNodeLocations: false,
+				storageQuota: 10000000,
+			});
+			const document = dom.window.document;
+			const { markdown: googleMarkdown } =
+				await extractSemanticContentWithFormattedMarkdown(document.body);
+			finalMarkdown = googleMarkdown;
+
+			const needsDdgFallback =
+				!skipDdgFallback &&
+				(finalResults.length === 0 ||
+					blockedReason === "captcha" ||
+					blockedReason === "consent_or_interstitial");
+
+			if (needsDdgFallback) {
+				const ddg = await fetchWebResultsViaDuckDuckGo(query, num);
+				if (ddg.results.length > 0) {
+					finalResults = ddg.results;
+					finalMarkdown = ddg.markdown;
+					finalSearchUrl = ddg.searchUrl;
+					sourceTag = "duckduckgo-html-fallback";
+				}
+			}
+
+			return c.json({
+				query,
+				results: finalResults,
+				searchUrl: finalSearchUrl,
+				markdown: finalMarkdown,
+				source: sourceTag,
+				...(usedGbvFallback && { gbvFallback: true }),
+				...(blockedReason && {
+					googleBlockedReason: blockedReason,
+					googleSearchUrl: googleSearchUrl,
+				}),
+				...(sourceTag === "duckduckgo-html-fallback" && {
+					note: "Google showed a CAPTCHA or blocked automated access; results are from DuckDuckGo HTML search. For real Google results use GOOGLE_CSE_ID + GOOGLE_CSE_API_KEY (Custom Search API) or set useProxy: true with a working residential proxy.",
+				}),
+				...(finalResults.length === 0 &&
+					blockedReason && { blockedReason }),
+			});
+		} finally {
+			if (browser) await browser.close();
+		}
 	} catch (error) {
 		console.error("Google search error:", error);
 		return c.json({ error: error.message }, 500);
@@ -4369,18 +4729,10 @@ async function scrapeSingleUrlWithPuppeteer(
 				if (takeScreenshot) {
 					try {
 						const buf = await page.screenshot({ fullPage: true });
-						const fname = `ihr-website-screenshot/screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
-						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-						const file = bucket.file(fname);
-						await file.save(buf, {
-							metadata: {
-								contentType: "image/png",
-								cacheControl: "public, max-age=3600",
-							},
-						});
-						await file.makePublic();
-						screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
-					} catch {}
+						screenshotUrl = await uploadScreenshotBuffer(buf);
+					} catch (err) {
+						console.error("[scrape] Screenshot upload failed:", err?.message);
+					}
 				}
 
 				if (useProxy && selectedProxy)
@@ -4410,27 +4762,24 @@ async function scrapeSingleUrlWithPuppeteer(
 				let summary = null;
 				if (aiSummary && markdown) {
 					try {
-						const splitter = RecursiveCharacterTextSplitter.fromLanguage(
-							"markdown",
-							{ separators: "\n\n", chunkSize: 1024, chunkOverlap: 128 },
-						);
-						const chunks = await splitter.splitText(markdown);
-						const chunked = chunks.slice(0, 3000).join("\n\n");
+						const truncated = markdown.slice(0, 12000);
 						const aiResponse = await genai.models.generateContent({
-							model: "gemini-1.5-flash",
+							model: "gemini-2.0-flash",
 							contents: [
 								{
 									role: "user",
 									parts: [
 										{
-											text: `Summarize the following markdown: ${chunked}; The length or token count for the summary depend on the content but always lies between 100 to 1000 tokens`,
+											text: `Summarize the following content concisely. Length should be between 100 and 1000 tokens depending on content length:\n\n${truncated}`,
 										},
 									],
 								},
 							],
 						});
 						summary = aiResponse.candidates[0].content.parts[0].text;
-					} catch {}
+					} catch (err) {
+						console.error("[scrape] AI summary failed:", err?.message);
+					}
 				}
 
 				return { summary, scrapedData, markdown, screenshotUrl };
