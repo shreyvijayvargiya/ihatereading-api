@@ -218,10 +218,7 @@ class BrowserPool {
 // ─── Singleton ────────────────────────────────────────────────────────────────
 const browserPool = new BrowserPool();
 
-// Warm the pool up as soon as the module is imported (non-blocking)
-browserPool.initialise().catch((err) => {
-    console.error("❌ BrowserPool warm-up failed:", err);
-});
+// Lazy: browsers launch on first withPage() (scrape / screenshot routes), not at process start.
 
 // Clean shutdown hooks
 process.on("SIGTERM", () => browserPool.destroy());

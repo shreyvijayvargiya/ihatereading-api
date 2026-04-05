@@ -12,12 +12,11 @@
  *   1. Copy this file to your project root.
  *   2. Copy ./lib/extractSemanticContent.js from this repo (markdown extraction).
  *   3. npm i hono @hono/node-server puppeteer-core @sparticuz/chromium jsdom user-agents
- *   4. Optional (aiSummary on /scrape): npm i @google/genai @langchain/textsplitters
- *      and set GOOGLE_GENAI_API_KEY
+ *   4. Optional (aiSummary on /scrape): set OPENROUTER_API_KEY (uses OpenRouter chat completions)
  *
  * Run: node scrape-api-standalone.js
  * Env: PORT (default 3001), BROWSER_POOL_SIZE, PUPPETEER_EXECUTABLE_PATH (optional Chrome path),
- *      GOOGLE_GENAI_API_KEY (optional)
+ *      OPENROUTER_API_KEY (optional, for aiSummary)
  */
 
 import fs from "fs";
@@ -207,9 +206,7 @@ class BrowserPool {
 }
 
 const browserPool = new BrowserPool();
-browserPool.initialise().catch((err) => {
-	console.error("❌ BrowserPool warm-up failed:", err);
-});
+// Lazy: browsers launch on first withPage(), not at process start.
 process.on("SIGTERM", () => browserPool.destroy());
 process.on("SIGINT", () => browserPool.destroy());
 
@@ -623,33 +620,41 @@ const generateRandomHeaders = () => {
 };
 
 async function maybeSummarizeMarkdown(markdown) {
-	if (!markdown || !process.env.GOOGLE_GENAI_API_KEY) return null;
+	if (!markdown || !process.env.OPENROUTER_API_KEY) return null;
 	try {
-		const { RecursiveCharacterTextSplitter } =
-			await import("@langchain/textsplitters");
-		const { GoogleGenAI } = await import("@google/genai");
-		const genai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENAI_API_KEY });
-		const splitter = RecursiveCharacterTextSplitter.fromLanguage("markdown", {
-			separators: "\n\n",
-			chunkSize: 1024,
-			chunkOverlap: 128,
+		const truncated = String(markdown).slice(0, 12000);
+		const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+			},
+			body: JSON.stringify({
+				model:
+					process.env.OPENROUTER_MODEL ||
+					process.env.OPENROUTER_AGENT_MODEL ||
+					"openai/gpt-4o-mini",
+				messages: [
+					{
+						role: "system",
+						content:
+							"You summarize web page content concisely. Respond with plain text only—no markdown code fences.",
+					},
+					{
+						role: "user",
+						content: `Summarize the following content concisely. Target length: roughly 100–1000 tokens depending on content length.\n\n${truncated}`,
+					},
+				],
+				temperature: 0.3,
+				max_tokens: 2048,
+			}),
 		});
-		const chunks = await splitter.splitText(markdown);
-		const chunked = chunks.slice(0, 3000).join("\n\n");
-		const aiResponse = await genai.models.generateContent({
-			model: "gemini-1.5-flash",
-			contents: [
-				{
-					role: "user",
-					parts: [
-						{
-							text: `Summarize the following markdown: ${chunked}; The length or token count for the summary depend on the content but always lies between 100 to 1000 tokens`,
-						},
-					],
-				},
-			],
-		});
-		return aiResponse.candidates[0].content.parts[0].text;
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok) {
+			throw new Error(data?.error?.message || `OpenRouter ${res.status}`);
+		}
+		const text = data?.choices?.[0]?.message?.content;
+		return typeof text === "string" ? text.trim() || null : null;
 	} catch {
 		return null;
 	}

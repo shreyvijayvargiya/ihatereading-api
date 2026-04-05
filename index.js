@@ -6,7 +6,6 @@ import { FieldValue } from "firebase-admin/firestore";
 import { createHash } from "node:crypto";
 import jwt from "jsonwebtoken";
 import chromium from "@sparticuz/chromium";
-import { supabase } from "./config/supabase.js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
 import UserAgent from "user-agents";
@@ -3213,7 +3212,6 @@ app.post("/google-maps-agent", async (c) => {
 	});
 });
 
-
 // Enhanced Bing Search endpoint using Axios
 app.post("/bing-search", async (c) => {
 	const {
@@ -3753,9 +3751,7 @@ function parseGoogleResults(html) {
 				.filter((i, e) => {
 					const h = ($(e).attr("href") || "").trim();
 					return (
-						h.startsWith("http") ||
-						h.startsWith("/url?") ||
-						h.startsWith("//")
+						h.startsWith("http") || h.startsWith("/url?") || h.startsWith("//")
 					);
 				})
 				.first();
@@ -3770,7 +3766,12 @@ function parseGoogleResults(html) {
 			.text()
 			.trim();
 		if (!description) {
-			description = block.find("div").not(block.find("div div")).last().text().trim();
+			description = block
+				.find("div")
+				.not(block.find("div div"))
+				.last()
+				.text()
+				.trim();
 		}
 		pushResult(title, href, description);
 	});
@@ -3784,10 +3785,15 @@ function parseGoogleResults(html) {
 			const title = h3.text().trim();
 			const a = block.find("a[href]").first();
 			const href = (a.attr("href") || "").trim();
-			const description = block.find("div").filter((i, e) => {
-				const t = $(e).text();
-				return t.length > 20 && !$(e).find("h3").length;
-			}).first().text().trim();
+			const description = block
+				.find("div")
+				.filter((i, e) => {
+					const t = $(e).text();
+					return t.length > 20 && !$(e).find("h3").length;
+				})
+				.first()
+				.text()
+				.trim();
 			pushResult(title, href, description);
 		});
 	}
@@ -3795,13 +3801,7 @@ function parseGoogleResults(html) {
 	return results;
 }
 
-function buildGoogleSearchUrl({
-	query,
-	language,
-	country,
-	num,
-	gbv = false,
-}) {
+function buildGoogleSearchUrl({ query, language, country, num, gbv = false }) {
 	const params = new URLSearchParams({
 		q: query,
 		hl: language,
@@ -3842,9 +3842,7 @@ async function dismissGoogleConsent(page) {
 				byId.click();
 				return true;
 			}
-			const t = document.querySelector(
-				"[data-testid='uc-accept-all-button']",
-			);
+			const t = document.querySelector("[data-testid='uc-accept-all-button']");
 			if (t) {
 				t.click();
 				return true;
@@ -3859,7 +3857,8 @@ async function dismissGoogleConsent(page) {
 
 function detectGoogleSerpBlocked(html) {
 	const h = (html || "").toLowerCase();
-	if (h.includes("unusual traffic from your computer network")) return "captcha";
+	if (h.includes("unusual traffic from your computer network"))
+		return "captcha";
 	if (
 		h.includes("before you continue") ||
 		(h.includes("about this page") && h.includes("terms of service"))
@@ -3958,8 +3957,7 @@ async function fetchGoogleCustomSearchApi({
 	language = "en",
 	country = "us",
 }) {
-	const apiKey =
-		process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_API_KEY;
+	const apiKey = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_API_KEY;
 	const cx = process.env.GOOGLE_CSE_ID;
 	if (!apiKey || !cx) {
 		return null;
@@ -4071,7 +4069,11 @@ app.post("/google-search", async (c) => {
 			}
 
 			const page = await browser.newPage();
-			await page.setViewport({ width: 1366, height: 768, deviceScaleFactor: 1 });
+			await page.setViewport({
+				width: 1366,
+				height: 768,
+				deviceScaleFactor: 1,
+			});
 
 			await page.setUserAgent(
 				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -4082,11 +4084,7 @@ app.post("/google-search", async (c) => {
 				"Accept-Language": `${language}-${country.toUpperCase()},${language};q=0.9,en;q=0.8`,
 			});
 
-			if (
-				useProxy &&
-				selectedProxy?.username &&
-				selectedProxy?.password
-			) {
+			if (useProxy && selectedProxy?.username && selectedProxy?.password) {
 				await page.authenticate({
 					username: selectedProxy.username,
 					password: selectedProxy.password,
@@ -4184,8 +4182,7 @@ app.post("/google-search", async (c) => {
 				...(sourceTag === "duckduckgo-html-fallback" && {
 					note: "Google showed a CAPTCHA or blocked automated access; results are from DuckDuckGo HTML search. For real Google results use GOOGLE_CSE_ID + GOOGLE_CSE_API_KEY (Custom Search API) or set useProxy: true with a working residential proxy.",
 				}),
-				...(finalResults.length === 0 &&
-					blockedReason && { blockedReason }),
+				...(finalResults.length === 0 && blockedReason && { blockedReason }),
 			});
 		} finally {
 			if (browser) await browser.close();
@@ -4248,7 +4245,10 @@ app.post("/seo-g2-competitor-deep-research", async (c) => {
 				success: true,
 				...base,
 				deepScrape: deepScrape
-					? { skipped: !process.env.OPENROUTER_API_KEY, reason: "OPENROUTER_API_KEY missing" }
+					? {
+							skipped: !process.env.OPENROUTER_API_KEY,
+							reason: "OPENROUTER_API_KEY missing",
+						}
 					: { skipped: true, reason: "deepScrape disabled" },
 			});
 		}
@@ -4576,8 +4576,7 @@ async function scrapeSingleUrlWithPuppeteer(
 					media: 0,
 				};
 				const isG2Host =
-					/\bg2\.com\b/i.test(targetUrl) ||
-					/\bg2crowd\.com\b/i.test(targetUrl);
+					/\bg2\.com\b/i.test(targetUrl) || /\bg2crowd\.com\b/i.test(targetUrl);
 
 				await page.setRequestInterception(true);
 				page.on("request", (request) => {
@@ -4728,8 +4727,7 @@ async function scrapeSingleUrlWithPuppeteer(
 								}
 								const n = countG2ProductAnchors(document.body);
 								const title = (document.title || "").trim();
-								const titleOk =
-									title.length > 8 && !/^g2\.com$/i.test(title);
+								const titleOk = title.length > 8 && !/^g2\.com$/i.test(title);
 								return n >= 2 || titleOk;
 							},
 							{ timeout: 35_000, polling: 500 },
@@ -4740,7 +4738,10 @@ async function scrapeSingleUrlWithPuppeteer(
 					await runG2PostLoadActions(page);
 					await new Promise((r) => setTimeout(r, 1500));
 				} else {
-					await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout });
+					await page.goto(targetUrl, {
+						waitUntil: "domcontentloaded",
+						timeout,
+					});
 				}
 				const navLatency = Date.now() - navStart;
 
@@ -4862,9 +4863,7 @@ async function scrapeSingleUrlWithPuppeteer(
 											if (!label) {
 												const m = link.href.match(/\/products\/([^/?#]+)/);
 												label = m
-													? decodeURIComponent(
-															m[1].replace(/-/g, " "),
-														)
+													? decodeURIComponent(m[1].replace(/-/g, " "))
 													: "Product";
 											}
 											link.text = label;
@@ -5008,17 +5007,15 @@ async function scrapeSingleUrlWithPuppeteer(
 					doc.body,
 				);
 
-				if (
-					isG2Host &&
-					(!markdown || String(markdown).trim().length < 80)
-				) {
+				if (isG2Host && (!markdown || String(markdown).trim().length < 80)) {
 					try {
 						const linkMd = await page.evaluate(() => {
 							const seen = new Set();
 							const lines = [];
 							function walk(node) {
 								if (!node) return;
-								if (node.nodeType === 1 && node.shadowRoot) walk(node.shadowRoot);
+								if (node.nodeType === 1 && node.shadowRoot)
+									walk(node.shadowRoot);
 								if (node.nodeType === 1) {
 									if (node.tagName === "A") {
 										const href = (node.href || "").split("#")[0];
@@ -5060,7 +5057,10 @@ async function scrapeSingleUrlWithPuppeteer(
 							markdown = linkMd;
 						}
 					} catch (e) {
-						console.warn("[scrape] G2 product-link fallback failed:", e?.message);
+						console.warn(
+							"[scrape] G2 product-link fallback failed:",
+							e?.message,
+						);
 					}
 					try {
 						const plain = await page.evaluate(() => {
@@ -5122,23 +5122,26 @@ async function scrapeSingleUrlWithPuppeteer(
 					removeEmptyKeys(scrapedData.content);
 
 				let summary = null;
-				if (aiSummary && markdown) {
+				if (aiSummary && markdown && process.env.OPENROUTER_API_KEY) {
 					try {
 						const truncated = markdown.slice(0, 12000);
-						const aiResponse = await genai.models.generateContent({
-							model: "gemini-2.0-flash",
-							contents: [
+						const { content } = await openRouterChatMessages(
+							process.env.OPENROUTER_API_KEY,
+							[
+								{
+									role: "system",
+									content:
+										"You summarize web page content concisely. Respond with plain text only—no markdown code fences.",
+								},
 								{
 									role: "user",
-									parts: [
-										{
-											text: `Summarize the following content concisely. Length should be between 100 and 1000 tokens depending on content length:\n\n${truncated}`,
-										},
-									],
+									content: `Summarize the following content concisely. Target length: roughly 100–1000 tokens depending on content length.\n\n${truncated}`,
 								},
 							],
-						});
-						summary = aiResponse.candidates[0].content.parts[0].text;
+							2048,
+							{ temperature: 0.3 },
+						);
+						summary = String(content || "").trim() || null;
 					} catch (err) {
 						console.error("[scrape] AI summary failed:", err?.message);
 					}
@@ -5210,7 +5213,7 @@ app.post("/scrape", async (c) => {
 		timeout = 30000,
 		includeSemanticContent = true,
 		includeImages = true,
-	includeLinks = true,
+		includeLinks = true,
 		extractMetadata = true,
 		includeCache = false,
 		useProxy = false,
@@ -5632,255 +5635,260 @@ app.post("/inkgest-agent", async (c) => {
 							}
 						}
 
-					if (!hasExecuteTasks) {
-						// 1. Snapshot prompt URLs (already populated from extractedUrls above)
-						const promptUrls = [...urlsToScrape];
+						if (!hasExecuteTasks) {
+							// 1. Snapshot prompt URLs (already populated from extractedUrls above)
+							const promptUrls = [...urlsToScrape];
 
-						const urlLine = promptUrls.length
-							? `URLs found: ${promptUrls.join(", ")}`
-							: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
-						const imageLine = hasImages
-							? `Images provided: ${bodyImages.length} image(s). You MUST suggest an image-reading task with params.images (the executor will inject the actual images). Suggest blog, article, newsletter, or table to use the extracted image content.`
-							: "";
-						const userContent = `User message: ${userPrompt}\n\n${urlLine}${imageLine ? `\n\n${imageLine}` : ""}`;
-						const messages = [
-							{ role: "system", content: ROUTER_SYSTEM_PROMPT },
-							...chatHistory.slice(-6).map((m) => ({
-								role: m.role === "user" ? "user" : "assistant",
-								content: m.content,
-							})),
-							{ role: "user", content: userContent },
-						];
+							const urlLine = promptUrls.length
+								? `URLs found: ${promptUrls.join(", ")}`
+								: 'URLs found: none. You MUST infer the URL from the user\'s message (e.g. \'scrape dev.to\' → params.urls: ["https://dev.to"] or ["https://dev.to/rss"], \'dev.to RSS\' → ["https://dev.to/rss"]). Set suggestedTasks[].params.urls to the inferred URL(s) and shouldExecute: true. Do not say you need URLs.';
+							const imageLine = hasImages
+								? `Images provided: ${bodyImages.length} image(s). You MUST suggest an image-reading task with params.images (the executor will inject the actual images). Suggest blog, article, newsletter, or table to use the extracted image content.`
+								: "";
+							const userContent = `User message: ${userPrompt}\n\n${urlLine}${imageLine ? `\n\n${imageLine}` : ""}`;
+							const messages = [
+								{ role: "system", content: ROUTER_SYSTEM_PROMPT },
+								...chatHistory.slice(-6).map((m) => ({
+									role: m.role === "user" ? "user" : "assistant",
+									content: m.content,
+								})),
+								{ role: "user", content: userContent },
+							];
 
-						// Scrape helper: explicit URL lists so it can be re-used for
-						// prompt URLs (parallel with router) and router-inferred URLs.
-						async function scrapeClassifiedUrls(regular, youtube, reddit) {
-							const [regularScraped, youtubeScraped, redditScraped] =
-								await Promise.all([
-									regular.length > 0
-										? scrapeUrlsViaApi(scrapeBase, regular, {
-												includeImages: true,
-												aiSummary: true,
-											})
-										: { sources: [], errors: [] },
-									youtube.length > 0
-										? scrapeYoutubeViaApi(apiBase, youtube)
-										: { sources: [], errors: [] },
-									reddit.length > 0
-										? scrapeRedditViaApi(apiBase, reddit)
-										: { sources: [], errors: [] },
-								]);
-							let redditFinal = redditScraped;
-							if (
-								reddit.length > 0 &&
-								redditScraped.sources?.length === 0 &&
-								redditScraped.errors?.length > 0
-							) {
-								redditFinal = await scrapeUrlsViaApi(scrapeBase, reddit, {
-									includeImages: true,
-									aiSummary: true,
-								});
-								if (redditFinal.sources?.length > 0) {
+							// Scrape helper: explicit URL lists so it can be re-used for
+							// prompt URLs (parallel with router) and router-inferred URLs.
+							async function scrapeClassifiedUrls(regular, youtube, reddit) {
+								const [regularScraped, youtubeScraped, redditScraped] =
+									await Promise.all([
+										regular.length > 0
+											? scrapeUrlsViaApi(scrapeBase, regular, {
+													includeImages: true,
+													aiSummary: true,
+												})
+											: { sources: [], errors: [] },
+										youtube.length > 0
+											? scrapeYoutubeViaApi(apiBase, youtube)
+											: { sources: [], errors: [] },
+										reddit.length > 0
+											? scrapeRedditViaApi(apiBase, reddit)
+											: { sources: [], errors: [] },
+									]);
+								let redditFinal = redditScraped;
+								if (
+									reddit.length > 0 &&
+									redditScraped.sources?.length === 0 &&
+									redditScraped.errors?.length > 0
+								) {
+									redditFinal = await scrapeUrlsViaApi(scrapeBase, reddit, {
+										includeImages: true,
+										aiSummary: true,
+									});
+									if (redditFinal.sources?.length > 0) {
+										console.log(
+											"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
+											reddit.length,
+											"URL(s)",
+										);
+									}
+								}
+								return {
+									sources: [
+										...(regularScraped.sources || []),
+										...(youtubeScraped.sources || []),
+										...(redditFinal.sources || []),
+									],
+									errors: [
+										...(regularScraped.errors || []),
+										...(youtubeScraped.errors || []),
+										...(redditFinal.sources?.length > 0
+											? []
+											: redditScraped.errors || []),
+									],
+								};
+							}
+
+							// 2. PARALLEL: LLM/fast router + scrape prompt URLs simultaneously.
+							//    By the time the router resolves, scraping is already done.
+							const routerPromise = (async () => {
+								const fastResult = fastRouter(userPrompt, hasImages);
+								if (fastResult.confidence >= 0.85) {
 									console.log(
-										"[inkgest-agent] Reddit fallback (Puppeteer) succeeded for",
-										reddit.length,
-										"URL(s)",
+										"[inkgest-agent] Fast router used — skipped LLM (confidence:",
+										fastResult.confidence,
+										")",
 									);
+									return {
+										parsed: fastResult,
+										fast: true,
+										usage: null,
+										parseError: false,
+									};
+								}
+								const routerResult = await openRouterChatMessages(
+									openRouterKey,
+									messages,
+								);
+								try {
+									return {
+										parsed: parseAgentResponse(routerResult.content),
+										fast: false,
+										usage: routerResult.usage,
+										raw: routerResult.content,
+										parseError: false,
+									};
+								} catch (e) {
+									return {
+										parsed: null,
+										fast: false,
+										usage: routerResult.usage,
+										raw: routerResult.content,
+										parseError: true,
+									};
+								}
+							})();
+
+							const [routerOutcome, initialScrape] = await Promise.all([
+								routerPromise,
+								promptUrls.length > 0
+									? scrapeClassifiedUrls(regularUrls, youtubeUrls, redditUrls)
+									: Promise.resolve({ sources: [], errors: [] }),
+							]);
+
+							// Apply LLM router credits (fast router has no LLM cost)
+							if (!routerOutcome.fast && routerOutcome.usage) {
+								addTokenUsage(routerOutcome.usage);
+								creditsDistribution.push({
+									task: "thinking",
+									credits: CREDITS.thinking,
+								});
+								creditsUsed += CREDITS.thinking;
+							}
+
+							// Router parse failure → stream error and bail
+							if (routerOutcome.parseError) {
+								controller.enqueue(
+									encoder.encode(
+										send({
+											type: "end",
+											error:
+												"Agent could not parse your request. Try being more specific.",
+											raw: routerOutcome.raw?.slice(0, 500),
+											executed: [],
+											references: [],
+											creditsUsed,
+											creditsDistribution,
+											tokenUsage,
+										}),
+									),
+								);
+								controller.close();
+								return;
+							}
+
+							parsed = routerOutcome.parsed;
+
+							// 3. Collect initial (parallel) scrape results
+							scrapedSources = initialScrape.sources || [];
+							if (initialScrape.errors?.length) {
+								scrapeErrors.push(...initialScrape.errors);
+								console.error(
+									"[inkgest-agent] Scrape errors (parallel with router):",
+									initialScrape.errors,
+								);
+							}
+
+							// 4. Build suggested tasks from router output
+							suggestedTasks = (
+								Array.isArray(parsed.suggestedTasks)
+									? parsed.suggestedTasks
+									: []
+							).map((t) => {
+								const taskUrls =
+									Array.isArray(t.params?.urls) && t.params.urls.length > 0
+										? t.params.urls.filter((u) =>
+												/^https?:\/\/\S+$/i.test(String(u)),
+											)
+										: promptUrls;
+								return { ...t, params: { ...t.params, urls: taskUrls } };
+							});
+
+							if (hasImages) {
+								const imageReadingIdx = suggestedTasks.findIndex(
+									(t) => t.type === "image-reading",
+								);
+								const imageParams = { images: bodyImages };
+								if (imageReadingIdx >= 0) {
+									suggestedTasks[imageReadingIdx].params = {
+										...suggestedTasks[imageReadingIdx].params,
+										...imageParams,
+									};
+								} else {
+									suggestedTasks.unshift({
+										type: "image-reading",
+										label: "Read image(s)",
+										params: imageParams,
+									});
 								}
 							}
-							return {
-								sources: [
-									...(regularScraped.sources || []),
-									...(youtubeScraped.sources || []),
-									...(redditFinal.sources || []),
-								],
-								errors: [
-									...(regularScraped.errors || []),
-									...(youtubeScraped.errors || []),
-									...(redditFinal.sources?.length > 0
-										? []
-										: redditScraped.errors || []),
-								],
-							};
-						}
 
-						// 2. PARALLEL: LLM/fast router + scrape prompt URLs simultaneously.
-						//    By the time the router resolves, scraping is already done.
-						const routerPromise = (async () => {
-							const fastResult = fastRouter(userPrompt, hasImages);
-							if (fastResult.confidence >= 0.85) {
-								console.log(
-									"[inkgest-agent] Fast router used — skipped LLM (confidence:",
-									fastResult.confidence,
-									")",
-								);
-								return {
-									parsed: fastResult,
-									fast: true,
-									usage: null,
-									parseError: false,
-								};
-							}
-							const routerResult = await openRouterChatMessages(
-								openRouterKey,
-								messages,
+							// 5. Merge prompt URLs + any URLs the router inferred
+							urlsToScrape = [
+								...new Set([
+									...promptUrls,
+									...collectHttpUrlsFromTasks(suggestedTasks),
+								]),
+							].slice(0, 10);
+							redditUrls = urlsToScrape.filter(isRedditUrl);
+							youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
+							regularUrls = urlsToScrape.filter(
+								(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
 							);
-							try {
-								return {
-									parsed: parseAgentResponse(routerResult.content),
-									fast: false,
-									usage: routerResult.usage,
-									raw: routerResult.content,
-									parseError: false,
-								};
-							} catch (e) {
-								return {
-									parsed: null,
-									fast: false,
-									usage: routerResult.usage,
-									raw: routerResult.content,
-									parseError: true,
-								};
-							}
-						})();
 
-						const [routerOutcome, initialScrape] = await Promise.all([
-							routerPromise,
-							promptUrls.length > 0
-								? scrapeClassifiedUrls(regularUrls, youtubeUrls, redditUrls)
-								: Promise.resolve({ sources: [], errors: [] }),
-						]);
-
-						// Apply LLM router credits (fast router has no LLM cost)
-						if (!routerOutcome.fast && routerOutcome.usage) {
-							addTokenUsage(routerOutcome.usage);
-							creditsDistribution.push({
-								task: "thinking",
-								credits: CREDITS.thinking,
-							});
-							creditsUsed += CREDITS.thinking;
-						}
-
-						// Router parse failure → stream error and bail
-						if (routerOutcome.parseError) {
+							// 6. Stream plan immediately — prompt URLs already scraped above
 							controller.enqueue(
 								encoder.encode(
 									send({
-										type: "end",
-										error:
-											"Agent could not parse your request. Try being more specific.",
-										raw: routerOutcome.raw?.slice(0, 500),
-										executed: [],
-										references: [],
-										creditsUsed,
-										creditsDistribution,
-										tokenUsage,
+										type: "plan",
+										thinking: parsed.thinking || "",
+										message:
+											parsed.message || "Starting scrape and task execution.",
+										suggestedTasks,
+										urlsToScrape,
 									}),
 								),
 							);
-							controller.close();
-							return;
-						}
 
-						parsed = routerOutcome.parsed;
-
-						// 3. Collect initial (parallel) scrape results
-						scrapedSources = initialScrape.sources || [];
-						if (initialScrape.errors?.length) {
-							scrapeErrors.push(...initialScrape.errors);
-							console.error(
-								"[inkgest-agent] Scrape errors (parallel with router):",
-								initialScrape.errors,
+							// 7. Scrape only NEW URLs the router inferred (not from the prompt)
+							const alreadyScrapedSet = new Set(
+								scrapedSources.map((s) => s.url),
 							);
-						}
-
-						// 4. Build suggested tasks from router output
-						suggestedTasks = (
-							Array.isArray(parsed.suggestedTasks)
-								? parsed.suggestedTasks
-								: []
-						).map((t) => {
-							const taskUrls =
-								Array.isArray(t.params?.urls) && t.params.urls.length > 0
-									? t.params.urls.filter((u) =>
-											/^https?:\/\/\S+$/i.test(String(u)),
-										)
-									: promptUrls;
-							return { ...t, params: { ...t.params, urls: taskUrls } };
-						});
-
-						if (hasImages) {
-							const imageReadingIdx = suggestedTasks.findIndex(
-								(t) => t.type === "image-reading",
+							const newUrls = urlsToScrape.filter(
+								(u) => !alreadyScrapedSet.has(u),
 							);
-							const imageParams = { images: bodyImages };
-							if (imageReadingIdx >= 0) {
-								suggestedTasks[imageReadingIdx].params = {
-									...suggestedTasks[imageReadingIdx].params,
-									...imageParams,
-								};
-							} else {
-								suggestedTasks.unshift({
-									type: "image-reading",
-									label: "Read image(s)",
-									params: imageParams,
-								});
-							}
-						}
-
-						// 5. Merge prompt URLs + any URLs the router inferred
-						urlsToScrape = [
-							...new Set([
-								...promptUrls,
-								...collectHttpUrlsFromTasks(suggestedTasks),
-							]),
-						].slice(0, 10);
-						redditUrls = urlsToScrape.filter(isRedditUrl);
-						youtubeUrls = urlsToScrape.filter(isYoutubeUrl);
-						regularUrls = urlsToScrape.filter(
-							(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
-						);
-
-						// 6. Stream plan immediately — prompt URLs already scraped above
-						controller.enqueue(
-							encoder.encode(
-								send({
-									type: "plan",
-									thinking: parsed.thinking || "",
-									message: parsed.message || "Starting scrape and task execution.",
-									suggestedTasks,
-									urlsToScrape,
-								}),
-							),
-						);
-
-						// 7. Scrape only NEW URLs the router inferred (not from the prompt)
-						const alreadyScrapedSet = new Set(scrapedSources.map((s) => s.url));
-						const newUrls = urlsToScrape.filter((u) => !alreadyScrapedSet.has(u));
-						if (newUrls.length > 0) {
-							const newReddit = newUrls.filter(isRedditUrl);
-							const newYoutube = newUrls.filter(isYoutubeUrl);
-							const newRegular = newUrls.filter(
-								(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
-							);
-							const additional = await scrapeClassifiedUrls(
-								newRegular,
-								newYoutube,
-								newReddit,
-							);
-							scrapedSources = [
-								...scrapedSources,
-								...(additional.sources || []),
-							];
-							if (additional.errors?.length) {
-								scrapeErrors.push(...additional.errors);
-								console.error(
-									"[inkgest-agent] Scrape errors (router-inferred URLs):",
-									additional.errors,
+							if (newUrls.length > 0) {
+								const newReddit = newUrls.filter(isRedditUrl);
+								const newYoutube = newUrls.filter(isYoutubeUrl);
+								const newRegular = newUrls.filter(
+									(u) => !isRedditUrl(u) && !isYoutubeUrl(u),
 								);
+								const additional = await scrapeClassifiedUrls(
+									newRegular,
+									newYoutube,
+									newReddit,
+								);
+								scrapedSources = [
+									...scrapedSources,
+									...(additional.sources || []),
+								];
+								if (additional.errors?.length) {
+									scrapeErrors.push(...additional.errors);
+									console.error(
+										"[inkgest-agent] Scrape errors (router-inferred URLs):",
+										additional.errors,
+									);
+								}
 							}
-						}
-					} else {
+						} else {
 							if (urlsToScrape.length > 0) {
 								const [regularScraped, youtubeScraped, redditScraped] =
 									await Promise.all([
@@ -5947,31 +5955,34 @@ app.post("/inkgest-agent", async (c) => {
 							}
 						}
 
-					// Stream scrape outcome — client shows per-URL success/failure before tasks start.
-					controller.enqueue(
-						encoder.encode(
-							send({
-								type: "scrape_status",
-								urlsToScrape,
-								scraped: scrapedSources.map((s) => ({
-									url: s.url,
-									title: s.title || "",
-									success: true,
-								})),
-								failed: scrapeErrors.map((e) =>
-									typeof e === "string"
-										? { url: "unknown", error: e }
-										: { url: e?.url || "unknown", error: e?.error || String(e) },
-								),
-							}),
-						),
-					);
+						// Stream scrape outcome — client shows per-URL success/failure before tasks start.
+						controller.enqueue(
+							encoder.encode(
+								send({
+									type: "scrape_status",
+									urlsToScrape,
+									scraped: scrapedSources.map((s) => ({
+										url: s.url,
+										title: s.title || "",
+										success: true,
+									})),
+									failed: scrapeErrors.map((e) =>
+										typeof e === "string"
+											? { url: "unknown", error: e }
+											: {
+													url: e?.url || "unknown",
+													error: e?.error || String(e),
+												},
+									),
+								}),
+							),
+						);
 
-					let tasksToRun = hasExecuteTasks
-						? executeTasks
-						: parsed.shouldExecute === true
-							? suggestedTasks
-							: [];
+						let tasksToRun = hasExecuteTasks
+							? executeTasks
+							: parsed.shouldExecute === true
+								? suggestedTasks
+								: [];
 
 						// Ensure every task has params.urls — scrape/content tasks need URLs.
 						// Router may put URL in params.url (singular) or params.urls; inherit from other tasks when missing.
@@ -6725,21 +6736,21 @@ app.post("/inkgest-agent", async (c) => {
 							}
 						}
 
-				controller.enqueue(
-					encoder.encode(
-						send({
-							type: "start",
-							success: true,
-							taskCount: validTasks.length,
-							message: hasExecuteTasks
-								? `Running ${validTasks.length} task(s).`
-								: validTasks.length > 0
-									? `Executing ${validTasks.length} task(s).`
-									: parsed.message || "Here's what I suggest.",
-							suggestedTasks,
-						}),
-					),
-				);
+						controller.enqueue(
+							encoder.encode(
+								send({
+									type: "start",
+									success: true,
+									taskCount: validTasks.length,
+									message: hasExecuteTasks
+										? `Running ${validTasks.length} task(s).`
+										: validTasks.length > 0
+											? `Executing ${validTasks.length} task(s).`
+											: parsed.message || "Here's what I suggest.",
+									suggestedTasks,
+								}),
+							),
+						);
 
 						if (validTasks.length === 0) {
 							controller.enqueue(
@@ -6769,7 +6780,9 @@ app.post("/inkgest-agent", async (c) => {
 								const parsed = new URL(u);
 								parsed.hostname = parsed.hostname.toLowerCase();
 								if (parsed.pathname === "/") parsed.pathname = "";
-								return parsed.origin + parsed.pathname + parsed.search + parsed.hash;
+								return (
+									parsed.origin + parsed.pathname + parsed.search + parsed.hash
+								);
 							} catch {
 								return u.replace(/\/+$/, "");
 							}
@@ -8979,7 +8992,9 @@ app.post("/image-to-code", async (c) => {
 			return c.json({ error: "Failed to fetch image from imageUrl" }, 400);
 		}
 		mimeType = imgFetchRes.headers.get("content-type") || "image/png";
-		base64Data = Buffer.from(await imgFetchRes.arrayBuffer()).toString("base64");
+		base64Data = Buffer.from(await imgFetchRes.arrayBuffer()).toString(
+			"base64",
+		);
 	}
 
 	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
@@ -9103,9 +9118,7 @@ Strict requirements:
 						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
 						if (delta) {
 							controller.enqueue(
-								imgEncoder.encode(
-									`data: ${JSON.stringify({ delta })}\n\n`,
-								),
+								imgEncoder.encode(`data: ${JSON.stringify({ delta })}\n\n`),
 							);
 						}
 					}
@@ -9165,8 +9178,11 @@ async function normalizeImageInput(img) {
  * Body: { images: [{ url } | { base64, mimeType }], convertToCode?: boolean, extractContent?: boolean }
  */
 async function runImageReadingService(body) {
-	const { images = [], convertToCode = false, extractContent = true } =
-		body || {};
+	const {
+		images = [],
+		convertToCode = false,
+		extractContent = true,
+	} = body || {};
 
 	if (!Array.isArray(images) || images.length === 0) {
 		return {
@@ -9217,8 +9233,7 @@ async function runImageReadingService(body) {
 					],
 				});
 				const text =
-					contentRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
-					"";
+					contentRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 				result.content = text || "(No text extracted)";
 				markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
 			} catch (e) {
@@ -9276,10 +9291,7 @@ app.post("/image-reading", async (c) => {
 		const body = await c.req.json().catch(() => ({}));
 		const out = await runImageReadingService(body);
 		if (!out.success) {
-			return c.json(
-				{ success: false, error: out.error },
-				out.status || 400,
-			);
+			return c.json({ success: false, error: out.error }, out.status || 400);
 		}
 		return c.json({
 			success: true,
@@ -9961,26 +9973,26 @@ app.post("/fetch-metadata", async (c) => {
 		}
 
 		try {
-		// Fetch the webpage content
-		const response = await fetch(url, {
-			headers: {
-				"User-Agent": userAgents.random().toString(),
-				Accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.9",
-				"Accept-Encoding": "gzip, deflate, br",
-				DNT: "1",
-				Connection: "keep-alive",
-				"Upgrade-Insecure-Requests": "1",
-			},
-			signal: AbortSignal.timeout(30000),
-			redirect: "follow",
-		});
-		if (!response.ok) throw new Error(`HTTP ${response.status}`);
-		const responseHtml = await response.text();
+			// Fetch the webpage content
+			const response = await fetch(url, {
+				headers: {
+					"User-Agent": userAgents.random().toString(),
+					Accept:
+						"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+					"Accept-Language": "en-US,en;q=0.9",
+					"Accept-Encoding": "gzip, deflate, br",
+					DNT: "1",
+					Connection: "keep-alive",
+					"Upgrade-Insecure-Requests": "1",
+				},
+				signal: AbortSignal.timeout(30000),
+				redirect: "follow",
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			const responseHtml = await response.text();
 
-		// Load HTML content with Cheerio
-		const $ = load(responseHtml);
+			// Load HTML content with Cheerio
+			const $ = load(responseHtml);
 
 			// Extract basic metadata
 			const metadata = {
@@ -10264,18 +10276,18 @@ app.get("/scrap-grokipedia", async (c) => {
 
 		console.log("Grokipedia URL:", url);
 
-	// Fetch HTML
-	const response = await fetch(url, {
-		headers: {
-			"User-Agent":
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-		},
-		signal: AbortSignal.timeout(30000),
-	});
-	if (!response.ok) throw new Error(`HTTP ${response.status}`);
-	const responseHtml = await response.text();
+		// Fetch HTML
+		const response = await fetch(url, {
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+			},
+			signal: AbortSignal.timeout(30000),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const responseHtml = await response.text();
 
-	const $ = load(responseHtml);
+		const $ = load(responseHtml);
 
 		// Extract metadata
 		const title =
@@ -10603,7 +10615,10 @@ async function agentBrowserScrape(url, { timeout = 30000 } = {}) {
 /**
  * Navigate to a URL, take a screenshot, upload it to UploadThing, and return the public URL.
  */
-async function agentBrowserScreenshot(url, { timeout = 50000, fullPage = false } = {}) {
+async function agentBrowserScreenshot(
+	url,
+	{ timeout = 50000, fullPage = false } = {},
+) {
 	const tmpPath = path.join(os.tmpdir(), `ab-screenshot-${uuidv4()}.png`);
 	const fullPageFlag = fullPage ? " --full" : "";
 	await execAsync(
@@ -10629,18 +10644,23 @@ async function agentBrowserScreenshot(url, { timeout = 50000, fullPage = false }
 // Step 3 — Credit check:     verifyApiToken checks users/{userId}.credits > 0
 // Step 4 — Credit deduction: middleware deducts 1 credit after each successful call
 
-const JWT_SECRET         = process.env.JWT_SECRET || "ihatereading-api-jwt-secret";
-const API_TOKENS_COLL    = "apiTokens";
-const USERS_COLL         = "users";
-const API_CREDIT_COST    = 1;
+const JWT_SECRET = process.env.JWT_SECRET || "ihatereading-api-jwt-secret";
+const API_TOKENS_COLL = "apiTokens";
+const USERS_COLL = "users";
+const API_CREDIT_COST = 1;
 
 /** Create and persist a JWT API token for a given userId. */
 async function createApiToken(userId) {
-	const token = jwt.sign({ userId, type: "api_token" }, JWT_SECRET, { expiresIn: "1y" });
-	await firestore.collection(API_TOKENS_COLL).doc(userId).set(
-		{ token, userId, createdAt: new Date().toISOString(), isActive: true },
-		{ merge: true },
-	);
+	const token = jwt.sign({ userId, type: "api_token" }, JWT_SECRET, {
+		expiresIn: "1y",
+	});
+	await firestore
+		.collection(API_TOKENS_COLL)
+		.doc(userId)
+		.set(
+			{ token, userId, createdAt: new Date().toISOString(), isActive: true },
+			{ merge: true },
+		);
 	return token;
 }
 
@@ -10655,11 +10675,20 @@ async function verifyApiToken(token) {
 	try {
 		payload = jwt.verify(token, JWT_SECRET);
 	} catch (e) {
-		return { valid: false, error: "Invalid or expired API token", code: "INVALID_TOKEN" };
+		return {
+			valid: false,
+			error: "Invalid or expired API token",
+			code: "INVALID_TOKEN",
+		};
 	}
 
 	const { userId } = payload;
-	if (!userId) return { valid: false, error: "Token payload missing userId", code: "INVALID_TOKEN" };
+	if (!userId)
+		return {
+			valid: false,
+			error: "Token payload missing userId",
+			code: "INVALID_TOKEN",
+		};
 
 	const [tokenSnap, userSnap] = await Promise.all([
 		firestore.collection(API_TOKENS_COLL).doc(userId).get(),
@@ -10667,14 +10696,26 @@ async function verifyApiToken(token) {
 	]);
 
 	if (!tokenSnap.exists) {
-		return { valid: false, error: "API token not found — generate one via /api-token/create", code: "TOKEN_NOT_FOUND" };
+		return {
+			valid: false,
+			error: "API token not found — generate one via /api-token/create",
+			code: "TOKEN_NOT_FOUND",
+		};
 	}
 	const tokenData = tokenSnap.data();
 	if (!tokenData.isActive) {
-		return { valid: false, error: "API token has been revoked", code: "TOKEN_REVOKED" };
+		return {
+			valid: false,
+			error: "API token has been revoked",
+			code: "TOKEN_REVOKED",
+		};
 	}
 	if (tokenData.token !== token) {
-		return { valid: false, error: "Token does not match the active token for this user", code: "TOKEN_MISMATCH" };
+		return {
+			valid: false,
+			error: "Token does not match the active token for this user",
+			code: "TOKEN_MISMATCH",
+		};
 	}
 	if (!userSnap.exists) {
 		return { valid: false, error: "User not found", code: "USER_NOT_FOUND" };
@@ -10682,7 +10723,12 @@ async function verifyApiToken(token) {
 
 	const { credits = 0 } = userSnap.data();
 	if (credits < API_CREDIT_COST) {
-		return { valid: false, error: "Insufficient credits", code: "NO_CREDITS", credits };
+		return {
+			valid: false,
+			error: "Insufficient credits",
+			code: "NO_CREDITS",
+			credits,
+		};
 	}
 
 	return { valid: true, userId, credits };
@@ -10690,10 +10736,13 @@ async function verifyApiToken(token) {
 
 /** Decrement the user's credit balance by API_CREDIT_COST (fire-and-forget safe). */
 async function deductCredit(userId) {
-	await firestore.collection(USERS_COLL).doc(userId).update({
-		credits:   FieldValue.increment(-API_CREDIT_COST),
-		updatedAt: new Date().toISOString(),
-	});
+	await firestore
+		.collection(USERS_COLL)
+		.doc(userId)
+		.update({
+			credits: FieldValue.increment(-API_CREDIT_COST),
+			updatedAt: new Date().toISOString(),
+		});
 }
 
 /**
@@ -10701,13 +10750,20 @@ async function deductCredit(userId) {
  * deducts one credit after the downstream handler returns a 2xx response.
  */
 async function apiTokenMiddleware(c, next) {
-	const authHdr  = c.req.header("Authorization") || c.req.header("authorization");
-	const rawToken = authHdr?.startsWith("Bearer ") ? authHdr.slice(7).trim() : authHdr?.trim();
+	const authHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const rawToken = authHdr?.startsWith("Bearer ")
+		? authHdr.slice(7).trim()
+		: authHdr?.trim();
 
 	if (!rawToken) {
 		return c.json(
-			{ error: "API token required", code: "MISSING_TOKEN",
-			  details: "Set Authorization: Bearer <token>. Create one via POST /api-token/create." },
+			{
+				error: "API token required",
+				code: "MISSING_TOKEN",
+				details:
+					"Set Authorization: Bearer <token>. Create one via POST /api-token/create.",
+			},
 			401,
 		);
 	}
@@ -10715,12 +10771,16 @@ async function apiTokenMiddleware(c, next) {
 	const result = await verifyApiToken(rawToken);
 	if (!result.valid) {
 		return c.json(
-			{ error: result.error, code: result.code, credits: result.credits ?? undefined },
+			{
+				error: result.error,
+				code: result.code,
+				credits: result.credits ?? undefined,
+			},
 			result.code === "NO_CREDITS" ? 402 : 401,
 		);
 	}
 
-	c.set("userId",     result.userId);
+	c.set("userId", result.userId);
 	c.set("apiCredits", result.credits);
 
 	await next();
@@ -10728,7 +10788,11 @@ async function apiTokenMiddleware(c, next) {
 	// Deduct one credit after a successful (2xx) response
 	if (c.res.ok) {
 		deductCredit(result.userId).catch((e) =>
-			console.error("[api-token] credit deduction failed for", result.userId, e?.message),
+			console.error(
+				"[api-token] credit deduction failed for",
+				result.userId,
+				e?.message,
+			),
 		);
 	}
 }
@@ -10738,7 +10802,9 @@ async function apiTokenMiddleware(c, next) {
 /** POST /api-token/create — generate (or regenerate) an API token for a user. */
 app.post("/api-token/create", async (c) => {
 	let body;
-	try { body = await c.req.json(); } catch {
+	try {
+		body = await c.req.json();
+	} catch {
 		return c.json({ error: "Invalid JSON body" }, 400);
 	}
 	const { userId } = body;
@@ -10757,7 +10823,9 @@ app.post("/api-token/create", async (c) => {
 /** POST /api-token/revoke — invalidate the active token for a user. */
 app.post("/api-token/revoke", async (c) => {
 	let body;
-	try { body = await c.req.json(); } catch {
+	try {
+		body = await c.req.json();
+	} catch {
 		return c.json({ error: "Invalid JSON body" }, 400);
 	}
 	const { userId } = body;
@@ -10765,7 +10833,10 @@ app.post("/api-token/revoke", async (c) => {
 		return c.json({ error: "userId (string) is required" }, 400);
 	}
 	try {
-		await firestore.collection(API_TOKENS_COLL).doc(userId).update({ isActive: false });
+		await firestore
+			.collection(API_TOKENS_COLL)
+			.doc(userId)
+			.update({ isActive: false });
 		return c.json({ success: true, message: "API token revoked" });
 	} catch (err) {
 		console.error("[api-token/revoke]", err?.message);
@@ -10787,11 +10858,10 @@ app.get("/api-token/credits/:userId", async (c) => {
 });
 
 // ── Step 2: Apply apiTokenMiddleware to the 4 agent routes ───────────────────
-app.use("/agent-scrape",             apiTokenMiddleware);
-app.use("/agent-scrape-multiple",    apiTokenMiddleware);
-app.use("/agent-screenshot",         apiTokenMiddleware);
+app.use("/agent-scrape", apiTokenMiddleware);
+app.use("/agent-scrape-multiple", apiTokenMiddleware);
+app.use("/agent-screenshot", apiTokenMiddleware);
 app.use("/agent-screenshot-multiple", apiTokenMiddleware);
-
 
 // ─── agent-browser endpoints ─────────────────────────────────────────────────
 app.post("/agent-scrape", async (c) => {
@@ -10831,7 +10901,10 @@ app.post("/agent-scrape-multiple", async (c) => {
 	const MAX_URLS = 20;
 
 	if (!Array.isArray(urls) || urls.length === 0) {
-		return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+		return c.json(
+			{ success: false, error: "urls must be a non-empty array" },
+			400,
+		);
 	}
 	if (urls.length > MAX_URLS) {
 		return c.json(
@@ -10856,7 +10929,14 @@ app.post("/agent-scrape-multiple", async (c) => {
 			}
 			try {
 				const markdown = await agentBrowserScrape(inputUrl, { timeout });
-				return { url: inputUrl, success: true, markdown, data: {}, summary: null, screenshot: null };
+				return {
+					url: inputUrl,
+					success: true,
+					markdown,
+					data: {},
+					summary: null,
+					screenshot: null,
+				};
 			} catch (err) {
 				return {
 					url: inputUrl,
@@ -10871,7 +10951,11 @@ app.post("/agent-scrape-multiple", async (c) => {
 		}),
 	);
 
-	return c.json({ success: true, results, timestamp: new Date().toISOString() });
+	return c.json({
+		success: true,
+		results,
+		timestamp: new Date().toISOString(),
+	});
 });
 
 app.post("/agent-screenshot", async (c) => {
@@ -10882,7 +10966,10 @@ app.post("/agent-screenshot", async (c) => {
 	}
 
 	try {
-		const screenshotUrl = await agentBrowserScreenshot(url, { timeout, fullPage });
+		const screenshotUrl = await agentBrowserScreenshot(url, {
+			timeout,
+			fullPage,
+		});
 		return c.json({
 			success: true,
 			url,
@@ -10910,7 +10997,10 @@ app.post("/agent-screenshot-multiple", async (c) => {
 	const MAX_URLS = 20;
 
 	if (!Array.isArray(urls) || urls.length === 0) {
-		return c.json({ success: false, error: "urls must be a non-empty array" }, 400);
+		return c.json(
+			{ success: false, error: "urls must be a non-empty array" },
+			400,
+		);
 	}
 	if (urls.length > MAX_URLS) {
 		return c.json(
@@ -10919,7 +11009,9 @@ app.post("/agent-screenshot-multiple", async (c) => {
 		);
 	}
 
-	const list = urls.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
+	const list = urls.filter(
+		(u) => typeof u === "string" && /^https?:\/\//i.test(u),
+	);
 	if (list.length === 0) {
 		return c.json({ success: false, error: "No valid URLs" }, 400);
 	}
@@ -10927,8 +11019,17 @@ app.post("/agent-screenshot-multiple", async (c) => {
 	const results = await Promise.all(
 		list.map(async (url) => {
 			try {
-				const screenshotUrl = await agentBrowserScreenshot(url, { timeout, fullPage });
-				return { url, success: true, screenshot: screenshotUrl, markdown: null, metadata: {} };
+				const screenshotUrl = await agentBrowserScreenshot(url, {
+					timeout,
+					fullPage,
+				});
+				return {
+					url,
+					success: true,
+					screenshot: screenshotUrl,
+					markdown: null,
+					metadata: {},
+				};
 			} catch (err) {
 				return {
 					url,
@@ -10942,7 +11043,11 @@ app.post("/agent-screenshot-multiple", async (c) => {
 		}),
 	);
 
-	return c.json({ success: true, results, timestamp: new Date().toISOString() });
+	return c.json({
+		success: true,
+		results,
+		timestamp: new Date().toISOString(),
+	});
 });
 
 // ─── /api/codegen — URL → React / Tailwind HTML streamed codegen ─────────────
@@ -11234,7 +11339,8 @@ app.post("/api/codegen", async (c) => {
 		if (!url || !/^https?:\/\//i.test(url)) {
 			return c.json(
 				{
-					error: "A valid `url` (https://...) is required when outputType is reproduce",
+					error:
+						"A valid `url` (https://...) is required when outputType is reproduce",
 				},
 				400,
 			);
@@ -11248,7 +11354,10 @@ app.post("/api/codegen", async (c) => {
 			400,
 		);
 	} else if (url && !/^https?:\/\//i.test(url)) {
-		return c.json({ error: "Invalid `url` — must start with http:// or https://" }, 400);
+		return c.json(
+			{ error: "Invalid `url` — must start with http:// or https://" },
+			400,
+		);
 	}
 
 	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
@@ -11257,7 +11366,8 @@ app.post("/api/codegen", async (c) => {
 			{
 				error: "OpenRouter API key not configured",
 				code: "MISSING_API_KEY",
-				details: "Set OPENROUTER_API_KEY in your environment for codegen to work.",
+				details:
+					"Set OPENROUTER_API_KEY in your environment for codegen to work.",
 			},
 			503,
 		);
@@ -11288,70 +11398,74 @@ app.post("/api/codegen", async (c) => {
 		//     Tailwind/utility class names, and computed colour/font hints.
 		try {
 			const rawRes = await fetch(url, {
-			headers: {
-				"User-Agent":
-					"Mozilla/5.0 (compatible; CodegenBot/1.0; +https://ihatereading.in)",
-				Accept: "text/html,application/xhtml+xml",
-			},
-			signal: AbortSignal.timeout(15_000),
-		});
-		if (rawRes.ok) {
-			const html = await rawRes.text();
-			const dom  = new JSDOM(html);
-			const doc  = dom.window.document;
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (compatible; CodegenBot/1.0; +https://ihatereading.in)",
+					Accept: "text/html,application/xhtml+xml",
+				},
+				signal: AbortSignal.timeout(15_000),
+			});
+			if (rawRes.ok) {
+				const html = await rawRes.text();
+				const dom = new JSDOM(html);
+				const doc = dom.window.document;
 
-			// Inline <style> blocks — grab first 8 KB
-			const styleText = Array.from(doc.querySelectorAll("style"))
-				.map((s) => s.textContent || "")
-				.join("\n")
-				.slice(0, 8_000);
+				// Inline <style> blocks — grab first 8 KB
+				const styleText = Array.from(doc.querySelectorAll("style"))
+					.map((s) => s.textContent || "")
+					.join("\n")
+					.slice(0, 8_000);
 
-			// CSS custom property declarations (--color-*, --font-*, etc.)
-			const cssVarMatches = [...styleText.matchAll(/--([\w-]+)\s*:\s*([^;}{]+)/g)]
-				.slice(0, 60)
-				.map(([, name, val]) => `--${name}: ${val.trim()}`);
+				// CSS custom property declarations (--color-*, --font-*, etc.)
+				const cssVarMatches = [
+					...styleText.matchAll(/--([\w-]+)\s*:\s*([^;}{]+)/g),
+				]
+					.slice(0, 60)
+					.map(([, name, val]) => `--${name}: ${val.trim()}`);
 
-			// Inline style attributes on elements — capture colours & fonts
-			const inlineStyles = Array.from(
-				doc.querySelectorAll("[style]"),
-			)
-				.map((el) => el.getAttribute("style") || "")
-				.filter(Boolean)
-				.slice(0, 50)
-				.join("; ");
+				// Inline style attributes on elements — capture colours & fonts
+				const inlineStyles = Array.from(doc.querySelectorAll("[style]"))
+					.map((el) => el.getAttribute("style") || "")
+					.filter(Boolean)
+					.slice(0, 50)
+					.join("; ");
 
-			// Collect all class names — useful when Tailwind/utility classes are used
-			const allClasses = [
-				...new Set(
-					Array.from(doc.querySelectorAll("[class]"))
-						.flatMap((el) =>
+				// Collect all class names — useful when Tailwind/utility classes are used
+				const allClasses = [
+					...new Set(
+						Array.from(doc.querySelectorAll("[class]")).flatMap((el) =>
 							(el.getAttribute("class") || "").split(/\s+/).filter(Boolean),
 						),
-				),
-			]
-				.slice(0, 300)
-				.join(" ");
+					),
+				]
+					.slice(0, 300)
+					.join(" ");
 
-			// Background / text colours declared in stylesheets
-			const colourRe = /(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|hsl[a]?\([^)]+\))/g;
-			const colours = [...new Set(styleText.match(colourRe) ?? [])].slice(0, 30);
+				// Background / text colours declared in stylesheets
+				const colourRe = /(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|hsl[a]?\([^)]+\))/g;
+				const colours = [...new Set(styleText.match(colourRe) ?? [])].slice(
+					0,
+					30,
+				);
 
-			// Font families from CSS
-			const fontRe = /font-family\s*:\s*([^;}{]+)/g;
-			const fonts = [
-				...new Set([...styleText.matchAll(fontRe)].map(([, f]) => f.trim())),
-			].slice(0, 10);
+				// Font families from CSS
+				const fontRe = /font-family\s*:\s*([^;}{]+)/g;
+				const fonts = [
+					...new Set([...styleText.matchAll(fontRe)].map(([, f]) => f.trim())),
+				].slice(0, 10);
 
-			cssHints = [
-				colours.length   && `Colour palette: ${colours.join(", ")}`,
-				fonts.length     && `Font families: ${fonts.join(", ")}`,
-				cssVarMatches.length && `CSS custom properties:\n${cssVarMatches.join("\n")}`,
-				allClasses       && `CSS/Tailwind class names used: ${allClasses}`,
-				inlineStyles     && `Inline styles sample: ${inlineStyles.slice(0, 1_000)}`,
-			]
-				.filter(Boolean)
-				.join("\n\n");
-		}
+				cssHints = [
+					colours.length && `Colour palette: ${colours.join(", ")}`,
+					fonts.length && `Font families: ${fonts.join(", ")}`,
+					cssVarMatches.length &&
+						`CSS custom properties:\n${cssVarMatches.join("\n")}`,
+					allClasses && `CSS/Tailwind class names used: ${allClasses}`,
+					inlineStyles &&
+						`Inline styles sample: ${inlineStyles.slice(0, 1_000)}`,
+				]
+					.filter(Boolean)
+					.join("\n\n");
+			}
 		} catch (cssErr) {
 			console.warn("[codegen] CSS fetch failed:", cssErr?.message);
 		}
@@ -11362,7 +11476,11 @@ app.post("/api/codegen", async (c) => {
 
 	// Structured content sections
 	const headings = ["h1", "h2", "h3", "h4", "h5", "h6"]
-		.flatMap((tag) => (scrapeData?.content?.[tag] ?? []).map((t) => `${tag.toUpperCase()}: ${t}`))
+		.flatMap((tag) =>
+			(scrapeData?.content?.[tag] ?? []).map(
+				(t) => `${tag.toUpperCase()}: ${t}`,
+			),
+		)
 		.join("\n");
 
 	const paragraphs = (sc.paragraphs ?? [])
@@ -11380,7 +11498,9 @@ app.post("/api/codegen", async (c) => {
 
 	const images = (scrapeData?.images ?? [])
 		.slice(0, 20)
-		.map((img) => `src="${img.src}" alt="${img.alt}" (${img.width}x${img.height})`)
+		.map(
+			(img) => `src="${img.src}" alt="${img.alt}" (${img.width}x${img.height})`,
+		)
 		.join("\n");
 
 	const metadata = scrapeData?.metadata
@@ -11398,7 +11518,8 @@ app.post("/api/codegen", async (c) => {
 		paragraphs && `## Paragraphs\n${paragraphs}`,
 		listItems && `## List items\n${listItems}`,
 		images && `## Images\n${images}`,
-		scrapeMarkdown && `## Full page markdown\n${scrapeMarkdown.slice(0, 6_000)}`,
+		scrapeMarkdown &&
+			`## Full page markdown\n${scrapeMarkdown.slice(0, 6_000)}`,
 		cssHints && `## CSS / Design tokens\n${cssHints}`,
 	]
 		.filter(Boolean)
@@ -11432,9 +11553,7 @@ app.post("/api/codegen", async (c) => {
 	const systemPrompt = buildCodegenSystemPrompt(format, outputType);
 
 	const model =
-		modelOverride ||
-		process.env.CODEGEN_MODEL ||
-		"anthropic/claude-sonnet-4-5";
+		modelOverride || process.env.CODEGEN_MODEL || "anthropic/claude-sonnet-4-5";
 
 	// ── 3. Stream from OpenRouter ──────────────────────────────────────────────
 	let openRouterRes;
@@ -11522,13 +11641,10 @@ app.post("/api/codegen", async (c) => {
 							return;
 						}
 
-						const delta =
-							parsed?.choices?.[0]?.delta?.content ?? null;
+						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
 						if (delta) {
 							controller.enqueue(
-								encoder.encode(
-									`data: ${JSON.stringify({ delta })}\n\n`,
-								),
+								encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`),
 							);
 						}
 					}
@@ -11569,19 +11685,19 @@ app.post("/api/codegen", async (c) => {
 //
 // Maps URL-friendly route :type param → SKILLS key
 const ASSET_SKILL_MAP = {
-	blog:         "blog",
-	article:      "article",
-	email:        "newsletter",
-	newsletter:   "newsletter",
-	linkedin:     "linkedin",
-	twitter:      "twitter",
-	substack:     "substack",
-	scrape:       "scrape",
+	blog: "blog",
+	article: "article",
+	email: "newsletter",
+	newsletter: "newsletter",
+	linkedin: "linkedin",
+	twitter: "twitter",
+	substack: "substack",
+	scrape: "scrape",
 	infographics: "infographics-svg-generator",
-	table:        "table",
-	landing:      "landing-page-generator",
+	table: "table",
+	landing: "landing-page-generator",
 	"landing-page": "landing-page-generator",
-	gallery:      "image-gallery-creator",
+	gallery: "image-gallery-creator",
 	"image-gallery": "image-gallery-creator",
 };
 
@@ -11595,14 +11711,25 @@ function clampGalleryMaxImages(n) {
 	return Math.min(10, Math.max(1, Math.floor(x)));
 }
 
-async function runSkillAsset(skillType, { urls = [], prompt = "", format = "substack", style = "casual", maxImages: maxImagesRaw } = {}) {
+async function runSkillAsset(
+	skillType,
+	{
+		urls = [],
+		prompt = "",
+		format = "substack",
+		style = "casual",
+		maxImages: maxImagesRaw,
+	} = {},
+) {
 	const skill = SKILLS[skillType];
 	if (!skill || skill.maxTokens <= 1) {
 		throw new Error(`"${skillType}" is not a content-generation skill`);
 	}
 
 	const maxImages =
-		skillType === "image-gallery-creator" ? clampGalleryMaxImages(maxImagesRaw) : undefined;
+		skillType === "image-gallery-creator"
+			? clampGalleryMaxImages(maxImagesRaw)
+			: undefined;
 
 	// Scrape each URL in parallel; silently drop failures
 	const sources = [];
@@ -11611,17 +11738,17 @@ async function runSkillAsset(skillType, { urls = [], prompt = "", format = "subs
 			urls.slice(0, 10).map(async (url) => {
 				const r = await scrapeSingleUrlWithPuppeteer(url, {
 					includeSemanticContent: true,
-					extractMetadata:        true,
-					includeImages:          true,
-					includeLinks:           true,
-					timeout:                30_000,
+					extractMetadata: true,
+					includeImages: true,
+					includeLinks: true,
+					timeout: 30_000,
 				});
 				return {
 					url,
 					markdown: r.markdown || "",
-					title:    r.data?.title || "",
-					links:    r.data?.links  || [],
-					images:   r.data?.images || [],
+					title: r.data?.title || "",
+					links: r.data?.links || [],
+					images: r.data?.images || [],
 				};
 			}),
 		);
@@ -11635,26 +11762,44 @@ async function runSkillAsset(skillType, { urls = [], prompt = "", format = "subs
 	}
 
 	const skillOpts = skillType === "image-gallery-creator" ? { maxImages } : {};
-	const system  = skill.buildSystemPrompt(format, style, sources.length > 0, skillOpts);
-	const user    = skill.buildUserContent(String(prompt).trim(), sources, skillOpts);
-	const fmt = String(format || "").trim().toLowerCase();
+	const system = skill.buildSystemPrompt(
+		format,
+		style,
+		sources.length > 0,
+		skillOpts,
+	);
+	const user = skill.buildUserContent(
+		String(prompt).trim(),
+		sources,
+		skillOpts,
+	);
+	const fmt = String(format || "")
+		.trim()
+		.toLowerCase();
 	const isJson =
 		skillType === "infographics-svg-generator" ||
 		skillType === "image-gallery-creator" ||
 		skillType === "table" ||
 		(skillType === "scrape" && fmt === "json");
-	const maxOut  = Math.min(skill.maxTokens, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
+	const maxOut = Math.min(skill.maxTokens, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
 
 	const { content } = await openRouterChatMessages(
 		process.env.OPENROUTER_API_KEY,
-		[{ role: "system", content: system }, { role: "user", content: user }],
+		[
+			{ role: "system", content: system },
+			{ role: "user", content: user },
+		],
 		maxOut,
 		isJson ? { response_format: { type: "json_object" } } : {},
 	);
 
 	if (skill.parseResponse) {
 		const parsed = skill.parseResponse(content);
-		if (skillType === "image-gallery-creator" && parsed && Array.isArray(parsed.images)) {
+		if (
+			skillType === "image-gallery-creator" &&
+			parsed &&
+			Array.isArray(parsed.images)
+		) {
 			parsed.images = parsed.images.slice(0, maxImages);
 			parsed.maxImages = maxImages;
 		}
@@ -11674,7 +11819,10 @@ async function runSkillAsset(skillType, { urls = [], prompt = "", format = "subs
 	// Scrape + JSON: return parsed value (json_object mode returns a JSON string)
 	if (skillType === "scrape" && fmt === "json") {
 		try {
-			const raw = String(content || "").trim().replace(/```json|```/gi, "").trim();
+			const raw = String(content || "")
+				.trim()
+				.replace(/```json|```/gi, "")
+				.trim();
 			return { content: JSON.parse(raw) };
 		} catch {
 			return { content: content.trim() };
@@ -11693,13 +11841,19 @@ const G2_SEARCH_HOST = "https://www.g2.com";
 const G2_PRODUCT_SEARCH_DEFAULT_PAGES = 5;
 const G2_PRODUCT_SEARCH_MAX_PAGES = 50;
 /** Per-chunk markdown sent to extraction model (leave room for system + instructions). */
-const G2_MARKDOWN_CHUNK_CHARS = Math.min(26000, Math.max(8000, MAX_SUMMARY_INPUT_CHARS - 8000));
+const G2_MARKDOWN_CHUNK_CHARS = Math.min(
+	26000,
+	Math.max(8000, MAX_SUMMARY_INPUT_CHARS - 8000),
+);
 const G2_EXTRACT_MAX_TOKENS = Math.min(8192, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
 
 function buildG2SearchUrl(query, page, productId) {
 	const u = new URL("/search", G2_SEARCH_HOST);
 	u.searchParams.set("query", String(query).trim());
-	u.searchParams.set("page", String(Math.max(1, Math.floor(Number(page)) || 1)));
+	u.searchParams.set(
+		"page",
+		String(Math.max(1, Math.floor(Number(page)) || 1)),
+	);
 	if (productId != null && String(productId).trim() !== "") {
 		u.searchParams.set("product_id", String(productId).trim());
 	}
@@ -11820,7 +11974,11 @@ ${markdown}
 	);
 	let parsed;
 	try {
-		parsed = JSON.parse(String(content || "").replace(/```json|```/gi, "").trim());
+		parsed = JSON.parse(
+			String(content || "")
+				.replace(/```json|```/gi, "")
+				.trim(),
+		);
 	} catch {
 		return [];
 	}
@@ -12178,38 +12336,48 @@ app.post("/g2-product-search-research", async (c) => {
 // Response: { success, type, skillType, urls, content|infographics|columns/rows|images|markdown, timestamp }
 app.post("/generate/:type", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
-	const genAuthHdr   = c.req.header("Authorization") || c.req.header("authorization");
-	const genAuthToken = genAuthHdr?.startsWith("Bearer ") ? genAuthHdr.slice(7).trim() : genAuthHdr?.trim();
+	const genAuthHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const genAuthToken = genAuthHdr?.startsWith("Bearer ")
+		? genAuthHdr.slice(7).trim()
+		: genAuthHdr?.trim();
 	if (!genAuthToken) {
 		return c.json(
-			{ error: "Authentication required", code: "MISSING_AUTH_TOKEN",
-			  details: "Provide a Bearer token in the Authorization header" },
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
 			401,
 		);
 	}
 
 	// ── Rate limit (20 req / 10 min per IP) ──────────────────────────────────
-	const GEN_RATE_LIMIT     = 20;
+	const GEN_RATE_LIMIT = 20;
 	const GEN_RATE_WINDOW_MS = 10 * 60 * 1000;
 	const genIp =
 		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
-		c.req.header("x-real-ip")  ||
+		c.req.header("x-real-ip") ||
 		c.req.header("cf-connecting-ip") ||
 		"unknown";
 	const genRl = rateLimit(genIp, GEN_RATE_LIMIT, GEN_RATE_WINDOW_MS);
 	if (!genRl.allowed) {
-		c.header("Retry-After",       String(genRl.retryAfter));
+		c.header("Retry-After", String(genRl.retryAfter));
 		c.header("X-RateLimit-Limit", String(GEN_RATE_LIMIT));
 		c.header("X-RateLimit-Remaining", "0");
-		c.header("X-RateLimit-Window",    "10 minutes");
+		c.header("X-RateLimit-Window", "10 minutes");
 		return c.json(
-			{ success: false, error: "Rate limit exceeded", retryAfter: genRl.retryAfter },
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: genRl.retryAfter,
+			},
 			429,
 		);
 	}
-	c.header("X-RateLimit-Limit",     String(GEN_RATE_LIMIT));
+	c.header("X-RateLimit-Limit", String(GEN_RATE_LIMIT));
 	c.header("X-RateLimit-Remaining", String(genRl.remaining));
-	c.header("X-RateLimit-Window",    "10 minutes");
+	c.header("X-RateLimit-Window", "10 minutes");
 
 	let body;
 	try {
@@ -12224,10 +12392,7 @@ app.post("/generate/:type", async (c) => {
 	if (typeName === "image-reading" || typeName === "images") {
 		const out = await runImageReadingService(body);
 		if (!out.success) {
-			return c.json(
-				{ success: false, error: out.error },
-				out.status || 400,
-			);
+			return c.json({ success: false, error: out.error }, out.status || 400);
 		}
 		return c.json({
 			success: true,
@@ -12250,7 +12415,10 @@ app.post("/generate/:type", async (c) => {
 	}
 
 	if (!process.env.OPENROUTER_API_KEY) {
-		return c.json({ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" }, 503);
+		return c.json(
+			{ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" },
+			503,
+		);
 	}
 
 	const {
@@ -12267,8 +12435,9 @@ app.post("/generate/:type", async (c) => {
 				? "markdown"
 				: "substack";
 
-	const urlList = (Array.isArray(urls) ? urls : [urls])
-		.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
+	const urlList = (Array.isArray(urls) ? urls : [urls]).filter(
+		(u) => typeof u === "string" && /^https?:\/\//i.test(u),
+	);
 
 	if (urlList.length === 0 && !String(prompt).trim()) {
 		return c.json({ error: "Provide at least one URL or a prompt" }, 400);
@@ -12283,19 +12452,21 @@ app.post("/generate/:type", async (c) => {
 			maxImages: maxImagesBody,
 		});
 		return c.json({
-			success:   true,
-			type:      typeName,
+			success: true,
+			type: typeName,
 			skillType,
-			urls:      urlList,
+			urls: urlList,
 			...result,
 			timestamp: new Date().toISOString(),
 		});
 	} catch (err) {
 		console.error(`[/generate/${typeName}]`, err?.message);
-		return c.json({ success: false, error: err?.message || "Generation failed" }, 500);
+		return c.json(
+			{ success: false, error: err?.message || "Generation failed" },
+			500,
+		);
 	}
 });
-
 
 // ─── /ai-resume-builder — LinkedIn + GitHub + projects → streamed resume code ──
 //
@@ -12344,7 +12515,8 @@ function parseGitHubUrl(url) {
 		if (u.hostname !== "github.com") return null;
 		const parts = u.pathname.replace(/^\//, "").split("/").filter(Boolean);
 		if (parts.length === 1) return { type: "user", username: parts[0] };
-		if (parts.length >= 2) return { type: "repo", owner: parts[0], repo: parts[1] };
+		if (parts.length >= 2)
+			return { type: "repo", owner: parts[0], repo: parts[1] };
 		return null;
 	} catch {
 		return null;
@@ -12353,65 +12525,88 @@ function parseGitHubUrl(url) {
 
 app.post("/ai-resume-builder", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
-	const resumeAuthHdr   = c.req.header("Authorization") || c.req.header("authorization");
+	const resumeAuthHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
 	const resumeAuthToken = resumeAuthHdr?.startsWith("Bearer ")
 		? resumeAuthHdr.slice(7).trim()
 		: resumeAuthHdr?.trim();
 	if (!resumeAuthToken) {
 		return c.json(
-			{ error: "Authentication required", code: "MISSING_AUTH_TOKEN",
-			  details: "Provide a Bearer token in the Authorization header" },
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
 			401,
 		);
 	}
 
 	// ── Rate limit (10 req / 10 min per IP) ──────────────────────────────────
-	const RESUME_RATE_LIMIT     = 10;
+	const RESUME_RATE_LIMIT = 10;
 	const RESUME_RATE_WINDOW_MS = 10 * 60 * 1000;
 	const resumeIp =
 		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
 		c.req.header("x-real-ip") ||
 		c.req.header("cf-connecting-ip") ||
 		"unknown";
-	const resumeRl = rateLimit(resumeIp, RESUME_RATE_LIMIT, RESUME_RATE_WINDOW_MS);
+	const resumeRl = rateLimit(
+		resumeIp,
+		RESUME_RATE_LIMIT,
+		RESUME_RATE_WINDOW_MS,
+	);
 	if (!resumeRl.allowed) {
-		c.header("Retry-After",           String(resumeRl.retryAfter));
-		c.header("X-RateLimit-Limit",     String(RESUME_RATE_LIMIT));
+		c.header("Retry-After", String(resumeRl.retryAfter));
+		c.header("X-RateLimit-Limit", String(RESUME_RATE_LIMIT));
 		c.header("X-RateLimit-Remaining", "0");
-		c.header("X-RateLimit-Window",    "10 minutes");
+		c.header("X-RateLimit-Window", "10 minutes");
 		return c.json(
-			{ success: false, error: "Rate limit exceeded", retryAfter: resumeRl.retryAfter },
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: resumeRl.retryAfter,
+			},
 			429,
 		);
 	}
-	c.header("X-RateLimit-Limit",     String(RESUME_RATE_LIMIT));
+	c.header("X-RateLimit-Limit", String(RESUME_RATE_LIMIT));
 	c.header("X-RateLimit-Remaining", String(resumeRl.remaining));
-	c.header("X-RateLimit-Window",    "10 minutes");
+	c.header("X-RateLimit-Window", "10 minutes");
 
 	if (!process.env.OPENROUTER_API_KEY) {
-		return c.json({ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" }, 503);
+		return c.json(
+			{ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" },
+			503,
+		);
 	}
 
 	let body;
-	try { body = await c.req.json(); } catch {
+	try {
+		body = await c.req.json();
+	} catch {
 		return c.json({ error: "Invalid JSON body" }, 400);
 	}
 
 	const {
-		linkedinUrl  = "",
-		githubUrl    = "",
-		projectUrls  = [],
+		linkedinUrl = "",
+		githubUrl = "",
+		projectUrls = [],
 		prompt: extraPrompt = "",
-		format: rawFormat   = "react",
+		format: rawFormat = "react",
 	} = body;
 
 	const format = rawFormat === "html" ? "html" : "react";
 
 	const isValidUrl = (u) => typeof u === "string" && /^https?:\/\//i.test(u);
 
-	if (!isValidUrl(linkedinUrl) && !isValidUrl(githubUrl) && !projectUrls.some(isValidUrl)) {
+	if (
+		!isValidUrl(linkedinUrl) &&
+		!isValidUrl(githubUrl) &&
+		!projectUrls.some(isValidUrl)
+	) {
 		return c.json(
-			{ error: "Provide at least one of linkedinUrl, githubUrl, or projectUrls" },
+			{
+				error: "Provide at least one of linkedinUrl, githubUrl, or projectUrls",
+			},
 			400,
 		);
 	}
@@ -12419,10 +12614,10 @@ app.post("/ai-resume-builder", async (c) => {
 	// ── 1. Scrape all sources in parallel ────────────────────────────────────
 	const scrapeOpts = {
 		includeSemanticContent: true,
-		extractMetadata:        true,
-		includeImages:          true,
-		includeLinks:           true,
-		timeout:                35_000,
+		extractMetadata: true,
+		includeImages: true,
+		includeLinks: true,
+		timeout: 35_000,
 	};
 
 	const contextSections = [];
@@ -12431,28 +12626,38 @@ app.post("/ai-resume-builder", async (c) => {
 	async function scrapeToContext(url, label) {
 		try {
 			const result = await scrapeSingleUrlWithPuppeteer(url, scrapeOpts);
-			const d   = result.data ?? {};
-			const md  = result.markdown ?? "";
-			const sc  = d.content?.semanticContent ?? {};
+			const d = result.data ?? {};
+			const md = result.markdown ?? "";
+			const sc = d.content?.semanticContent ?? {};
 
 			const headings = ["h1", "h2", "h3", "h4"]
-				.flatMap((t) => (d.content?.[t] ?? []).map((v) => `${t.toUpperCase()}: ${v}`))
+				.flatMap((t) =>
+					(d.content?.[t] ?? []).map((v) => `${t.toUpperCase()}: ${v}`),
+				)
 				.join("\n");
 
-			const paragraphs = (sc.paragraphs ?? []).filter(Boolean).slice(0, 60).join("\n");
-			const listItems  = [
+			const paragraphs = (sc.paragraphs ?? [])
+				.filter(Boolean)
+				.slice(0, 60)
+				.join("\n");
+			const listItems = [
 				...(sc.unorderedLists ?? []).flat(),
-				...(sc.orderedLists   ?? []).flat(),
-			].filter(Boolean).slice(0, 40).join("\n");
+				...(sc.orderedLists ?? []).flat(),
+			]
+				.filter(Boolean)
+				.slice(0, 40)
+				.join("\n");
 
 			return [
 				`## ${label} — ${url}`,
-				d.title           && `Title: ${d.title}`,
-				headings          && `### Headings\n${headings}`,
-				paragraphs        && `### Paragraphs\n${paragraphs}`,
-				listItems         && `### List items\n${listItems}`,
-				md                && `### Full markdown (truncated)\n${md.slice(0, 5_000)}`,
-			].filter(Boolean).join("\n\n");
+				d.title && `Title: ${d.title}`,
+				headings && `### Headings\n${headings}`,
+				paragraphs && `### Paragraphs\n${paragraphs}`,
+				listItems && `### List items\n${listItems}`,
+				md && `### Full markdown (truncated)\n${md.slice(0, 5_000)}`,
+			]
+				.filter(Boolean)
+				.join("\n\n");
 		} catch (err) {
 			console.warn(`[resume-builder] scrape failed for ${url}:`, err?.message);
 			return `## ${label} — ${url}\n(scrape failed: ${err?.message})`;
@@ -12462,24 +12667,29 @@ app.post("/ai-resume-builder", async (c) => {
 	/** Fetch GitHub user data + top repos via GitHub API. */
 	async function fetchGitHubUserContext(username) {
 		const ghHeaders = {
-			Accept:       "application/vnd.github.v3+json",
+			Accept: "application/vnd.github.v3+json",
 			"User-Agent": "ai-resume-builder/1.0",
-			...(process.env.GITHUB_TOKEN ? { Authorization: `token ${process.env.GITHUB_TOKEN}` } : {}),
+			...(process.env.GITHUB_TOKEN
+				? { Authorization: `token ${process.env.GITHUB_TOKEN}` }
+				: {}),
 		};
 		const lines = [`## GitHub Profile — https://github.com/${username}`];
 		try {
 			const userRes = await fetch(`https://api.github.com/users/${username}`, {
-				headers: ghHeaders, signal: AbortSignal.timeout(10_000),
+				headers: ghHeaders,
+				signal: AbortSignal.timeout(10_000),
 			});
 			if (userRes.ok) {
 				const u = await userRes.json();
-				if (u.name)       lines.push(`Name: ${u.name}`);
-				if (u.bio)        lines.push(`Bio: ${u.bio}`);
-				if (u.company)    lines.push(`Company: ${u.company}`);
-				if (u.location)   lines.push(`Location: ${u.location}`);
-				if (u.blog)       lines.push(`Website: ${u.blog}`);
-				if (u.email)      lines.push(`Email: ${u.email}`);
-				lines.push(`Followers: ${u.followers ?? 0} | Following: ${u.following ?? 0} | Public repos: ${u.public_repos ?? 0}`);
+				if (u.name) lines.push(`Name: ${u.name}`);
+				if (u.bio) lines.push(`Bio: ${u.bio}`);
+				if (u.company) lines.push(`Company: ${u.company}`);
+				if (u.location) lines.push(`Location: ${u.location}`);
+				if (u.blog) lines.push(`Website: ${u.blog}`);
+				if (u.email) lines.push(`Email: ${u.email}`);
+				lines.push(
+					`Followers: ${u.followers ?? 0} | Following: ${u.following ?? 0} | Public repos: ${u.public_repos ?? 0}`,
+				);
 			}
 		} catch (e) {
 			lines.push(`(GitHub user API unavailable: ${e?.message})`);
@@ -12495,12 +12705,17 @@ app.post("/ai-resume-builder", async (c) => {
 					lines.push("\n### Top Repositories");
 					for (const r of repos.slice(0, 8)) {
 						const desc = r.description ? ` — ${r.description}` : "";
-						const lang = r.language     ? ` [${r.language}]`   : "";
-						lines.push(`- **${r.name}**${lang}${desc} | ⭐ ${r.stargazers_count ?? 0} | ${r.html_url}`);
+						const lang = r.language ? ` [${r.language}]` : "";
+						lines.push(
+							`- **${r.name}**${lang}${desc} | ⭐ ${r.stargazers_count ?? 0} | ${r.html_url}`,
+						);
 					}
 					// Collect unique languages
-					const langs = [...new Set(repos.map((r) => r.language).filter(Boolean))];
-					if (langs.length > 0) lines.push(`\n### Languages: ${langs.join(", ")}`);
+					const langs = [
+						...new Set(repos.map((r) => r.language).filter(Boolean)),
+					];
+					if (langs.length > 0)
+						lines.push(`\n### Languages: ${langs.join(", ")}`);
 				}
 			}
 		} catch (e) {
@@ -12513,13 +12728,19 @@ app.post("/ai-resume-builder", async (c) => {
 	async function fetchGitHubRepoContext(owner, repo) {
 		const lines = [`## GitHub Repo — https://github.com/${owner}/${repo}`];
 		try {
-			const ast = await analyzeRepo(owner, repo, undefined, { maxFiles: 20, maxDepth: 2 });
+			const ast = await analyzeRepo(owner, repo, undefined, {
+				maxFiles: 20,
+				maxDepth: 2,
+			});
 			if (ast) {
 				if (ast.description) lines.push(`Description: ${ast.description}`);
-				if (ast.language)    lines.push(`Primary language: ${ast.language}`);
-				if (ast.stars)       lines.push(`Stars: ${ast.stars}`);
+				if (ast.language) lines.push(`Primary language: ${ast.language}`);
+				if (ast.stars) lines.push(`Stars: ${ast.stars}`);
 				if (ast.topics?.length) lines.push(`Topics: ${ast.topics.join(", ")}`);
-				if (ast.readme)      lines.push(`\n### README (truncated)\n${String(ast.readme).slice(0, 3_000)}`);
+				if (ast.readme)
+					lines.push(
+						`\n### README (truncated)\n${String(ast.readme).slice(0, 3_000)}`,
+					);
 			}
 		} catch (e) {
 			lines.push(`(repo analysis failed: ${e?.message})`);
@@ -12557,7 +12778,10 @@ app.post("/ai-resume-builder", async (c) => {
 
 	if (contextSections.length === 0) {
 		return c.json(
-			{ error: "All scraping attempts failed — no source data to build a resume from." },
+			{
+				error:
+					"All scraping attempts failed — no source data to build a resume from.",
+			},
 			422,
 		);
 	}
@@ -12569,45 +12793,59 @@ app.post("/ai-resume-builder", async (c) => {
 		"",
 		...contextSections,
 		extraPrompt && `\nExtra instructions from user: ${extraPrompt}`,
-	].filter((x) => x !== false && x !== undefined).join("\n\n");
+	]
+		.filter((x) => x !== false && x !== undefined)
+		.join("\n\n");
 
-	const model = process.env.RESUME_MODEL || process.env.CODEGEN_MODEL || "anthropic/claude-sonnet-4-5";
+	const model =
+		process.env.RESUME_MODEL ||
+		process.env.CODEGEN_MODEL ||
+		"anthropic/claude-sonnet-4-5";
 
 	// ── 3. Stream from OpenRouter ────────────────────────────────────────────
 	let openRouterRes;
 	try {
-		openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization:  `Bearer ${process.env.OPENROUTER_API_KEY}`,
-				"HTTP-Referer": "https://ihatereading.in",
-				"X-Title":      "IHateReading AI Resume Builder",
+		openRouterRes = await fetch(
+			"https://openrouter.ai/api/v1/chat/completions",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+					"HTTP-Referer": "https://ihatereading.in",
+					"X-Title": "IHateReading AI Resume Builder",
+				},
+				body: JSON.stringify({
+					model,
+					stream: true,
+					messages: [
+						{ role: "system", content: RESUME_SYSTEM_PROMPT },
+						{ role: "user", content: userMessage },
+					],
+					temperature: 0.25,
+					max_tokens: 8000,
+				}),
 			},
-			body: JSON.stringify({
-				model,
-				stream:   true,
-				messages: [
-					{ role: "system", content: RESUME_SYSTEM_PROMPT },
-					{ role: "user",   content: userMessage },
-				],
-				temperature: 0.25,
-				max_tokens:  8000,
-			}),
-		});
+		);
 	} catch (fetchErr) {
-		return c.json({ error: `Failed to reach OpenRouter: ${fetchErr.message}` }, 502);
+		return c.json(
+			{ error: `Failed to reach OpenRouter: ${fetchErr.message}` },
+			502,
+		);
 	}
 
 	if (!openRouterRes.ok) {
 		let detail = `OpenRouter ${openRouterRes.status}`;
-		try { const e = await openRouterRes.json(); detail = e?.error?.message || detail; } catch {}
+		try {
+			const e = await openRouterRes.json();
+			detail = e?.error?.message || detail;
+		} catch {}
 		return c.json({ error: detail }, openRouterRes.status);
 	}
 
 	// ── 4. Pipe SSE stream back to client ────────────────────────────────────
-	const encoder       = new TextEncoder();
-	const upstreamReader  = openRouterRes.body.getReader();
+	const encoder = new TextEncoder();
+	const upstreamReader = openRouterRes.body.getReader();
 	const upstreamDecoder = new TextDecoder();
 
 	const outputStream = new ReadableStream({
@@ -12632,17 +12870,25 @@ app.post("/ai-resume-builder", async (c) => {
 							return;
 						}
 						let parsed;
-						try { parsed = JSON.parse(payload); } catch { continue; }
+						try {
+							parsed = JSON.parse(payload);
+						} catch {
+							continue;
+						}
 						if (parsed?.error) {
-							controller.enqueue(encoder.encode(
-								`data: ${JSON.stringify({ error: parsed.error.message || "OpenRouter error" })}\n\n`,
-							));
+							controller.enqueue(
+								encoder.encode(
+									`data: ${JSON.stringify({ error: parsed.error.message || "OpenRouter error" })}\n\n`,
+								),
+							);
 							controller.close();
 							return;
 						}
 						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
 						if (delta) {
-							controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`));
+							controller.enqueue(
+								encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`),
+							);
 						}
 					}
 				}
@@ -12650,9 +12896,11 @@ app.post("/ai-resume-builder", async (c) => {
 				controller.close();
 			} catch (err) {
 				try {
-					controller.enqueue(encoder.encode(
-						`data: ${JSON.stringify({ error: err?.message || "Stream error" })}\n\n`,
-					));
+					controller.enqueue(
+						encoder.encode(
+							`data: ${JSON.stringify({ error: err?.message || "Stream error" })}\n\n`,
+						),
+					);
 					controller.close();
 				} catch {}
 			}
@@ -12661,9 +12909,9 @@ app.post("/ai-resume-builder", async (c) => {
 
 	return new Response(outputStream, {
 		headers: {
-			"Content-Type":  "text/event-stream",
+			"Content-Type": "text/event-stream",
 			"Cache-Control": "no-cache",
-			"Connection":    "keep-alive",
+			Connection: "keep-alive",
 		},
 	});
 });
