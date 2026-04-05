@@ -3,4 +3,5 @@
 	"name": "hono-api",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-04-05",
+	"type": "module"
 }
