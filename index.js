@@ -3,6 +3,7 @@ import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore, storage } from "./config/firebase.js";
 import { FieldValue } from "firebase-admin/firestore";
+import { createHash } from "node:crypto";
 import jwt from "jsonwebtoken";
 import chromium from "@sparticuz/chromium";
 import { supabase } from "./config/supabase.js";
@@ -13,6 +14,10 @@ import { v4 as uuidv4 } from "uuid";
 import { JSDOM } from "jsdom";
 import { load } from "cheerio";
 import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemanticContent.js";
+import {
+	runKeywordAnalysis,
+	runCompetitorAudit,
+} from "./lib/seoApis.js";
 import {
 	parseRepoUrl,
 	analyzeRepo,
@@ -63,6 +68,13 @@ import {
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, ".env") });
+
+/** Firestore collection for scraped URL cache (replaces Supabase `universo` for this path). */
+const UNIVERSO_CACHE_COLLECTION = "universo";
+
+function universoCacheDocId(url) {
+	return createHash("sha256").update(String(url)).digest("hex");
+}
 
 const utapi = new UTApi({ token: process.env.UPLOADTHING_TOKEN });
 
@@ -4183,6 +4195,35 @@ app.post("/google-search", async (c) => {
 	}
 });
 
+// ─── SEO: keyword analysis & competitor discovery (Google Suggest, Trends, DDG; optional OpenRouter) ──
+app.post("/seo-keyword-analysis", async (c) => {
+	try {
+		const body = await c.req.json();
+		const data = await runKeywordAnalysis(body);
+		return c.json({ success: true, ...data });
+	} catch (err) {
+		console.error("seo-keyword-analysis:", err?.message || err);
+		return c.json(
+			{ success: false, error: err?.message || "Request failed" },
+			400,
+		);
+	}
+});
+
+app.post("/seo-competitor-audit", async (c) => {
+	try {
+		const body = await c.req.json();
+		const data = await runCompetitorAudit(body);
+		return c.json({ success: true, ...data });
+	} catch (err) {
+		console.error("seo-competitor-audit:", err?.message || err);
+		return c.json(
+			{ success: false, error: err?.message || "Request failed" },
+			400,
+		);
+	}
+});
+
 function isValidURL(urlString) {
 	try {
 		new URL(urlString);
@@ -4306,25 +4347,32 @@ async function scrapeSingleUrlWithPuppeteer(
 		};
 	}
 
-	let existingData;
 	if (includeCache) {
-		const { data, error: fetchError } = await supabase
-			.from("universo")
-			.select("scraped_data, scraped_at, markdown, screenshot")
-			.eq("url", targetUrl);
-		existingData = data?.[0];
-		if (fetchError || !existingData) {
+		const snap = await firestore
+			.collection(UNIVERSO_CACHE_COLLECTION)
+			.doc(universoCacheDocId(targetUrl))
+			.get();
+		if (!snap.exists) {
 			throw new Error("Cache miss or fetch error");
 		}
-		if (existingData?.scraped_data) {
-			return {
-				success: true,
-				data: JSON.parse(existingData.scraped_data),
-				markdown: existingData?.markdown ?? null,
-				summary: null,
-				screenshot: existingData?.screenshot ?? null,
-			};
+		const existingData = snap.data();
+		const raw = existingData?.scraped_data;
+		if (raw == null) {
+			throw new Error("Cache miss or fetch error");
 		}
+		let parsedData;
+		if (typeof raw === "string") {
+			parsedData = JSON.parse(raw);
+		} else {
+			parsedData = raw;
+		}
+		return {
+			success: true,
+			data: parsedData,
+			markdown: existingData?.markdown ?? null,
+			summary: null,
+			screenshot: existingData?.screenshot ?? null,
+		};
 	}
 
 	const maxAttempts = useProxy ? 3 : 1;
@@ -4740,20 +4788,25 @@ async function scrapeSingleUrlWithPuppeteer(
 
 				if (!includeCache) {
 					try {
-						const { data: existingRows, error: fetchError } = await supabase
-							.from("universo")
-							.select("id")
-							.eq("url", targetUrl);
-						if (!fetchError && (!existingRows || existingRows.length === 0)) {
-							await supabase.from("universo").insert({
+						const docRef = firestore
+							.collection(UNIVERSO_CACHE_COLLECTION)
+							.doc(universoCacheDocId(targetUrl));
+						const existingSnap = await docRef.get();
+						if (!existingSnap.exists) {
+							await docRef.set({
 								title: scrapedData?.title || "No Title",
 								url: targetUrl,
 								markdown,
-								scraped_at: new Date().toISOString(),
-								scraped_data: JSON.stringify(scrapedData),
+								scraped_at: FieldValue.serverTimestamp(),
+								scraped_data: scrapedData,
 							});
 						}
-					} catch {}
+					} catch (cacheErr) {
+						console.warn(
+							"[scrape] Firestore universo cache write failed:",
+							cacheErr?.message,
+						);
+					}
 				}
 
 				if (includeSemanticContent && scrapedData?.content)
@@ -8799,6 +8852,112 @@ async function normalizeImageInput(img) {
 }
 
 /**
+ * Shared image-reading pipeline (Gemini). Used by POST /image-reading and POST /generate/image-reading.
+ * Body: { images: [{ url } | { base64, mimeType }], convertToCode?: boolean, extractContent?: boolean }
+ */
+async function runImageReadingService(body) {
+	const { images = [], convertToCode = false, extractContent = true } =
+		body || {};
+
+	if (!Array.isArray(images) || images.length === 0) {
+		return {
+			success: false,
+			error: "images array is required and must not be empty",
+			status: 400,
+		};
+	}
+
+	const normalized = [];
+	for (let i = 0; i < images.length; i++) {
+		try {
+			const n = await normalizeImageInput(images[i]);
+			if (n) normalized.push(n);
+		} catch (e) {
+			console.warn("[image-reading] Skip image", i, e?.message);
+		}
+	}
+	if (normalized.length === 0) {
+		return {
+			success: false,
+			error: "No valid image could be loaded from images array",
+			status: 400,
+		};
+	}
+
+	const results = [];
+	const markdownParts = [];
+
+	for (let idx = 0; idx < normalized.length; idx++) {
+		const { base64, mimeType } = normalized[idx];
+		const result = { index: idx, content: null, code: null };
+
+		if (extractContent) {
+			try {
+				const contentRes = await genai.models.generateContent({
+					model: "gemini-2.0-flash",
+					contents: [
+						{
+							role: "user",
+							parts: [
+								{
+									text: "Extract and describe all text and meaningful content from this image. Return only markdown: headings, paragraphs, lists, and any text you see. No preamble or explanation.",
+								},
+								{ inlineData: { mimeType, data: base64 } },
+							],
+						},
+					],
+				});
+				const text =
+					contentRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+					"";
+				result.content = text || "(No text extracted)";
+				markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
+			} catch (e) {
+				console.warn("[image-reading] Extract content failed:", e?.message);
+				result.content = "(Content extraction failed)";
+				markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
+			}
+		}
+
+		if (convertToCode) {
+			try {
+				const codeRes = await genai.models.generateContent({
+					model: "gemini-2.0-flash",
+					contents: [
+						{
+							role: "user",
+							parts: [
+								{
+									text: "Convert this image (screenshot, mockup, or UI) into clean HTML and CSS code. Output only a single HTML document with embedded <style>. No explanations.",
+								},
+								{ inlineData: { mimeType, data: base64 } },
+							],
+						},
+					],
+				});
+				let code =
+					codeRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+				const fence = code.match(/```(?:html)?\s*\n?([\s\S]*?)\n?```/);
+				if (fence && fence[1]) code = fence[1].trim();
+				result.code = code || null;
+			} catch (e) {
+				console.warn("[image-reading] Convert to code failed:", e?.message);
+			}
+		}
+
+		results.push(result);
+	}
+
+	const markdown = markdownParts.join("\n\n");
+
+	return {
+		success: true,
+		results,
+		markdown: markdown || "(No content extracted)",
+	};
+}
+
+/**
  * POST /image-reading
  * Body: { images: [{ url } | { base64, mimeType }], convertToCode?: boolean, extractContent?: boolean }
  * Uses Gemini 2.0 to extract content (markdown) and optionally convert to code.
@@ -8806,107 +8965,17 @@ async function normalizeImageInput(img) {
 app.post("/image-reading", async (c) => {
 	try {
 		const body = await c.req.json().catch(() => ({}));
-		const { images = [], convertToCode = false, extractContent = true } = body;
-
-		if (!Array.isArray(images) || images.length === 0) {
+		const out = await runImageReadingService(body);
+		if (!out.success) {
 			return c.json(
-				{
-					success: false,
-					error: "images array is required and must not be empty",
-				},
-				400,
+				{ success: false, error: out.error },
+				out.status || 400,
 			);
 		}
-
-		const normalized = [];
-		for (let i = 0; i < images.length; i++) {
-			try {
-				const n = await normalizeImageInput(images[i]);
-				if (n) normalized.push(n);
-			} catch (e) {
-				console.warn("[image-reading] Skip image", i, e?.message);
-			}
-		}
-		if (normalized.length === 0) {
-			return c.json(
-				{
-					success: false,
-					error: "No valid image could be loaded from images array",
-				},
-				400,
-			);
-		}
-
-		const results = [];
-		const markdownParts = [];
-
-		for (let idx = 0; idx < normalized.length; idx++) {
-			const { base64, mimeType } = normalized[idx];
-			const result = { index: idx, content: null, code: null };
-
-			if (extractContent) {
-				try {
-					const contentRes = await genai.models.generateContent({
-						model: "gemini-2.0-flash",
-						contents: [
-							{
-								role: "user",
-								parts: [
-									{
-										text: "Extract and describe all text and meaningful content from this image. Return only markdown: headings, paragraphs, lists, and any text you see. No preamble or explanation.",
-									},
-									{ inlineData: { mimeType, data: base64 } },
-								],
-							},
-						],
-					});
-					const text =
-						contentRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
-						"";
-					result.content = text || "(No text extracted)";
-					markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
-				} catch (e) {
-					console.warn("[image-reading] Extract content failed:", e?.message);
-					result.content = "(Content extraction failed)";
-					markdownParts.push(`--- Image ${idx + 1} ---\n\n${result.content}`);
-				}
-			}
-
-			if (convertToCode) {
-				try {
-					const codeRes = await genai.models.generateContent({
-						model: "gemini-2.0-flash",
-						contents: [
-							{
-								role: "user",
-								parts: [
-									{
-										text: "Convert this image (screenshot, mockup, or UI) into clean HTML and CSS code. Output only a single HTML document with embedded <style>. No explanations.",
-									},
-									{ inlineData: { mimeType, data: base64 } },
-								],
-							},
-						],
-					});
-					let code =
-						codeRes?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-					const fence = code.match(/```(?:html)?\s*\n?([\s\S]*?)\n?```/);
-					if (fence && fence[1]) code = fence[1].trim();
-					result.code = code || null;
-				} catch (e) {
-					console.warn("[image-reading] Convert to code failed:", e?.message);
-				}
-			}
-
-			results.push(result);
-		}
-
-		const markdown = markdownParts.join("\n\n");
-
 		return c.json({
 			success: true,
-			results,
-			markdown: markdown || "(No content extracted)",
+			results: out.results,
+			markdown: out.markdown,
 		});
 	} catch (err) {
 		console.error("❌ image-reading error:", err);
@@ -10569,39 +10638,187 @@ app.post("/agent-screenshot-multiple", async (c) => {
 
 // ─── /api/codegen — URL → React / Tailwind HTML streamed codegen ─────────────
 //
-// POST /api/codegen?format=react|html&model=<openrouter-model-id>
-// Body: { url: string, prompt?: string, context?: string }
+// POST /api/codegen?format=react|html&model=<openrouter-model-id>&outputType=reproduce|landing|app|page|mobile
+// Body: { url?: string, prompt?: string, context?: string, outputType?: string, format?: "react"|"html" }
+// `format` is read from the query string first, then from JSON body (use body if your client strips query params on POST).
 //
-// Scrapes the given URL, then streams generated code back as SSE:
+// outputType:
+//   reproduce (default) — clone a page; requires `url`
+//   landing — full marketing landing (navbar, hero, logos, features, how-it-works, pricing, FAQ, footer + social)
+//   app — single app shell: sidebar + main; React: lucide-react + framer-motion + Tailwind
+//   page — lighter marketing page (hero + sections + CTA + footer)
+//   mobile — mobile-first app/marketing UI (touch targets, sm/md breakpoints)
+// For non-reproduce: provide `prompt` (≥10 chars) and/or `url` for optional reference scrape.
+//
+// Scrapes URL when present, then streams generated code as SSE:
 //   data: {"delta":"..."}   — incremental chunk
 //   data: [DONE]            — stream finished
 //   data: {"error":"..."}   — on failure
 
-const CODEGEN_SYSTEM_PROMPT = `You are an expert frontend engineer specialising in pixel-accurate UI reproduction.
+const CODEGEN_LIGHT_THEME_RULE = `Theme: ALWAYS use a light, modern UI — white or soft gray backgrounds (bg-white, bg-slate-50), dark readable text (text-slate-900), subtle borders (border-slate-200), restrained accent colours. Do NOT ship dark mode or black page backgrounds unless the user explicitly demands it.`;
+
+/** Prepended so the model cannot mix formats (HTML requests were returning JSX). */
+const CODEGEN_CRITICAL_HTML = `CRITICAL OUTPUT FORMAT — HTML ONLY:
+- Your ENTIRE response must be ONE complete HTML5 document. First line MUST be <!DOCTYPE html> (or start with <html).
+- Put <script src="https://cdn.tailwindcss.com"></script> in <head> before </head>.
+- FORBIDDEN: React, JSX, TypeScript, import/export, export default, function components, lucide-react, framer-motion, \`use client\`, or .tsx syntax.
+- Use semantic HTML, Tailwind utility classes only, and inline SVG for icons (or Unicode symbols). Use <details>/<summary> or minimal inline <script> for interactivity if needed.
+
+`;
+
+const CODEGEN_CRITICAL_REACT = `CRITICAL OUTPUT FORMAT — REACT / JSX ONLY:
+- Your ENTIRE response must be ONE file: a default-exported React functional component (JSX).
+- FORBIDDEN: <!DOCTYPE html>, a full HTML document as the only output, or raw HTML pages without JSX/React.
+- Use Tailwind utility classes. You may import from "lucide-react" and "framer-motion" when the task allows.
+
+`;
+
+const CODEGEN_REPRODUCE_PROMPT_REACT = `You are an expert frontend engineer specialising in pixel-accurate UI reproduction.
 You are given rich data about a reference web page: its title, structured headings, paragraphs,
 list items, images, OG/meta tags, CSS colour palette, font families, CSS custom properties,
 and the full set of CSS/Tailwind class names used on the page.
-Your job is to reproduce that page's UI as clean, production-ready code.
+Your job is to reproduce that page's UI as clean, production-ready React code.
+
+${CODEGEN_LIGHT_THEME_RULE}
+When the reference is light, match it. If the reference is dark, still prefer reproducing as a light-themed equivalent unless that would misrepresent the brand — then match the reference.
 
 Rules:
 - Output ONLY the raw code — no markdown fences, no explanations, no comments.
-- For "react" format: return a single default-exported React functional component.
-  • Use Tailwind CSS utility classes for all styling — no inline styles, no separate CSS files.
-  • Import React at the top. The component must be self-contained and renderable.
-  • Use the exact colours from the "Colour palette" section (convert hex/rgb to the nearest
-    Tailwind colour or add them as arbitrary values, e.g. bg-[#1a1a2e]).
-  • Use the font families listed; load them from Google Fonts via a <style> tag if needed
-    (wrap in a React Fragment or use a dangerouslySetInnerHTML trick at the top of the component).
-- For "html" format: return a complete HTML document with Tailwind CDN included
-  via <script src="https://cdn.tailwindcss.com"></script>.
-  All styling must use Tailwind utility classes only.
-- Layout & structure:
-  • Reproduce every major section visible in the headings/content data.
-  • Use the image src URLs provided — do not make up or substitute image URLs.
-  • Match the colour palette, spacing rhythm, and typography hierarchy as closely as possible.
-  • If Tailwind class names are provided, reuse them where they make semantic sense.
+- Return a single default-exported React functional component.
+- Use Tailwind CSS utility classes for all styling — no inline styles, no separate CSS files.
+- Import React at the top. The component must be self-contained and renderable.
+- Use the exact colours from the "Colour palette" section (convert hex/rgb to the nearest Tailwind colour or arbitrary values).
+- Use the font families listed; load from Google Fonts via a <style> tag in the component if needed.
+- Reproduce every major section visible in the headings/content data.
+- Use the image src URLs provided — do not make up or substitute image URLs.
+- Match the colour palette, spacing rhythm, and typography hierarchy as closely as possible.
 - Do NOT include placeholder lorem-ipsum text — use the actual content from the page data.
 - Do NOT output anything except the code itself.`;
+
+const CODEGEN_REPRODUCE_PROMPT_HTML = `You are an expert frontend engineer specialising in pixel-accurate UI reproduction.
+You are given rich data about a reference web page: its title, structured headings, paragraphs,
+list items, images, OG/meta tags, CSS colour palette, font families, CSS custom properties,
+and the full set of CSS/Tailwind class names used on the page.
+Your job is to reproduce that page's UI as one complete HTML document with Tailwind CDN.
+
+${CODEGEN_LIGHT_THEME_RULE}
+When the reference is light, match it. If the reference is dark, still prefer a light-themed equivalent unless that would misrepresent the brand.
+
+Rules:
+- Output ONLY the raw code — no markdown fences, no explanations, no comments.
+- Return a complete HTML document with <script src="https://cdn.tailwindcss.com"></script> in <head>.
+- All styling must use Tailwind utility classes only.
+- Reproduce every major section visible in the headings/content data.
+- Use the image src URLs provided — do not make up or substitute image URLs.
+- Match the colour palette, spacing rhythm, and typography hierarchy as closely as possible.
+- Do NOT include placeholder lorem-ipsum text — use the actual content from the page data.
+- Do NOT output anything except the code itself.`;
+
+const CODEGEN_FORMAT_RULES = (format) =>
+	format === "react"
+		? `- Return ONE default-exported React functional component only.
+- Tailwind CSS for all styling (no inline styles, no extra CSS files).
+- import React from "react" if needed.`
+		: `- Return ONE complete HTML document with <script src="https://cdn.tailwindcss.com"></script>.
+- Tailwind utility classes only for styling.`;
+
+function buildCodegenSystemPrompt(format, outputType) {
+	const isHtml = format === "html";
+	const critical = isHtml ? CODEGEN_CRITICAL_HTML : CODEGEN_CRITICAL_REACT;
+	const fmt = CODEGEN_FORMAT_RULES(format);
+
+	if (outputType === "reproduce") {
+		return (
+			critical +
+			(isHtml ? CODEGEN_REPRODUCE_PROMPT_HTML : CODEGEN_REPRODUCE_PROMPT_REACT)
+		);
+	}
+	if (outputType === "landing") {
+		const stack = isHtml
+			? `Stack: HTML + Tailwind CDN only. Icons: inline SVG or simple shapes. Motion: CSS transitions or @keyframes in a single <style> block if needed.`
+			: `Stack: React + Tailwind. Icons: import from "lucide-react". Motion: import from "framer-motion" for subtle section animations.`;
+		return `${critical}You are an expert frontend engineer building modern marketing landing pages.
+
+${CODEGEN_LIGHT_THEME_RULE}
+
+Output type: FULL LANDING PAGE (not a pixel clone). Build a polished, conversion-focused page using the user's instructions and any scraped reference below.
+
+Required sections (use real-sounding copy grounded in the prompt/scrape; avoid lorem ipsum):
+1. Sticky navbar — logo area, primary nav links, CTA button
+2. Hero — headline, subheadline, primary + optional secondary CTA, optional hero visual area
+3. Social proof — "Trusted by" / logos strip or testimonial strip
+4. Features — responsive grid or bento of feature cards with icons
+5. How it works — 3–4 clear steps
+6. Pricing — at least two tiers or a simple comparison
+7. FAQ — accordion (details/summary or simple toggles)
+8. Footer — sitemap-style links, legal placeholders, social icons
+
+${fmt}
+${stack}
+
+Rules:
+- Output ONLY raw code — no markdown fences, no explanations, no comments before/after the code.
+- Do NOT output anything except the code itself.`;
+	}
+	if (outputType === "app") {
+		const stack = isHtml
+			? `Stack: ONE .html file — semantic HTML, Tailwind CDN, inline SVG icons, CSS transitions for motion. Build sidebar + main layout with flex/grid. No React, no npm imports.`
+			: `Stack: React + Tailwind. MUST import icons from "lucide-react". MUST import "framer-motion" for subtle motion (layout, stagger, panel transitions). One default-exported component.`;
+		return `${critical}You are an expert frontend engineer building a single-screen app UI (dashboard / SaaS product shell).
+
+${CODEGEN_LIGHT_THEME_RULE}
+
+Output type: APP SHELL — one cohesive screen with:
+- A sidebar (fixed or collapsible) with navigation items and optional user/org footer area
+- Main column: top bar (title, actions) + scrollable content area
+- Use clear visual hierarchy and spacing suitable for a real product
+
+${fmt}
+${stack}
+
+Rules:
+- Output ONLY raw code — no markdown fences, no explanations.
+- Do NOT output anything except the code itself.`;
+	}
+	if (outputType === "page") {
+		const stack = isHtml
+			? `Stack: HTML + Tailwind CDN. Inline SVG icons. No React.`
+			: `Stack: React + Tailwind. Optional lucide-react and framer-motion.`;
+		return `${critical}You are an expert frontend engineer building a marketing or content page (lighter than a full landing).
+
+${CODEGEN_LIGHT_THEME_RULE}
+
+Output type: MARKETING PAGE — include hero, 2–3 supporting sections, strong CTA block, and a compact footer. Fewer sections than a full landing; still professional.
+
+${fmt}
+${stack}
+
+Rules:
+- Output ONLY raw code — no markdown fences, no explanations.
+- Do NOT output anything except the code itself.`;
+	}
+	if (outputType === "mobile") {
+		const stack = isHtml
+			? `Stack: HTML + Tailwind CDN, mobile-first responsive classes (sm:, md:). Touch-friendly spacing. No React.`
+			: `Stack: React + Tailwind + lucide-react + framer-motion; mobile-first breakpoints.`;
+		return `${critical}You are an expert frontend engineer building a mobile-first UI (app or marketing).
+
+${CODEGEN_LIGHT_THEME_RULE}
+
+Output type: MOBILE-FIRST — prioritize max-w-md / sm breakpoints, large tap targets, readable type, bottom navigation OR slide-over menu pattern where appropriate.
+
+${fmt}
+${stack}
+
+Rules:
+- Output ONLY raw code — no markdown fences, no explanations.
+- Do NOT output anything except the code itself.`;
+	}
+	return (
+		critical +
+		(isHtml ? CODEGEN_REPRODUCE_PROMPT_HTML : CODEGEN_REPRODUCE_PROMPT_REACT)
+	);
+}
 
 app.post("/api/codegen", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
@@ -10652,14 +10869,6 @@ app.post("/api/codegen", async (c) => {
 	c.header("X-RateLimit-Remaining", String(rl.remaining));
 	c.header("X-RateLimit-Window", "10 minutes");
 
-	// ── Validate query params ─────────────────────────────────────────────────
-	const format = (c.req.query("format") || "react").toLowerCase();
-	const modelOverride = c.req.query("model") || "";
-
-	if (format !== "react" && format !== "html") {
-		return c.json({ error: 'format must be "react" or "html"' }, 400);
-	}
-
 	let body;
 	try {
 		body = await c.req.json();
@@ -10667,10 +10876,70 @@ app.post("/api/codegen", async (c) => {
 		return c.json({ error: "Invalid JSON body" }, 400);
 	}
 
-	const { url, prompt: extraPrompt = "", context = "" } = body;
+	// format: query string wins, then JSON body (clients often send format in body only)
+	const formatRaw =
+		c.req.query("format") ||
+		(typeof body?.format === "string" ? body.format : "") ||
+		"react";
+	const format = String(formatRaw).toLowerCase().trim();
+	const modelOverride = c.req.query("model") || "";
 
-	if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
-		return c.json({ error: "A valid `url` field is required" }, 400);
+	if (format !== "react" && format !== "html") {
+		return c.json({ error: 'format must be "react" or "html"' }, 400);
+	}
+
+	const {
+		url: bodyUrl,
+		prompt: extraPrompt = "",
+		context = "",
+		outputType: bodyOutputType,
+	} = body;
+
+	const outputTypeRaw =
+		c.req.query("outputType") || bodyOutputType || "reproduce";
+	const outputType = String(outputTypeRaw).toLowerCase().trim();
+	const VALID_CODEGEN_OUTPUT_TYPES = new Set([
+		"reproduce",
+		"landing",
+		"app",
+		"page",
+		"mobile",
+	]);
+	if (!VALID_CODEGEN_OUTPUT_TYPES.has(outputType)) {
+		return c.json(
+			{
+				error: "Invalid outputType",
+				allowed: [...VALID_CODEGEN_OUTPUT_TYPES],
+				details:
+					"Use reproduce (default, needs url), or landing | app | page | mobile (prompt-led; url optional).",
+			},
+			400,
+		);
+	}
+
+	const url =
+		typeof bodyUrl === "string" && bodyUrl.trim() ? bodyUrl.trim() : "";
+	const promptLen = String(extraPrompt).trim().length;
+
+	if (outputType === "reproduce") {
+		if (!url || !/^https?:\/\//i.test(url)) {
+			return c.json(
+				{
+					error: "A valid `url` (https://...) is required when outputType is reproduce",
+				},
+				400,
+			);
+		}
+	} else if (!url && promptLen < 10) {
+		return c.json(
+			{
+				error:
+					"For outputType landing | app | page | mobile, provide a `prompt` with at least 10 characters and/or a valid `url` for optional reference scraping",
+			},
+			400,
+		);
+	} else if (url && !/^https?:\/\//i.test(url)) {
+		return c.json({ error: "Invalid `url` — must start with http:// or https://" }, 400);
 	}
 
 	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
@@ -10685,30 +10954,31 @@ app.post("/api/codegen", async (c) => {
 		);
 	}
 
-	// ── 1. Scrape the URL — Puppeteer for rich content + raw fetch for CSS ──────
+	// ── 1. Scrape the URL (optional for outputType !== reproduce) ───────────────
 	let scrapeData = null;
 	let scrapeMarkdown = "";
 	let cssHints = "";
 
-	// 1a. Puppeteer scrape — semantic content, metadata, images, headings
-	try {
-		const scrapeResult = await scrapeSingleUrlWithPuppeteer(url, {
-			includeSemanticContent: true,
-			extractMetadata: true,
-			includeImages: true,
-			includeLinks: false,
-			timeout: 30_000,
-		});
-		scrapeData   = scrapeResult.data   ?? null;
-		scrapeMarkdown = scrapeResult.markdown ?? "";
-	} catch (scrapeErr) {
-		console.warn("[codegen] puppeteer scrape failed:", scrapeErr?.message);
-	}
+	if (url) {
+		// 1a. Puppeteer scrape — semantic content, metadata, images, headings
+		try {
+			const scrapeResult = await scrapeSingleUrlWithPuppeteer(url, {
+				includeSemanticContent: true,
+				extractMetadata: true,
+				includeImages: true,
+				includeLinks: false,
+				timeout: 30_000,
+			});
+			scrapeData = scrapeResult.data ?? null;
+			scrapeMarkdown = scrapeResult.markdown ?? "";
+		} catch (scrapeErr) {
+			console.warn("[codegen] puppeteer scrape failed:", scrapeErr?.message);
+		}
 
-	// 1b. Raw HTML fetch — extract inline styles, <style> blocks, CSS variables,
-	//     Tailwind/utility class names, and computed colour/font hints.
-	try {
-		const rawRes = await fetch(url, {
+		// 1b. Raw HTML fetch — extract inline styles, <style> blocks, CSS variables,
+		//     Tailwind/utility class names, and computed colour/font hints.
+		try {
+			const rawRes = await fetch(url, {
 			headers: {
 				"User-Agent":
 					"Mozilla/5.0 (compatible; CodegenBot/1.0; +https://ihatereading.in)",
@@ -10773,8 +11043,9 @@ app.post("/api/codegen", async (c) => {
 				.filter(Boolean)
 				.join("\n\n");
 		}
-	} catch (cssErr) {
-		console.warn("[codegen] CSS fetch failed:", cssErr?.message);
+		} catch (cssErr) {
+			console.warn("[codegen] CSS fetch failed:", cssErr?.message);
+		}
 	}
 
 	// ── 2. Build the user prompt ───────────────────────────────────────────────
@@ -10812,27 +11083,44 @@ app.post("/api/codegen", async (c) => {
 
 	const pageContext = [
 		scrapeData?.title && `Page title: ${scrapeData.title}`,
-		`URL: ${url}`,
-		metadata          && `## Metadata (OG / Twitter / meta)\n${metadata}`,
-		headings          && `## Headings\n${headings}`,
-		paragraphs        && `## Paragraphs\n${paragraphs}`,
-		listItems         && `## List items\n${listItems}`,
-		images            && `## Images\n${images}`,
-		scrapeMarkdown    && `## Full page markdown\n${scrapeMarkdown.slice(0, 6_000)}`,
-		cssHints          && `## CSS / Design tokens\n${cssHints}`,
+		url && `URL: ${url}`,
+		metadata && `## Metadata (OG / Twitter / meta)\n${metadata}`,
+		headings && `## Headings\n${headings}`,
+		paragraphs && `## Paragraphs\n${paragraphs}`,
+		listItems && `## List items\n${listItems}`,
+		images && `## Images\n${images}`,
+		scrapeMarkdown && `## Full page markdown\n${scrapeMarkdown.slice(0, 6_000)}`,
+		cssHints && `## CSS / Design tokens\n${cssHints}`,
 	]
 		.filter(Boolean)
 		.join("\n\n");
 
+	const fmtLabel =
+		format === "react"
+			? "a React + Tailwind CSS component"
+			: "a complete Tailwind CSS HTML page";
+	const taskLine =
+		outputType === "reproduce"
+			? `Reproduce the UI of the following web page as ${fmtLabel}.`
+			: `Generate a ${outputType} experience as ${fmtLabel}. Obey the system prompt section list and stack requirements.`;
+	const guideLine =
+		outputType === "reproduce"
+			? `Use ALL the information below — headings, content, images, colours, fonts, and class names — to make the reproduction as accurate as possible.`
+			: `Ground layout and copy in the user prompt and any scraped reference below. Use coherent, professional copy (no lorem ipsum).`;
+
 	const userMessage = [
-		`Reproduce the UI of the following web page as ${format === "react" ? "a React + Tailwind CSS component" : "a complete Tailwind CSS HTML page"}.`,
-		`Use ALL the information below — headings, content, images, colours, fonts, and class names — to make the reproduction as accurate as possible.`,
-		pageContext || `URL: ${url}`,
+		taskLine,
+		guideLine,
+		format === "html" &&
+			`Reminder: respond with HTML only — <!DOCTYPE html>, Tailwind CDN in <head>, no React/JSX.`,
+		pageContext || null,
 		extraPrompt && `Additional instructions: ${extraPrompt}`,
-		context     && `Extra context: ${context}`,
+		context && `Extra context: ${context}`,
 	]
 		.filter(Boolean)
 		.join("\n\n");
+
+	const systemPrompt = buildCodegenSystemPrompt(format, outputType);
 
 	const model =
 		modelOverride ||
@@ -10856,10 +11144,10 @@ app.post("/api/codegen", async (c) => {
 					model,
 					stream: true,
 					messages: [
-						{ role: "system", content: CODEGEN_SYSTEM_PROMPT },
+						{ role: "system", content: systemPrompt },
 						{ role: "user", content: userMessage },
 					],
-					temperature: 0.2,
+					temperature: outputType === "reproduce" ? 0.2 : 0.35,
 				}),
 			},
 		);
@@ -10962,6 +11250,8 @@ app.post("/api/codegen", async (c) => {
 			"Cache-Control": "no-cache",
 			Connection: "keep-alive",
 			"X-Accel-Buffering": "no",
+			"X-Codegen-Output-Type": outputType,
+			"X-Codegen-Format": format,
 		},
 	});
 });
@@ -10977,19 +11267,33 @@ const ASSET_SKILL_MAP = {
 	linkedin:     "linkedin",
 	twitter:      "twitter",
 	substack:     "substack",
+	scrape:       "scrape",
 	infographics: "infographics-svg-generator",
 	table:        "table",
+	landing:      "landing-page-generator",
+	"landing-page": "landing-page-generator",
+	gallery:      "image-gallery-creator",
+	"image-gallery": "image-gallery-creator",
 };
 
 /**
  * Scrape a list of URLs, then run the requested SKILL against the scraped sources.
  * Returns the parsed result object (content string or structured JSON depending on skill).
  */
-async function runSkillAsset(skillType, { urls = [], prompt = "", format = "substack", style = "casual" } = {}) {
+function clampGalleryMaxImages(n) {
+	const x = Number(n);
+	if (!Number.isFinite(x)) return 6;
+	return Math.min(10, Math.max(1, Math.floor(x)));
+}
+
+async function runSkillAsset(skillType, { urls = [], prompt = "", format = "substack", style = "casual", maxImages: maxImagesRaw } = {}) {
 	const skill = SKILLS[skillType];
 	if (!skill || skill.maxTokens <= 1) {
 		throw new Error(`"${skillType}" is not a content-generation skill`);
 	}
+
+	const maxImages =
+		skillType === "image-gallery-creator" ? clampGalleryMaxImages(maxImagesRaw) : undefined;
 
 	// Scrape each URL in parallel; silently drop failures
 	const sources = [];
@@ -11008,17 +11312,28 @@ async function runSkillAsset(skillType, { urls = [], prompt = "", format = "subs
 					markdown: r.markdown || "",
 					title:    r.data?.title || "",
 					links:    r.data?.links  || [],
+					images:   r.data?.images || [],
 				};
 			}),
 		);
 		for (const r of settled) {
-			if (r.status === "fulfilled" && r.value.markdown) sources.push(r.value);
+			if (r.status !== "fulfilled") continue;
+			const v = r.value;
+			const hasText = Boolean(v.markdown && String(v.markdown).trim());
+			const hasImgs = Array.isArray(v.images) && v.images.length > 0;
+			if (hasText || hasImgs) sources.push(v);
 		}
 	}
 
-	const system  = skill.buildSystemPrompt(format, style, sources.length > 0);
-	const user    = skill.buildUserContent(String(prompt).trim(), sources);
-	const isJson  = skillType === "infographics-svg-generator" || skillType === "table";
+	const skillOpts = skillType === "image-gallery-creator" ? { maxImages } : {};
+	const system  = skill.buildSystemPrompt(format, style, sources.length > 0, skillOpts);
+	const user    = skill.buildUserContent(String(prompt).trim(), sources, skillOpts);
+	const fmt = String(format || "").trim().toLowerCase();
+	const isJson =
+		skillType === "infographics-svg-generator" ||
+		skillType === "image-gallery-creator" ||
+		skillType === "table" ||
+		(skillType === "scrape" && fmt === "json");
 	const maxOut  = Math.min(skill.maxTokens, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
 
 	const { content } = await openRouterChatMessages(
@@ -11028,7 +11343,14 @@ async function runSkillAsset(skillType, { urls = [], prompt = "", format = "subs
 		isJson ? { response_format: { type: "json_object" } } : {},
 	);
 
-	if (skill.parseResponse) return skill.parseResponse(content);
+	if (skill.parseResponse) {
+		const parsed = skill.parseResponse(content);
+		if (skillType === "image-gallery-creator" && parsed && Array.isArray(parsed.images)) {
+			parsed.images = parsed.images.slice(0, maxImages);
+			parsed.maxImages = maxImages;
+		}
+		return parsed;
+	}
 
 	// Table: try to parse as JSON, fall back to raw string
 	if (skillType === "table") {
@@ -11040,15 +11362,28 @@ async function runSkillAsset(skillType, { urls = [], prompt = "", format = "subs
 		}
 	}
 
+	// Scrape + JSON: return parsed value (json_object mode returns a JSON string)
+	if (skillType === "scrape" && fmt === "json") {
+		try {
+			const raw = String(content || "").trim().replace(/```json|```/gi, "").trim();
+			return { content: JSON.parse(raw) };
+		} catch {
+			return { content: content.trim() };
+		}
+	}
+
 	return { content: content.trim() };
 }
 
 // ─── POST /generate/:type ─────────────────────────────────────────────────────
 // Supported :type values (see ASSET_SKILL_MAP):
-//   blog | article | email | newsletter | linkedin | twitter | substack | infographics | table
+//   blog | article | email | newsletter | linkedin | twitter | substack | scrape | infographics | table |
+//   landing | landing-page | gallery | image-gallery |
+//   image-reading | images — body: { images: [...] } (Gemini vision; same as POST /image-reading)
 //
-// Request body: { urls?: string[], prompt?: string, format?: string, style?: string }
-// Response: { success, type, skillType, urls, content|infographics|columns/rows, timestamp }
+// Request body: { urls?: string[], prompt?: string, format?: string, style?: string, maxImages?: number (1–10, gallery only) }
+//   scrape: format defaults to "markdown"; use markdown | html | plain | text | json (output shape follows format)
+// Response: { success, type, skillType, urls, content|infographics|columns/rows|images|markdown, timestamp }
 app.post("/generate/:type", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
 	const genAuthHdr   = c.req.header("Authorization") || c.req.header("authorization");
@@ -11084,12 +11419,40 @@ app.post("/generate/:type", async (c) => {
 	c.header("X-RateLimit-Remaining", String(genRl.remaining));
 	c.header("X-RateLimit-Window",    "10 minutes");
 
-	// ── Resolve skill type ────────────────────────────────────────────────────
-	const typeName  = c.req.param("type").toLowerCase();
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	const typeName = c.req.param("type").toLowerCase();
+
+	// image-reading uses Gemini vision, not OpenRouter (same pipeline as POST /image-reading)
+	if (typeName === "image-reading" || typeName === "images") {
+		const out = await runImageReadingService(body);
+		if (!out.success) {
+			return c.json(
+				{ success: false, error: out.error },
+				out.status || 400,
+			);
+		}
+		return c.json({
+			success: true,
+			type: typeName,
+			skillType: "image-reading",
+			results: out.results,
+			markdown: out.markdown,
+			timestamp: new Date().toISOString(),
+		});
+	}
+
 	const skillType = ASSET_SKILL_MAP[typeName];
 	if (!skillType) {
 		return c.json(
-			{ error: `Unknown type "${typeName}". Supported: ${Object.keys(ASSET_SKILL_MAP).join(", ")}` },
+			{
+				error: `Unknown type "${typeName}". Supported: image-reading, images, ${Object.keys(ASSET_SKILL_MAP).join(", ")}`,
+			},
 			400,
 		);
 	}
@@ -11098,17 +11461,19 @@ app.post("/generate/:type", async (c) => {
 		return c.json({ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" }, 503);
 	}
 
-	let body;
-	try { body = await c.req.json(); } catch {
-		return c.json({ error: "Invalid JSON body" }, 400);
-	}
-
 	const {
-		urls    = [],
-		prompt  = "",
-		format  = "substack",
-		style   = "casual",
+		urls = [],
+		prompt = "",
+		format: formatRaw,
+		style = "casual",
+		maxImages: maxImagesBody,
 	} = body;
+	const format =
+		formatRaw != null && String(formatRaw).trim() !== ""
+			? formatRaw
+			: typeName === "scrape"
+				? "markdown"
+				: "substack";
 
 	const urlList = (Array.isArray(urls) ? urls : [urls])
 		.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
@@ -11118,7 +11483,13 @@ app.post("/generate/:type", async (c) => {
 	}
 
 	try {
-		const result = await runSkillAsset(skillType, { urls: urlList, prompt, format, style });
+		const result = await runSkillAsset(skillType, {
+			urls: urlList,
+			prompt,
+			format,
+			style,
+			maxImages: maxImagesBody,
+		});
 		return c.json({
 			success:   true,
 			type:      typeName,
@@ -11132,6 +11503,7 @@ app.post("/generate/:type", async (c) => {
 		return c.json({ success: false, error: err?.message || "Generation failed" }, 500);
 	}
 });
+
 
 // ─── /ai-resume-builder — LinkedIn + GitHub + projects → streamed resume code ──
 //
