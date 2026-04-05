@@ -4299,6 +4299,44 @@ const scrapHtml = async (url) => {
 };
 
 /**
+ * G2 pages are React SPAs; networkidle can settle on the empty shell before
+ * listings hydrate. Cookie banners also block innerText. Scroll + consent + wait for product links.
+ */
+async function runG2PostLoadActions(page) {
+	const consentSelectors = [
+		"#onetrust-accept-btn-handler",
+		"button#onetrust-accept-btn-handler",
+		"[aria-label='Accept All Cookies']",
+		"button[aria-label*='Accept All']",
+		"button[aria-label*='Accept']",
+		".osano-cm-accept-all",
+		"button[data-testid='cookie-accept']",
+	];
+	for (const sel of consentSelectors) {
+		try {
+			const el = await page.$(sel);
+			if (el) {
+				await el.click({ delay: 40 });
+				await new Promise((r) => setTimeout(r, 700));
+				break;
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+	await page.evaluate(async () => {
+		const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+		await sleep(400);
+		for (let i = 0; i < 5; i++) {
+			window.scrollBy(0, Math.min(1000, window.innerHeight * 0.9));
+			await sleep(450);
+		}
+		window.scrollTo(0, document.body.scrollHeight);
+		await sleep(1200);
+	});
+}
+
+/**
  * Core scraping logic for a single URL. Returns result object or throws.
  * Used by both /scrape and /scrap-urls-puppeteer.
  */
@@ -4420,8 +4458,18 @@ async function scrapeSingleUrlWithPuppeteer(
 					stylesheets: 0,
 					media: 0,
 				};
+				const isG2Host =
+					/\bg2\.com\b/i.test(targetUrl) ||
+					/\bg2crowd\.com\b/i.test(targetUrl);
+
 				await page.setRequestInterception(true);
 				page.on("request", (request) => {
+					// G2 (and similar SPAs) need real CSS/JS/CDN — empty stylesheets leave UI
+					// display:none / invisible, so markdown + innerText stay empty.
+					if (isG2Host) {
+						request.continue();
+						return;
+					}
 					const resourceType = request.resourceType();
 					const reqUrl = request.url().toLowerCase();
 					if (
@@ -4523,7 +4571,60 @@ async function scrapeSingleUrlWithPuppeteer(
 					};
 				}
 
-				await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout });
+				if (isG2Host) {
+					const g2NavTimeout = Math.min(
+						Math.max(Math.max(timeout, 55_000), 45_000),
+						120_000,
+					);
+					await page.goto(targetUrl, {
+						waitUntil: "load",
+						timeout: g2NavTimeout,
+					});
+					await new Promise((r) => setTimeout(r, 1500));
+					await runG2PostLoadActions(page);
+					try {
+						await page.waitForFunction(
+							() => {
+								function countG2ProductAnchors(node) {
+									if (!node) return 0;
+									let n = 0;
+									if (node.nodeType === 1 && node.shadowRoot) {
+										n += countG2ProductAnchors(node.shadowRoot);
+									}
+									if (node.nodeType === 1) {
+										if (
+											node.tagName === "A" &&
+											node.href &&
+											node.href.includes("/products/")
+										) {
+											n += 1;
+										}
+										for (const c of node.children) {
+											n += countG2ProductAnchors(c);
+										}
+									} else if (node.nodeType === 11) {
+										for (const c of node.children) {
+											n += countG2ProductAnchors(c);
+										}
+									}
+									return n;
+								}
+								const n = countG2ProductAnchors(document.body);
+								const title = (document.title || "").trim();
+								const titleOk =
+									title.length > 8 && !/^g2\.com$/i.test(title);
+								return n >= 2 || titleOk;
+							},
+							{ timeout: 35_000, polling: 500 },
+						);
+					} catch {
+						/* keep shell; fallbacks below may still recover text */
+					}
+					await runG2PostLoadActions(page);
+					await new Promise((r) => setTimeout(r, 1500));
+				} else {
+					await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout });
+				}
 				const navLatency = Date.now() - navStart;
 
 				if (waitForSelector) {
@@ -4633,14 +4734,30 @@ async function scrapeSingleUrlWithPuppeteer(
 										title: link.getAttribute("title") || "",
 									}))
 									.filter((link) => {
-										if (!(link?.text?.length > 0 || link?.title?.length > 0))
-											return false;
 										try {
 											if (new URL(link.href).hostname !== seedDomain)
 												return false;
 										} catch {
 											return false;
 										}
+										if (opts.isG2Host && /\/products\//i.test(link.href)) {
+											let label = link.text || link.title;
+											if (!label) {
+												const m = link.href.match(/\/products\/([^/?#]+)/);
+												label = m
+													? decodeURIComponent(
+															m[1].replace(/-/g, " "),
+														)
+													: "Product";
+											}
+											link.text = label;
+											const key = link.href.split("#")[0];
+											if (seen.has(key)) return false;
+											seen.add(key);
+											return true;
+										}
+										if (!(link?.text?.length > 0 || link?.title?.length > 0))
+											return false;
 										const key = `${link.text}|${link.href}|${link.title}`;
 										if (seen.has(key)) return false;
 										seen.add(key);
@@ -4713,6 +4830,7 @@ async function scrapeSingleUrlWithPuppeteer(
 							includeLinks,
 							includeSemanticContent,
 							selectors,
+							isG2Host,
 						},
 					);
 				}
@@ -4769,9 +4887,83 @@ async function scrapeSingleUrlWithPuppeteer(
 				remove.forEach((sel) =>
 					doc.querySelectorAll(sel).forEach((el) => el.remove()),
 				);
-				const { markdown } = extractSemanticContentWithFormattedMarkdown(
+				let { markdown } = extractSemanticContentWithFormattedMarkdown(
 					doc.body,
 				);
+
+				if (
+					isG2Host &&
+					(!markdown || String(markdown).trim().length < 80)
+				) {
+					try {
+						const linkMd = await page.evaluate(() => {
+							const seen = new Set();
+							const lines = [];
+							function walk(node) {
+								if (!node) return;
+								if (node.nodeType === 1 && node.shadowRoot) walk(node.shadowRoot);
+								if (node.nodeType === 1) {
+									if (node.tagName === "A") {
+										const href = (node.href || "").split("#")[0];
+										if (href.includes("/products/")) {
+											let t = (node.textContent || "")
+												.replace(/\s+/g, " ")
+												.trim();
+											if (!t)
+												t = (node.getAttribute("aria-label") || "").trim();
+											if (!t) {
+												const img = node.querySelector("img[alt]");
+												if (img) t = (img.getAttribute("alt") || "").trim();
+											}
+											if (!t) {
+												const m = href.match(/\/products\/([^/?#]+)/);
+												t = m
+													? decodeURIComponent(m[1].replace(/-/g, " "))
+													: "Product";
+											}
+											if (!href || t.length > 400) return;
+											const key = href;
+											if (seen.has(key)) return;
+											seen.add(key);
+											lines.push(`- [${t}](${href})`);
+										}
+									}
+									for (const ch of node.children) walk(ch);
+								} else if (node.nodeType === 11) {
+									for (const ch of node.children) walk(ch);
+								}
+							}
+							walk(document.body);
+							return lines.join("\n");
+						});
+						if (
+							linkMd &&
+							linkMd.length > String(markdown || "").trim().length
+						) {
+							markdown = linkMd;
+						}
+					} catch (e) {
+						console.warn("[scrape] G2 product-link fallback failed:", e?.message);
+					}
+					try {
+						const plain = await page.evaluate(() => {
+							const root =
+								document.querySelector("main") ||
+								document.querySelector('[role="main"]') ||
+								document.querySelector("#content") ||
+								document.body;
+							if (!root) return "";
+							return String(root.innerText || "")
+								.replace(/\n{3,}/g, "\n\n")
+								.trim();
+						});
+						if (plain && plain.length > String(markdown || "").trim().length) {
+							markdown = plain;
+						}
+					} catch (e) {
+						console.warn("[scrape] G2 innerText fallback failed:", e?.message);
+					}
+				}
 
 				let screenshotUrl = null;
 				if (takeScreenshot) {
@@ -11374,6 +11566,489 @@ async function runSkillAsset(skillType, { urls = [], prompt = "", format = "subs
 
 	return { content: content.trim() };
 }
+
+// ─── G2 product search — multi-page scrape + chunked LLM extraction ───────────
+// POST /g2-product-search-research
+// Builds URLs like: https://www.g2.com/search?page=N&query=...&product_id=...
+// Scrapes each page with Puppeteer, splits markdown into LLM-sized chunks, merges & dedupes.
+
+const G2_SEARCH_HOST = "https://www.g2.com";
+const G2_PRODUCT_SEARCH_DEFAULT_PAGES = 5;
+const G2_PRODUCT_SEARCH_MAX_PAGES = 50;
+/** Per-chunk markdown sent to extraction model (leave room for system + instructions). */
+const G2_MARKDOWN_CHUNK_CHARS = Math.min(26000, Math.max(8000, MAX_SUMMARY_INPUT_CHARS - 8000));
+const G2_EXTRACT_MAX_TOKENS = Math.min(8192, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
+
+function buildG2SearchUrl(query, page, productId) {
+	const u = new URL("/search", G2_SEARCH_HOST);
+	u.searchParams.set("query", String(query).trim());
+	u.searchParams.set("page", String(Math.max(1, Math.floor(Number(page)) || 1)));
+	if (productId != null && String(productId).trim() !== "") {
+		u.searchParams.set("product_id", String(productId).trim());
+	}
+	return u.toString();
+}
+
+function sliceMarkdownIntoChunks(markdown, maxChars) {
+	const md = String(markdown || "");
+	if (md.length <= maxChars) return md.trim() ? [md] : [];
+	const chunks = [];
+	let i = 0;
+	while (i < md.length) {
+		let end = Math.min(i + maxChars, md.length);
+		if (end < md.length) {
+			const cut = md.lastIndexOf("\n\n", end);
+			if (cut > i + maxChars * 0.45) end = cut;
+		}
+		const slice = md.slice(i, end).trim();
+		if (slice) chunks.push(slice);
+		i = end;
+	}
+	return chunks.length ? chunks : [md.slice(0, maxChars)];
+}
+
+function g2ProductDedupeKey(p) {
+	const url = String(p?.g2_url || p?.url || "")
+		.trim()
+		.toLowerCase()
+		.replace(/\/$/, "");
+	if (url && /^https?:\/\/(www\.)?g2\.com\//i.test(url)) return `u:${url}`;
+	const name = String(p?.name || "")
+		.trim()
+		.toLowerCase();
+	const vendor = String(p?.vendor || "")
+		.trim()
+		.toLowerCase();
+	if (name) return `n:${vendor}|${name}`;
+	return "";
+}
+
+function mergeG2ProductLists(existing, incoming) {
+	const map = new Map();
+	for (const p of existing) {
+		const k = g2ProductDedupeKey(p);
+		if (k) map.set(k, { ...p, g2_url: p.g2_url || p.url || "" });
+	}
+	for (const p of incoming) {
+		const k = g2ProductDedupeKey(p);
+		if (!k) continue;
+		if (!map.has(k)) {
+			map.set(k, { ...p, g2_url: p.g2_url || p.url || "" });
+		}
+	}
+	return [...map.values()];
+}
+
+/** When markdown is empty, build rows from scrape `data.links` (same host + /products/). */
+function g2NameFromProductUrl(href) {
+	try {
+		const m = String(href).match(/\/products\/([^/?#]+)/);
+		return m ? decodeURIComponent(m[1].replace(/-/g, " ")) : "";
+	} catch {
+		return "";
+	}
+}
+
+function g2ProductsFromScrapeData(data) {
+	const links = data?.links;
+	if (!Array.isArray(links)) return [];
+	const out = [];
+	for (const l of links) {
+		const href = String(l.href || "")
+			.split("#")[0]
+			.trim();
+		if (!/\/products\//i.test(href)) continue;
+		const name =
+			String(l.text || l.title || "").trim() ||
+			g2NameFromProductUrl(href) ||
+			"Product";
+		out.push({
+			name,
+			g2_url: href,
+			vendor: null,
+			rating: null,
+			review_count: null,
+			description: null,
+		});
+	}
+	return out;
+}
+
+async function g2ExtractProductsFromMarkdownChunk(
+	apiKey,
+	{ searchQuery, userPrompt, page, chunkIndex, totalChunks, markdown },
+) {
+	const system = `You extract software product listings from G2.com search results given as markdown/HTML-derived text.
+Return ONLY valid JSON with shape: {"products":[...]}.
+Each product object may include: name (string), vendor (string), g2_url (string, only if a full https://www.g2.com/... URL appears in the text), rating (number|null), review_count (number|null), description (string), category (string), badges (string[]), rank_on_page (number|null).
+Use null for unknown numeric fields. Do not invent URLs or ratings — only what the excerpt supports. If the excerpt has no products, return {"products":[]}.`;
+
+	const user = `Search query: ${JSON.stringify(searchQuery)}
+Research focus: ${userPrompt || "List every product with available details."}
+Results page index: ${page}, text part ${chunkIndex + 1} of ${totalChunks}.
+
+--- scraped text ---
+${markdown}
+--- end ---`;
+
+	const capped = user.slice(0, MAX_SUMMARY_INPUT_CHARS);
+	const { content } = await openRouterChatMessages(
+		apiKey,
+		[
+			{ role: "system", content: system },
+			{ role: "user", content: capped },
+		],
+		G2_EXTRACT_MAX_TOKENS,
+		{ temperature: 0.15, response_format: { type: "json_object" } },
+	);
+	let parsed;
+	try {
+		parsed = JSON.parse(String(content || "").replace(/```json|```/gi, "").trim());
+	} catch {
+		return [];
+	}
+	const arr = parsed?.products;
+	return Array.isArray(arr) ? arr : [];
+}
+
+async function g2SynthesizeResearchBrief(apiKey, products, userPrompt) {
+	const slim = products.map((p) => ({
+		name: p.name,
+		vendor: p.vendor,
+		rating: p.rating,
+		review_count: p.review_count,
+		g2_url: p.g2_url || p.url,
+	}));
+	let payload = JSON.stringify(slim);
+	if (payload.length > 100_000) {
+		payload = payload.slice(0, 100_000) + "…";
+	}
+	const { content } = await openRouterChatMessages(
+		apiKey,
+		[
+			{
+				role: "system",
+				content: `You write a structured G2 market research brief in Markdown from product listing data.
+Sections: ## Executive summary, ## Product landscape, ## Ratings & review volume (high level), ## Notable segments / categories, ## Research notes.
+Be factual; do not invent vendors or scores not present in the data. Keep the brief readable; tables optional.`,
+			},
+			{
+				role: "user",
+				content: `User focus:\n${userPrompt || "General market overview."}\n\nProduct data (JSON):\n${payload}`,
+			},
+		],
+		Math.min(4096, INKGEST_SKILL_MAX_OUTPUT_TOKENS),
+		{ temperature: 0.25 },
+	);
+	return String(content || "").trim();
+}
+
+/**
+ * @param {object} opts
+ * @param {(ev: object) => void} [opts.onEvent]
+ */
+async function runG2ProductSearchResearchPipeline(opts) {
+	const {
+		apiKey,
+		searchQuery,
+		productId,
+		maxPages,
+		userPrompt,
+		useProxy,
+		deepResearch,
+		onEvent,
+	} = opts;
+	const emit = typeof onEvent === "function" ? onEvent : () => {};
+	const pagesMeta = [];
+	let allProducts = [];
+
+	for (let page = 1; page <= maxPages; page++) {
+		const url = buildG2SearchUrl(searchQuery, page, productId);
+		emit({ type: "page_start", page, url });
+		let markdown = "";
+		let g2Structured = [];
+		try {
+			const r = await scrapeSingleUrlWithPuppeteer(url, {
+				includeSemanticContent: true,
+				extractMetadata: true,
+				includeImages: true,
+				includeLinks: true,
+				timeout: 55_000,
+				useProxy: Boolean(useProxy),
+			});
+			markdown = r.markdown || "";
+			g2Structured = g2ProductsFromScrapeData(r.data);
+		} catch (err) {
+			emit({
+				type: "page_scrape_error",
+				page,
+				url,
+				error: err?.message || String(err),
+			});
+			pagesMeta.push({
+				page,
+				url,
+				scraped: false,
+				error: err?.message || String(err),
+				productsOnPage: 0,
+			});
+			continue;
+		}
+
+		const mdLen = markdown.length;
+		emit({
+			type: "page_scraped",
+			page,
+			url,
+			markdownChars: mdLen,
+			structuredFromLinks: g2Structured.length,
+		});
+		const chunks = sliceMarkdownIntoChunks(markdown, G2_MARKDOWN_CHUNK_CHARS);
+		let pageProducts = mergeG2ProductLists([], g2Structured);
+
+		for (let ci = 0; ci < chunks.length; ci++) {
+			emit({
+				type: "chunk_start",
+				page,
+				chunkIndex: ci,
+				totalChunks: chunks.length,
+			});
+			const extracted = await g2ExtractProductsFromMarkdownChunk(apiKey, {
+				searchQuery,
+				userPrompt,
+				page,
+				chunkIndex: ci,
+				totalChunks: chunks.length,
+				markdown: chunks[ci],
+			});
+			pageProducts = mergeG2ProductLists(pageProducts, extracted);
+			emit({
+				type: "chunk_extracted",
+				page,
+				chunkIndex: ci,
+				extractedCount: extracted.length,
+				runningPageTotal: pageProducts.length,
+			});
+		}
+
+		allProducts = mergeG2ProductLists(allProducts, pageProducts);
+		emit({
+			type: "page_complete",
+			page,
+			url,
+			products: pageProducts,
+			pageProductCount: pageProducts.length,
+			cumulativeUniqueCount: allProducts.length,
+		});
+		pagesMeta.push({
+			page,
+			url,
+			scraped: true,
+			markdownChars: mdLen,
+			chunks: chunks.length,
+			productsOnPage: pageProducts.length,
+		});
+	}
+
+	let researchBrief = null;
+	if (deepResearch && allProducts.length > 0) {
+		emit({ type: "synthesis_start", productCount: allProducts.length });
+		researchBrief = await g2SynthesizeResearchBrief(
+			apiKey,
+			allProducts,
+			userPrompt,
+		);
+		emit({
+			type: "synthesis_complete",
+			briefChars: researchBrief?.length ?? 0,
+		});
+	}
+
+	return {
+		success: true,
+		query: searchQuery,
+		productId: productId ?? null,
+		maxPages,
+		pages: pagesMeta,
+		products: allProducts,
+		totalProducts: allProducts.length,
+		researchBrief,
+		timestamp: new Date().toISOString(),
+	};
+}
+
+// POST /g2-product-search-research
+// Body: {
+//   query?: string,           // G2 search string (required if prompt empty)
+//   prompt?: string,        // research angle; also used as query if query omitted
+//   product_id?: string|number, // optional G2 filter (e.g. 23340)
+//   maxPages?: number,       // 1–50, default 5
+//   stream?: boolean,        // SSE: page/chunk events + final
+//   deepResearch?: boolean,  // final Markdown brief from all products
+//   useProxy?: boolean       // pass through to Puppeteer scrape
+// }
+// Auth: Bearer token (same as POST /generate/*). Requires OPENROUTER_API_KEY.
+app.post("/g2-product-search-research", async (c) => {
+	const authHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const authToken = authHdr?.startsWith("Bearer ")
+		? authHdr.slice(7).trim()
+		: authHdr?.trim();
+	if (!authToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
+			401,
+		);
+	}
+
+	const G2_RATE_LIMIT = 15;
+	const G2_RATE_WINDOW_MS = 10 * 60 * 1000;
+	const g2Ip =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const g2Rl = rateLimit(g2Ip, G2_RATE_LIMIT, G2_RATE_WINDOW_MS);
+	if (!g2Rl.allowed) {
+		c.header("Retry-After", String(g2Rl.retryAfter));
+		c.header("X-RateLimit-Limit", String(G2_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window", "10 minutes");
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: g2Rl.retryAfter,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(G2_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(g2Rl.remaining));
+	c.header("X-RateLimit-Window", "10 minutes");
+
+	if (!process.env.OPENROUTER_API_KEY) {
+		return c.json(
+			{ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" },
+			503,
+		);
+	}
+
+	let body = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	const queryRaw = body.query ?? body.q;
+	const promptRaw = body.prompt;
+	const searchQuery = String(
+		(queryRaw != null && String(queryRaw).trim() !== ""
+			? queryRaw
+			: promptRaw) || "",
+	).trim();
+	if (!searchQuery) {
+		return c.json(
+			{ error: "Provide query or prompt with the search terms" },
+			400,
+		);
+	}
+
+	const userPrompt = String(promptRaw || "").trim();
+	const productId = body.product_id ?? body.productId;
+	let maxPages = Number(body.maxPages ?? body.pages);
+	if (!Number.isFinite(maxPages) || maxPages < 1) {
+		maxPages = G2_PRODUCT_SEARCH_DEFAULT_PAGES;
+	}
+	maxPages = Math.min(
+		G2_PRODUCT_SEARCH_MAX_PAGES,
+		Math.max(1, Math.floor(maxPages)),
+	);
+
+	const stream = body.stream === true || body.stream === "true";
+	const deepResearch =
+		body.deepResearch === true || body.deepResearch === "true";
+	const useProxy = body.useProxy === true || body.useProxy === "true";
+
+	if (stream) {
+		const encoder = new TextEncoder();
+		const outputStream = new ReadableStream({
+			async start(controller) {
+				const send = (obj) => {
+					controller.enqueue(
+						encoder.encode(`data: ${JSON.stringify(obj)}\n\n`),
+					);
+				};
+				try {
+					send({
+						type: "start",
+						query: searchQuery,
+						productId: productId ?? null,
+						maxPages,
+						deepResearch,
+						chunkBudgetChars: G2_MARKDOWN_CHUNK_CHARS,
+					});
+					const result = await runG2ProductSearchResearchPipeline({
+						apiKey: process.env.OPENROUTER_API_KEY,
+						searchQuery,
+						productId,
+						maxPages,
+						userPrompt: userPrompt || searchQuery,
+						useProxy,
+						deepResearch,
+						onEvent: (ev) => send(ev),
+					});
+					send({ type: "final", ...result });
+					controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+					controller.close();
+				} catch (err) {
+					try {
+						send({
+							type: "error",
+							error: err?.message || String(err),
+						});
+						controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+					} catch {}
+					controller.close();
+				}
+			},
+		});
+
+		return new Response(outputStream, {
+			status: 200,
+			headers: {
+				"Content-Type": "text/event-stream",
+				"Cache-Control": "no-cache",
+				Connection: "keep-alive",
+				"X-Accel-Buffering": "no",
+			},
+		});
+	}
+
+	try {
+		const result = await runG2ProductSearchResearchPipeline({
+			apiKey: process.env.OPENROUTER_API_KEY,
+			searchQuery,
+			productId,
+			maxPages,
+			userPrompt: userPrompt || searchQuery,
+			useProxy,
+			deepResearch,
+		});
+		return c.json(result);
+	} catch (err) {
+		console.error("[/g2-product-search-research]", err?.message);
+		return c.json(
+			{ success: false, error: err?.message || "G2 research failed" },
+			500,
+		);
+	}
+});
 
 // ─── POST /generate/:type ─────────────────────────────────────────────────────
 // Supported :type values (see ASSET_SKILL_MAP):
