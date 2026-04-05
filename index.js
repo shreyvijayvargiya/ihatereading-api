@@ -17,6 +17,7 @@ import { extractSemanticContentWithFormattedMarkdown } from "./lib/extractSemant
 import {
 	runKeywordAnalysis,
 	runCompetitorAudit,
+	runG2CompetitorDeepResearch,
 } from "./lib/seoApis.js";
 import {
 	parseRepoUrl,
@@ -4217,6 +4218,122 @@ app.post("/seo-competitor-audit", async (c) => {
 		return c.json({ success: true, ...data });
 	} catch (err) {
 		console.error("seo-competitor-audit:", err?.message || err);
+		return c.json(
+			{ success: false, error: err?.message || "Request failed" },
+			400,
+		);
+	}
+});
+
+// POST /seo-g2-competitor-deep-research
+// Body: { url, query?, maxCompetitors?, useAi?, deepScrape?: true, useProxy?: false }
+// SERP + HTML (seoApis) discovers G2 anchor + competitor /products/ URLs, ratings from JSON-LD.
+// When deepScrape is true (default): Puppeteer each page + LLM JSON (problems/strengths) from excerpts.
+app.post("/seo-g2-competitor-deep-research", async (c) => {
+	try {
+		const body = await c.req.json();
+		const deepScrape = body.deepScrape !== false;
+		const useProxy = body.useProxy === true || body.useProxy === "true";
+
+		const base = await runG2CompetitorDeepResearch({
+			url: body.url,
+			query: body.query,
+			maxCompetitors: body.maxCompetitors,
+			useAi: body.useAi !== false,
+			geo: body.geo,
+		});
+
+		if (!deepScrape || !process.env.OPENROUTER_API_KEY) {
+			return c.json({
+				success: true,
+				...base,
+				deepScrape: deepScrape
+					? { skipped: !process.env.OPENROUTER_API_KEY, reason: "OPENROUTER_API_KEY missing" }
+					: { skipped: true, reason: "deepScrape disabled" },
+			});
+		}
+
+		const urls = [];
+		if (base.anchorProduct?.url) urls.push(base.anchorProduct.url);
+		for (const comp of base.competitors || []) {
+			if (comp.url) urls.push(comp.url);
+		}
+		const unique = [...new Set(urls)].slice(0, 15);
+
+		const scrapeSamples = [];
+		for (const u of unique) {
+			try {
+				const r = await scrapeSingleUrlWithPuppeteer(u, {
+					includeSemanticContent: true,
+					includeLinks: true,
+					includeImages: false,
+					extractMetadata: true,
+					timeout: 55_000,
+					useProxy,
+				});
+				const md = r.markdown || "";
+				scrapeSamples.push({
+					url: u,
+					markdownChars: md.length,
+					markdownSample: md.slice(0, 12_000),
+					structuredFromLinks: g2ProductsFromScrapeData(r.data),
+				});
+			} catch (e) {
+				scrapeSamples.push({
+					url: u,
+					error: e?.message || String(e),
+				});
+			}
+		}
+
+		let structuredProblems = null;
+		const hasText = scrapeSamples.some((s) => s.markdownSample);
+		if (hasText) {
+			try {
+				const payload = JSON.stringify({
+					productLabel: base.productLabel,
+					anchorUrl: base.anchorProduct?.url,
+					pages: scrapeSamples,
+				}).slice(0, MAX_SUMMARY_INPUT_CHARS);
+				const { content } = await openRouterChatMessages(
+					process.env.OPENROUTER_API_KEY,
+					[
+						{
+							role: "system",
+							content: `You analyze G2 product page excerpts (may be partial). Return ONLY valid JSON:
+{"items":[{"url":"string","productName":"string or null","problems":["short cons from text"],"strengths":["short pros"],"notes":"optional"}]}
+Rules: no invented star ratings or review counts; use null or empty arrays if unknown.`,
+						},
+						{ role: "user", content: payload },
+					],
+					Math.min(4096, INKGEST_SKILL_MAX_OUTPUT_TOKENS),
+					{
+						temperature: 0.2,
+						response_format: { type: "json_object" },
+					},
+				);
+				structuredProblems = JSON.parse(
+					String(content || "")
+						.replace(/```json|```/gi, "")
+						.trim(),
+				);
+			} catch (e) {
+				structuredProblems = {
+					error: e?.message || "parse_failed",
+				};
+			}
+		}
+
+		return c.json({
+			success: true,
+			...base,
+			deepScrape: {
+				scrapeSamples,
+				structuredProblems,
+			},
+		});
+	} catch (err) {
+		console.error("seo-g2-competitor-deep-research:", err?.message || err);
 		return c.json(
 			{ success: false, error: err?.message || "Request failed" },
 			400,

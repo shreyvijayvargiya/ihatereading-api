@@ -91,6 +91,7 @@
 		"useful": "^0.10.15",
 		"user-agents": "^1.1.642",
 		"uuid": "^11.1.0",
+		"wrangler": "^4.80.0",
 		"xml2js": "^0.6.2",
 		"youtube-transcript-plus": "^1.2.0",
 		"zod": "^3.25.76"
