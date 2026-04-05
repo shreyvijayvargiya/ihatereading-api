@@ -116,6 +116,123 @@ function parseAIJson(raw) {
 	return JSON.parse(text.slice(start, end + 1));
 }
 
+/** Max chars per message when echoing `aiPrompt` on API responses (avoid huge JSON). */
+const OPENROUTER_PROMPT_SNIPPET_MAX = Math.min(
+	32000,
+	Math.max(
+		4000,
+		Number.parseInt(process.env.OPENROUTER_PROMPT_SNIPPET_MAX || "12000", 10) ||
+			12000,
+	),
+);
+
+const OPENROUTER_TIMEOUT_MS = 90_000;
+
+function normalizeOpenRouterUsageFromApi(data) {
+	const u = data?.usage;
+	return {
+		prompt_tokens: u?.prompt_tokens ?? 0,
+		completion_tokens: u?.completion_tokens ?? 0,
+		total_tokens: u?.total_tokens ?? 0,
+	};
+}
+
+function toTokenUsageCamel(usage) {
+	if (!usage) return { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+	return {
+		promptTokens: usage.prompt_tokens ?? 0,
+		completionTokens: usage.completion_tokens ?? 0,
+		totalTokens: usage.total_tokens ?? 0,
+	};
+}
+
+/** Truncate chat messages for JSON responses (same shape as OpenRouter `messages`). */
+function truncateMessagesForApiResponse(
+	messages,
+	maxPerPart = OPENROUTER_PROMPT_SNIPPET_MAX,
+) {
+	if (!Array.isArray(messages)) return [];
+	return messages.map((m) => {
+		const raw =
+			typeof m.content === "string"
+				? m.content
+				: JSON.stringify(m.content ?? "");
+		const truncated = raw.length > maxPerPart;
+		return {
+			role: m.role,
+			content: truncated ? `${raw.slice(0, maxPerPart)}…` : raw,
+			...(truncated && { truncated: true }),
+		};
+	});
+}
+
+function mergeOpenRouterUsageSnake(a, b) {
+	const x = a || {
+		prompt_tokens: 0,
+		completion_tokens: 0,
+		total_tokens: 0,
+	};
+	const y = b || {
+		prompt_tokens: 0,
+		completion_tokens: 0,
+		total_tokens: 0,
+	};
+	return {
+		prompt_tokens: x.prompt_tokens + y.prompt_tokens,
+		completion_tokens: x.completion_tokens + y.completion_tokens,
+		total_tokens: x.total_tokens + y.total_tokens,
+	};
+}
+
+function openRouterResolvedModel(options = {}) {
+	return (
+		options.model ||
+		process.env.OPENROUTER_AGENT_MODEL ||
+		process.env.OPENROUTER_MODEL ||
+		"openai/gpt-4o-mini"
+	);
+}
+
+function buildOpenRouterAiMeta({ model, messages, usage }) {
+	const u = normalizeOpenRouterUsageFromApi({ usage });
+	return {
+		model,
+		usage: u,
+		tokenUsage: toTokenUsageCamel(u),
+		aiPrompt: truncateMessagesForApiResponse(messages),
+	};
+}
+
+/** Aggregate snake_case usage for API responses (usage + camelCase tokenUsage). */
+function usageFieldsFromSnake(usage) {
+	const u = normalizeOpenRouterUsageFromApi({ usage });
+	return {
+		usage: u,
+		tokenUsage: toTokenUsageCamel(u),
+	};
+}
+
+/** Last SSE chunk before [DONE] for OpenRouter streaming — echoes prompt + usage. */
+function buildOpenRouterStreamClientMeta(messages, usageRaw, modelId) {
+	const u = usageRaw
+		? normalizeOpenRouterUsageFromApi({ usage: usageRaw })
+		: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+	return {
+		type: "openrouter_meta",
+		usage: u,
+		tokenUsage: toTokenUsageCamel(u),
+		model: modelId || openRouterResolvedModel({}),
+		aiPrompt: truncateMessagesForApiResponse(messages),
+	};
+}
+
+/** Append to inkgest-agent state for observability. */
+function pushOpenRouterCall(state, label, meta) {
+	if (!state || typeof state !== "object") return;
+	if (!Array.isArray(state.openRouterCalls)) state.openRouterCalls = [];
+	state.openRouterCalls.push({ label, ...meta, at: new Date().toISOString() });
+}
+
 // Wrapper around OpenRouter chat completions with error checking
 async function openRouterChat({
 	model = "openai/gpt-4o-mini",
@@ -123,22 +240,24 @@ async function openRouterChat({
 	temperature = 0.7,
 	label = "AI",
 }) {
+	const messages = [
+		{
+			role: "system",
+			content:
+				"You are a JSON-only API. You MUST respond with valid JSON and nothing else. Never ask clarifying questions. Never add explanations. If information seems missing, use reasonable placeholder values.",
+		},
+		{ role: "user", content: prompt },
+	];
 	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
 		method: "POST",
+		signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
 		headers: {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
 		},
 		body: JSON.stringify({
 			model,
-			messages: [
-				{
-					role: "system",
-					content:
-						"You are a JSON-only API. You MUST respond with valid JSON and nothing else. Never ask clarifying questions. Never add explanations. If information seems missing, use reasonable placeholder values.",
-				},
-				{ role: "user", content: prompt },
-			],
+			messages,
 			temperature,
 			response_format: { type: "json_object" },
 		}),
@@ -163,7 +282,12 @@ async function openRouterChat({
 		);
 	}
 
-	return parseAIJson(content);
+	const usage = normalizeOpenRouterUsageFromApi(data);
+	return {
+		result: parseAIJson(content),
+		...buildOpenRouterAiMeta({ model, messages, usage }),
+		label,
+	};
 }
 
 const OUTPUT_FILE = "./templates.json";
@@ -2346,6 +2470,7 @@ async function callOpenRouter(
 ) {
 	const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
 		method: "POST",
+		signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
 		headers: {
 			Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
 			"Content-Type": "application/json",
@@ -2372,13 +2497,13 @@ async function callOpenRouter(
 			`OpenRouter returned empty content (finish_reason: ${reason})`,
 		);
 	}
+	const usageSnake = normalizeOpenRouterUsageFromApi(data);
 	return {
 		text,
-		usage: {
-			promptTokens: data.usage?.prompt_tokens ?? 0,
-			completionTokens: data.usage?.completion_tokens ?? 0,
-			totalTokens: data.usage?.total_tokens ?? 0,
-		},
+		usage: usageSnake,
+		tokenUsage: toTokenUsageCamel(usageSnake),
+		model,
+		aiPrompt: truncateMessagesForApiResponse(messages),
 	};
 }
 
@@ -3025,15 +3150,34 @@ app.post("/google-maps-agent", async (c) => {
 	// Track token usage across both LLM calls
 	const tokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 	const addUsage = (u) => {
-		tokenUsage.promptTokens += u.promptTokens;
-		tokenUsage.completionTokens += u.completionTokens;
-		tokenUsage.totalTokens += u.totalTokens;
+		if (!u) return;
+		tokenUsage.promptTokens += u.promptTokens ?? 0;
+		tokenUsage.completionTokens += u.completionTokens ?? 0;
+		tokenUsage.totalTokens += u.totalTokens ?? 0;
+	};
+	const openRouterCalls = [];
+	let aggUsageSnake = {
+		prompt_tokens: 0,
+		completion_tokens: 0,
+		total_tokens: 0,
+	};
+	const recordOpenRouter = (r, step) => {
+		if (!r) return;
+		addUsage(r.tokenUsage);
+		aggUsageSnake = mergeOpenRouterUsageSnake(aggUsageSnake, r.usage);
+		openRouterCalls.push({
+			step,
+			model: r.model,
+			usage: r.usage,
+			tokenUsage: r.tokenUsage,
+			aiPrompt: r.aiPrompt,
+		});
 	};
 
 	// ── Step 1: Generate search queries ───────────────────────────────────────
 	let queries = [];
 	try {
-		const { text, usage } = await callOpenRouter(
+		const rQuery = await callOpenRouter(
 			[
 				{
 					role: "system",
@@ -3043,8 +3187,8 @@ app.post("/google-maps-agent", async (c) => {
 			],
 			{ jsonMode: true },
 		);
-		addUsage(usage);
-		const parsed = parseJsonFromLLM(text);
+		recordOpenRouter(rQuery, "query_generation");
+		const parsed = parseJsonFromLLM(rQuery.text);
 		queries = Array.isArray(parsed.queries)
 			? parsed.queries.slice(0, 5).filter(Boolean)
 			: [];
@@ -3143,7 +3287,7 @@ app.post("/google-maps-agent", async (c) => {
 
 	let parsed;
 	try {
-		const { text, usage } = await callOpenRouter(
+		const rSynth = await callOpenRouter(
 			[
 				{
 					role: "system",
@@ -3176,8 +3320,8 @@ app.post("/google-maps-agent", async (c) => {
 			],
 			{ jsonMode: true },
 		);
-		addUsage(usage);
-		parsed = parseJsonFromLLM(text);
+		recordOpenRouter(rSynth, "synthesis");
+		parsed = parseJsonFromLLM(rSynth.text);
 	} catch {
 		parsed = {
 			answer: `Found ${uniquePlaces.length} results across ${queries.length} searches.`,
@@ -3208,6 +3352,8 @@ app.post("/google-maps-agent", async (c) => {
 		scrapedUrls,
 		scrapedUrlsCount: scrapedUrls.length,
 		tokenUsage,
+		usage: aggUsageSnake,
+		openRouterCalls,
 		timestamp: new Date().toISOString(),
 	});
 });
@@ -4287,6 +4433,7 @@ app.post("/seo-g2-competitor-deep-research", async (c) => {
 		}
 
 		let structuredProblems = null;
+		let g2DeepOpenRouter = null;
 		const hasText = scrapeSamples.some((s) => s.markdownSample);
 		if (hasText) {
 			try {
@@ -4295,7 +4442,7 @@ app.post("/seo-g2-competitor-deep-research", async (c) => {
 					anchorUrl: base.anchorProduct?.url,
 					pages: scrapeSamples,
 				}).slice(0, MAX_SUMMARY_INPUT_CHARS);
-				const { content } = await openRouterChatMessages(
+				const orG2Deep = await openRouterChatMessages(
 					process.env.OPENROUTER_API_KEY,
 					[
 						{
@@ -4312,6 +4459,13 @@ Rules: no invented star ratings or review counts; use null or empty arrays if un
 						response_format: { type: "json_object" },
 					},
 				);
+				g2DeepOpenRouter = {
+					usage: orG2Deep.usage,
+					tokenUsage: orG2Deep.tokenUsage,
+					model: orG2Deep.model,
+					aiPrompt: orG2Deep.aiPrompt,
+				};
+				const { content } = orG2Deep;
 				structuredProblems = JSON.parse(
 					String(content || "")
 						.replace(/```json|```/gi, "")
@@ -4327,6 +4481,21 @@ Rules: no invented star ratings or review counts; use null or empty arrays if un
 		return c.json({
 			success: true,
 			...base,
+			...(g2DeepOpenRouter && {
+				...usageFieldsFromSnake(g2DeepOpenRouter.usage),
+				model: g2DeepOpenRouter.model,
+				aiPrompt: g2DeepOpenRouter.aiPrompt,
+				openRouterCalls: [
+					{
+						label: "g2_deep_structured",
+						usage: g2DeepOpenRouter.usage,
+						tokenUsage: g2DeepOpenRouter.tokenUsage,
+						model: g2DeepOpenRouter.model,
+						aiPrompt: g2DeepOpenRouter.aiPrompt,
+						at: new Date().toISOString(),
+					},
+				],
+			}),
 			deepScrape: {
 				scrapeSamples,
 				structuredProblems,
@@ -5122,10 +5291,11 @@ async function scrapeSingleUrlWithPuppeteer(
 					removeEmptyKeys(scrapedData.content);
 
 				let summary = null;
+				let openRouterSummary = null;
 				if (aiSummary && markdown && process.env.OPENROUTER_API_KEY) {
 					try {
 						const truncated = markdown.slice(0, 12000);
-						const { content } = await openRouterChatMessages(
+						const or = await openRouterChatMessages(
 							process.env.OPENROUTER_API_KEY,
 							[
 								{
@@ -5141,13 +5311,19 @@ async function scrapeSingleUrlWithPuppeteer(
 							2048,
 							{ temperature: 0.3 },
 						);
-						summary = String(content || "").trim() || null;
+						summary = String(or.content || "").trim() || null;
+						openRouterSummary = {
+							tokenUsage: or.tokenUsage,
+							usage: or.usage,
+							model: or.model,
+							aiPrompt: or.aiPrompt,
+						};
 					} catch (err) {
 						console.error("[scrape] AI summary failed:", err?.message);
 					}
 				}
 
-				return { summary, scrapedData, markdown, screenshotUrl };
+				return { summary, scrapedData, markdown, screenshotUrl, openRouterSummary };
 			});
 
 			return {
@@ -5156,6 +5332,9 @@ async function scrapeSingleUrlWithPuppeteer(
 				markdown: poolResult.markdown,
 				summary: poolResult.summary,
 				screenshot: poolResult.screenshotUrl,
+				...(poolResult.openRouterSummary && {
+					openRouterSummary: poolResult.openRouterSummary,
+				}),
 			};
 		} catch (attemptError) {
 			lastError = attemptError;
@@ -5359,6 +5538,9 @@ app.post("/scrape-multiple", async (c) => {
 					markdown: result.markdown,
 					summary: result.summary,
 					screenshot: result.screenshot,
+					...(result.openRouterSummary && {
+						openRouterSummary: result.openRouterSummary,
+					}),
 					error: null,
 				};
 			} catch (err) {
@@ -5391,19 +5573,15 @@ const INKGEST_SCRAPE_BASE =
 	process.env.SCRAPE_API_BASE_URL ||
 	"http://localhost:3002";
 
-const OPENROUTER_TIMEOUT_MS = 90_000; // 90s for LLM responses
-
 async function openRouterChatMessages(
 	apiKey,
 	messages,
 	maxTokens = 1200,
 	options = {},
 ) {
+	const model = openRouterResolvedModel(options);
 	const body = {
-		model:
-			process.env.OPENROUTER_AGENT_MODEL ||
-			process.env.OPENROUTER_MODEL ||
-			"openai/gpt-4o-mini",
+		model,
 		messages,
 		temperature: options.temperature ?? 0.3,
 		max_tokens: maxTokens,
@@ -5423,14 +5601,14 @@ async function openRouterChatMessages(
 		throw new Error(data?.error?.message || `OpenRouter error (${res.status})`);
 	}
 	const content = data?.choices?.[0]?.message?.content || "";
-	const usage = data?.usage
-		? {
-				prompt_tokens: data.usage.prompt_tokens ?? 0,
-				completion_tokens: data.usage.completion_tokens ?? 0,
-				total_tokens: data.usage.total_tokens ?? 0,
-			}
-		: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-	return { content, usage };
+	const usage = normalizeOpenRouterUsageFromApi(data);
+	return {
+		content,
+		usage,
+		tokenUsage: toTokenUsageCamel(usage),
+		model,
+		aiPrompt: truncateMessagesForApiResponse(messages),
+	};
 }
 
 /** Caps skill completion tokens (OpenRouter rejects high max_tokens vs account credits). Override via INKGEST_SKILL_MAX_OUTPUT_TOKENS. */
@@ -5490,7 +5668,7 @@ async function condenseSourcesIfOverBudget(
 		Math.max(800, Math.ceil(MAX_SUMMARY_OUTPUT_CHARS / 3)),
 	);
 
-	const { content, usage } = await openRouterChatMessages(
+	const orCondense = await openRouterChatMessages(
 		apiKey,
 		[
 			{
@@ -5503,7 +5681,19 @@ Preserve each source URL (markdown headings or a bullet list of links). Keep key
 		condenseMaxOut,
 		{ temperature: 0.2 },
 	);
+	const { content, usage } = orCondense;
 	addTokenUsage(usage);
+	if (state?.tokenUsage) {
+		state.tokenUsage.prompt_tokens += usage.prompt_tokens || 0;
+		state.tokenUsage.completion_tokens += usage.completion_tokens || 0;
+		state.tokenUsage.total_tokens += usage.total_tokens || 0;
+	}
+	pushOpenRouterCall(state, "source-condense", {
+		usage: orCondense.usage,
+		tokenUsage: orCondense.tokenUsage,
+		model: orCondense.model,
+		aiPrompt: orCondense.aiPrompt,
+	});
 	const credit = CREDITS["source-condense"] ?? 0.25;
 	state.creditsDistribution.push({
 		task: "source-condense",
@@ -5590,6 +5780,7 @@ app.post("/inkgest-agent", async (c) => {
 						completion_tokens: 0,
 						total_tokens: 0,
 					};
+					const pendingOpenRouterCalls = [];
 					try {
 						const extractedUrls = hasExecuteTasks
 							? [
@@ -5721,6 +5912,7 @@ app.post("/inkgest-agent", async (c) => {
 										parsed: fastResult,
 										fast: true,
 										usage: null,
+										openRouterMeta: null,
 										parseError: false,
 									};
 								}
@@ -5728,11 +5920,18 @@ app.post("/inkgest-agent", async (c) => {
 									openRouterKey,
 									messages,
 								);
+								const openRouterMeta = {
+									usage: routerResult.usage,
+									tokenUsage: routerResult.tokenUsage,
+									model: routerResult.model,
+									aiPrompt: routerResult.aiPrompt,
+								};
 								try {
 									return {
 										parsed: parseAgentResponse(routerResult.content),
 										fast: false,
 										usage: routerResult.usage,
+										openRouterMeta,
 										raw: routerResult.content,
 										parseError: false,
 									};
@@ -5741,6 +5940,7 @@ app.post("/inkgest-agent", async (c) => {
 										parsed: null,
 										fast: false,
 										usage: routerResult.usage,
+										openRouterMeta,
 										raw: routerResult.content,
 										parseError: true,
 									};
@@ -5753,6 +5953,14 @@ app.post("/inkgest-agent", async (c) => {
 									? scrapeClassifiedUrls(regularUrls, youtubeUrls, redditUrls)
 									: Promise.resolve({ sources: [], errors: [] }),
 							]);
+
+							if (!routerOutcome.fast && routerOutcome.openRouterMeta) {
+								pendingOpenRouterCalls.push({
+									label: "router",
+									...routerOutcome.openRouterMeta,
+									at: new Date().toISOString(),
+								});
+							}
 
 							// Apply LLM router credits (fast router has no LLM cost)
 							if (!routerOutcome.fast && routerOutcome.usage) {
@@ -5777,7 +5985,8 @@ app.post("/inkgest-agent", async (c) => {
 											references: [],
 											creditsUsed,
 											creditsDistribution,
-											tokenUsage,
+											...usageFieldsFromSnake(tokenUsage),
+											openRouterCalls: pendingOpenRouterCalls,
 										}),
 									),
 								);
@@ -6187,7 +6396,8 @@ app.post("/inkgest-agent", async (c) => {
 										scrapeErrors: errPayload.scrapeErrors,
 										creditsUsed: errPayload.creditsUsed,
 										creditsDistribution: errPayload.creditsDistribution,
-										tokenUsage: errPayload.tokenUsage,
+										...usageFieldsFromSnake(errPayload.tokenUsage),
+										openRouterCalls: pendingOpenRouterCalls,
 									}),
 								),
 							);
@@ -6199,6 +6409,7 @@ app.post("/inkgest-agent", async (c) => {
 							tokenUsage: { ...tokenUsage },
 							creditsUsed,
 							creditsDistribution: [...creditsDistribution],
+							openRouterCalls: [...pendingOpenRouterCalls],
 							/** After crawl-url tasks run, filled with { url, markdown, title, links }[] for useCrawlResult content tasks */
 							crawlUrlSources: [],
 							/** After image-reading task runs, filled with same shape as scrape sources for blog/article etc. */
@@ -6624,24 +6835,31 @@ app.post("/inkgest-agent", async (c) => {
 									INKGEST_SKILL_MAX_OUTPUT_TOKENS,
 								);
 
-								const { content: rawContent, usage: skillUsage } =
-									await openRouterChatMessages(
-										openRouterKey,
-										[
-											{ role: "system", content: system },
-											{ role: "user", content: user },
-										],
-										cappedMaxTokens,
-										task.type === "infographics-svg-generator"
-											? { response_format: { type: "json_object" } }
-											: {},
-									);
+								const orSkill = await openRouterChatMessages(
+									openRouterKey,
+									[
+										{ role: "system", content: system },
+										{ role: "user", content: user },
+									],
+									cappedMaxTokens,
+									task.type === "infographics-svg-generator"
+										? { response_format: { type: "json_object" } }
+										: {},
+								);
+								const rawContent = orSkill.content;
+								const skillUsage = orSkill.usage;
 								addTokenUsage(skillUsage);
 								state.tokenUsage.prompt_tokens +=
 									skillUsage?.prompt_tokens || 0;
 								state.tokenUsage.completion_tokens +=
 									skillUsage?.completion_tokens || 0;
 								state.tokenUsage.total_tokens += skillUsage?.total_tokens || 0;
+								pushOpenRouterCall(state, `skill:${task.type}`, {
+									usage: orSkill.usage,
+									tokenUsage: orSkill.tokenUsage,
+									model: orSkill.model,
+									aiPrompt: orSkill.aiPrompt,
+								});
 
 								const taskCredits = CREDITS[task.type] ?? 1;
 								state.creditsDistribution.push({
@@ -6765,7 +6983,8 @@ app.post("/inkgest-agent", async (c) => {
 										references: state.references || [],
 										creditsUsed,
 										creditsDistribution,
-										tokenUsage,
+										...usageFieldsFromSnake(state.tokenUsage),
+										openRouterCalls: state.openRouterCalls || [],
 									}),
 								),
 							);
@@ -6993,7 +7212,8 @@ app.post("/inkgest-agent", async (c) => {
 										scrapeErrors.length > 0 ? scrapeErrors : undefined,
 									creditsUsed: state.creditsUsed,
 									creditsDistribution: state.creditsDistribution,
-									tokenUsage: state.tokenUsage,
+									...usageFieldsFromSnake(state.tokenUsage),
+									openRouterCalls: state.openRouterCalls || [],
 								}),
 							),
 						);
@@ -7011,7 +7231,11 @@ app.post("/inkgest-agent", async (c) => {
 										creditsUsed: state?.creditsUsed ?? creditsUsed,
 										creditsDistribution:
 											state?.creditsDistribution ?? creditsDistribution,
-										tokenUsage: state?.tokenUsage ?? tokenUsage,
+										...usageFieldsFromSnake(
+											state?.tokenUsage ?? tokenUsage,
+										),
+										openRouterCalls:
+											state?.openRouterCalls ?? pendingOpenRouterCalls ?? [],
 									}),
 								),
 							);
@@ -9008,6 +9232,34 @@ app.post("/image-to-code", async (c) => {
 		);
 	}
 
+	const imgToCodeModel = "anthropic/claude-sonnet-4-5";
+	const imgToCodeMessages = [
+		{
+			role: "system",
+			content: `You are an expert React developer. Your task is to generate a single, complete React component based on the provided image and user prompt.
+
+Strict requirements:
+- Output only a single React component as raw JSX — no markdown fences, no explanations.
+- Use **Tailwind CSS** for all styling.
+- Use **lucide-react** and **react-icons** for any icons (import from these libraries as needed).
+- Do not use any other CSS frameworks or icon libraries.
+- The component must be self-contained, default-exported, and ready to render.
+- If the image contains interactive elements, implement them as functional React code.
+- Do not include any import for Tailwind CSS (assume it is globally available).
+- Only output the raw JSX component code, nothing else.`,
+		},
+		{
+			role: "user",
+			content: [
+				{ type: "text", text: prompt },
+				{
+					type: "image_url",
+					image_url: { url: `data:${mimeType};base64,${base64Data}` },
+				},
+			],
+		},
+	];
+
 	// ── Stream from OpenRouter ────────────────────────────────────────────────
 	let imgCodeUpstreamRes;
 	try {
@@ -9022,34 +9274,9 @@ app.post("/image-to-code", async (c) => {
 					"X-Title": "IHateReading Image-to-Code",
 				},
 				body: JSON.stringify({
-					model: "anthropic/claude-sonnet-4-5",
+					model: imgToCodeModel,
 					stream: true,
-					messages: [
-						{
-							role: "system",
-							content: `You are an expert React developer. Your task is to generate a single, complete React component based on the provided image and user prompt.
-
-Strict requirements:
-- Output only a single React component as raw JSX — no markdown fences, no explanations.
-- Use **Tailwind CSS** for all styling.
-- Use **lucide-react** and **react-icons** for any icons (import from these libraries as needed).
-- Do not use any other CSS frameworks or icon libraries.
-- The component must be self-contained, default-exported, and ready to render.
-- If the image contains interactive elements, implement them as functional React code.
-- Do not include any import for Tailwind CSS (assume it is globally available).
-- Only output the raw JSX component code, nothing else.`,
-						},
-						{
-							role: "user",
-							content: [
-								{ type: "text", text: prompt },
-								{
-									type: "image_url",
-									image_url: { url: `data:${mimeType};base64,${base64Data}` },
-								},
-							],
-						},
-					],
+					messages: imgToCodeMessages,
 					temperature: 0.2,
 				}),
 			},
@@ -9078,6 +9305,23 @@ Strict requirements:
 	const imgOutputStream = new ReadableStream({
 		async start(controller) {
 			let sseBuffer = "";
+			let streamUsageRaw = null;
+			let streamModel = imgToCodeModel;
+			const sendMetaAndDone = () => {
+				controller.enqueue(
+					imgEncoder.encode(
+						`data: ${JSON.stringify(
+							buildOpenRouterStreamClientMeta(
+								imgToCodeMessages,
+								streamUsageRaw,
+								streamModel,
+							),
+						)}\n\n`,
+					),
+				);
+				controller.enqueue(imgEncoder.encode("data: [DONE]\n\n"));
+				controller.close();
+			};
 			try {
 				while (true) {
 					const { done, value } = await imgUpstreamReader.read();
@@ -9093,8 +9337,7 @@ Strict requirements:
 
 						const payload = trimmed.slice(6);
 						if (payload === "[DONE]") {
-							controller.enqueue(imgEncoder.encode("data: [DONE]\n\n"));
-							controller.close();
+							sendMetaAndDone();
 							return;
 						}
 
@@ -9115,6 +9358,9 @@ Strict requirements:
 							return;
 						}
 
+						if (parsed?.usage) streamUsageRaw = parsed.usage;
+						if (parsed?.model) streamModel = parsed.model;
+
 						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
 						if (delta) {
 							controller.enqueue(
@@ -9124,8 +9370,7 @@ Strict requirements:
 					}
 				}
 
-				controller.enqueue(imgEncoder.encode("data: [DONE]\n\n"));
-				controller.close();
+				sendMetaAndDone();
 			} catch (err) {
 				try {
 					controller.enqueue(
@@ -10574,10 +10819,27 @@ ${JSON.stringify(structured)}`;
 
 	try {
 		const siteData = await crawlWebsite(url);
-		const structured = await extractStructuredData(siteData);
-		const linkedin = await generateLinkedInPack(structured);
-		const productHunt = await generateProductHuntKit(structured);
-		const emails = await generateEmailSequence(structured);
+		const extractRes = await extractStructuredData(siteData);
+		const structured = extractRes.result;
+		const linkedInRes = await generateLinkedInPack(structured);
+		const linkedin = linkedInRes.result;
+		const phRes = await generateProductHuntKit(structured);
+		const productHunt = phRes.result;
+		const emRes = await generateEmailSequence(structured);
+		const emails = emRes.result;
+
+		let aggUsage = mergeOpenRouterUsageSnake(null, null);
+		const openRouterCalls = [];
+		for (const r of [extractRes, linkedInRes, phRes, emRes]) {
+			aggUsage = mergeOpenRouterUsageSnake(aggUsage, r.usage);
+			openRouterCalls.push({
+				label: r.label,
+				model: r.model,
+				usage: r.usage,
+				tokenUsage: r.tokenUsage,
+				aiPrompt: r.aiPrompt,
+			});
+		}
 
 		return c.json({
 			success: true,
@@ -10585,6 +10847,9 @@ ${JSON.stringify(structured)}`;
 			linkedin,
 			productHunt,
 			emails,
+			usage: aggUsage,
+			tokenUsage: toTokenUsageCamel(aggUsage),
+			openRouterCalls,
 		});
 	} catch (err) {
 		console.error(err);
@@ -11555,6 +11820,11 @@ app.post("/api/codegen", async (c) => {
 	const model =
 		modelOverride || process.env.CODEGEN_MODEL || "anthropic/claude-sonnet-4-5";
 
+	const codegenMessages = [
+		{ role: "system", content: systemPrompt },
+		{ role: "user", content: userMessage },
+	];
+
 	// ── 3. Stream from OpenRouter ──────────────────────────────────────────────
 	let openRouterRes;
 	try {
@@ -11571,10 +11841,7 @@ app.post("/api/codegen", async (c) => {
 				body: JSON.stringify({
 					model,
 					stream: true,
-					messages: [
-						{ role: "system", content: systemPrompt },
-						{ role: "user", content: userMessage },
-					],
+					messages: codegenMessages,
 					temperature: outputType === "reproduce" ? 0.2 : 0.35,
 				}),
 			},
@@ -11603,6 +11870,23 @@ app.post("/api/codegen", async (c) => {
 	const outputStream = new ReadableStream({
 		async start(controller) {
 			let sseBuffer = "";
+			let streamUsageRaw = null;
+			let streamModel = model;
+			const sendMetaAndDone = () => {
+				controller.enqueue(
+					encoder.encode(
+						`data: ${JSON.stringify(
+							buildOpenRouterStreamClientMeta(
+								codegenMessages,
+								streamUsageRaw,
+								streamModel,
+							),
+						)}\n\n`,
+					),
+				);
+				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+				controller.close();
+			};
 			try {
 				while (true) {
 					const { done, value } = await upstreamReader.read();
@@ -11618,8 +11902,7 @@ app.post("/api/codegen", async (c) => {
 
 						const payload = trimmed.slice(6);
 						if (payload === "[DONE]") {
-							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-							controller.close();
+							sendMetaAndDone();
 							return;
 						}
 
@@ -11641,6 +11924,9 @@ app.post("/api/codegen", async (c) => {
 							return;
 						}
 
+						if (parsed?.usage) streamUsageRaw = parsed.usage;
+						if (parsed?.model) streamModel = parsed.model;
+
 						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
 						if (delta) {
 							controller.enqueue(
@@ -11651,8 +11937,7 @@ app.post("/api/codegen", async (c) => {
 				}
 
 				// Stream ended without [DONE] — still signal completion
-				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-				controller.close();
+				sendMetaAndDone();
 			} catch (err) {
 				try {
 					controller.enqueue(
@@ -11783,7 +12068,7 @@ async function runSkillAsset(
 		(skillType === "scrape" && fmt === "json");
 	const maxOut = Math.min(skill.maxTokens, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
 
-	const { content } = await openRouterChatMessages(
+	const or = await openRouterChatMessages(
 		process.env.OPENROUTER_API_KEY,
 		[
 			{ role: "system", content: system },
@@ -11792,6 +12077,15 @@ async function runSkillAsset(
 		maxOut,
 		isJson ? { response_format: { type: "json_object" } } : {},
 	);
+	const content = or.content;
+
+	const attachOpenRouterMeta = (out) => ({
+		...out,
+		tokenUsage: or.tokenUsage,
+		usage: or.usage,
+		model: or.model,
+		aiPrompt: or.aiPrompt,
+	});
 
 	if (skill.parseResponse) {
 		const parsed = skill.parseResponse(content);
@@ -11803,16 +12097,16 @@ async function runSkillAsset(
 			parsed.images = parsed.images.slice(0, maxImages);
 			parsed.maxImages = maxImages;
 		}
-		return parsed;
+		return attachOpenRouterMeta(parsed);
 	}
 
 	// Table: try to parse as JSON, fall back to raw string
 	if (skillType === "table") {
 		try {
 			const j = JSON.parse(content.replace(/```json|```/gi, "").trim());
-			return { columns: j.columns || [], rows: j.rows || [] };
+			return attachOpenRouterMeta({ columns: j.columns || [], rows: j.rows || [] });
 		} catch {
-			return { content: content.trim() };
+			return attachOpenRouterMeta({ content: content.trim() });
 		}
 	}
 
@@ -11823,13 +12117,13 @@ async function runSkillAsset(
 				.trim()
 				.replace(/```json|```/gi, "")
 				.trim();
-			return { content: JSON.parse(raw) };
+			return attachOpenRouterMeta({ content: JSON.parse(raw) });
 		} catch {
-			return { content: content.trim() };
+			return attachOpenRouterMeta({ content: content.trim() });
 		}
 	}
 
-	return { content: content.trim() };
+	return attachOpenRouterMeta({ content: content.trim() });
 }
 
 // ─── G2 product search — multi-page scrape + chunked LLM extraction ───────────
@@ -11963,7 +12257,7 @@ ${markdown}
 --- end ---`;
 
 	const capped = user.slice(0, MAX_SUMMARY_INPUT_CHARS);
-	const { content } = await openRouterChatMessages(
+	const orExtract = await openRouterChatMessages(
 		apiKey,
 		[
 			{ role: "system", content: system },
@@ -11972,6 +12266,7 @@ ${markdown}
 		G2_EXTRACT_MAX_TOKENS,
 		{ temperature: 0.15, response_format: { type: "json_object" } },
 	);
+	const { content } = orExtract;
 	let parsed;
 	try {
 		parsed = JSON.parse(
@@ -11980,10 +12275,23 @@ ${markdown}
 				.trim(),
 		);
 	} catch {
-		return [];
+		return {
+			products: [],
+			usage: orExtract.usage,
+			tokenUsage: orExtract.tokenUsage,
+			model: orExtract.model,
+			aiPrompt: orExtract.aiPrompt,
+		};
 	}
 	const arr = parsed?.products;
-	return Array.isArray(arr) ? arr : [];
+	const products = Array.isArray(arr) ? arr : [];
+	return {
+		products,
+		usage: orExtract.usage,
+		tokenUsage: orExtract.tokenUsage,
+		model: orExtract.model,
+		aiPrompt: orExtract.aiPrompt,
+	};
 }
 
 async function g2SynthesizeResearchBrief(apiKey, products, userPrompt) {
@@ -11998,7 +12306,7 @@ async function g2SynthesizeResearchBrief(apiKey, products, userPrompt) {
 	if (payload.length > 100_000) {
 		payload = payload.slice(0, 100_000) + "…";
 	}
-	const { content } = await openRouterChatMessages(
+	const orSyn = await openRouterChatMessages(
 		apiKey,
 		[
 			{
@@ -12015,7 +12323,13 @@ Be factual; do not invent vendors or scores not present in the data. Keep the br
 		Math.min(4096, INKGEST_SKILL_MAX_OUTPUT_TOKENS),
 		{ temperature: 0.25 },
 	);
-	return String(content || "").trim();
+	return {
+		brief: String(orSyn.content || "").trim(),
+		usage: orSyn.usage,
+		tokenUsage: orSyn.tokenUsage,
+		model: orSyn.model,
+		aiPrompt: orSyn.aiPrompt,
+	};
 }
 
 /**
@@ -12036,6 +12350,8 @@ async function runG2ProductSearchResearchPipeline(opts) {
 	const emit = typeof onEvent === "function" ? onEvent : () => {};
 	const pagesMeta = [];
 	let allProducts = [];
+	let aggUsageSnake = mergeOpenRouterUsageSnake(null, null);
+	const openRouterCalls = [];
 
 	for (let page = 1; page <= maxPages; page++) {
 		const url = buildG2SearchUrl(searchQuery, page, productId);
@@ -12096,12 +12412,24 @@ async function runG2ProductSearchResearchPipeline(opts) {
 				totalChunks: chunks.length,
 				markdown: chunks[ci],
 			});
-			pageProducts = mergeG2ProductLists(pageProducts, extracted);
+			aggUsageSnake = mergeOpenRouterUsageSnake(
+				aggUsageSnake,
+				extracted.usage,
+			);
+			openRouterCalls.push({
+				label: `g2_extract_p${page}_c${ci}`,
+				usage: extracted.usage,
+				tokenUsage: extracted.tokenUsage,
+				model: extracted.model,
+				aiPrompt: extracted.aiPrompt,
+				at: new Date().toISOString(),
+			});
+			pageProducts = mergeG2ProductLists(pageProducts, extracted.products);
 			emit({
 				type: "chunk_extracted",
 				page,
 				chunkIndex: ci,
-				extractedCount: extracted.length,
+				extractedCount: extracted.products.length,
 				runningPageTotal: pageProducts.length,
 			});
 		}
@@ -12128,11 +12456,21 @@ async function runG2ProductSearchResearchPipeline(opts) {
 	let researchBrief = null;
 	if (deepResearch && allProducts.length > 0) {
 		emit({ type: "synthesis_start", productCount: allProducts.length });
-		researchBrief = await g2SynthesizeResearchBrief(
+		const syn = await g2SynthesizeResearchBrief(
 			apiKey,
 			allProducts,
 			userPrompt,
 		);
+		researchBrief = syn.brief;
+		aggUsageSnake = mergeOpenRouterUsageSnake(aggUsageSnake, syn.usage);
+		openRouterCalls.push({
+			label: "g2_synthesis",
+			usage: syn.usage,
+			tokenUsage: syn.tokenUsage,
+			model: syn.model,
+			aiPrompt: syn.aiPrompt,
+			at: new Date().toISOString(),
+		});
 		emit({
 			type: "synthesis_complete",
 			briefChars: researchBrief?.length ?? 0,
@@ -12148,6 +12486,8 @@ async function runG2ProductSearchResearchPipeline(opts) {
 		products: allProducts,
 		totalProducts: allProducts.length,
 		researchBrief,
+		...usageFieldsFromSnake(aggUsageSnake),
+		openRouterCalls,
 		timestamp: new Date().toISOString(),
 	};
 }
@@ -12802,6 +13142,11 @@ app.post("/ai-resume-builder", async (c) => {
 		process.env.CODEGEN_MODEL ||
 		"anthropic/claude-sonnet-4-5";
 
+	const resumeMessages = [
+		{ role: "system", content: RESUME_SYSTEM_PROMPT },
+		{ role: "user", content: userMessage },
+	];
+
 	// ── 3. Stream from OpenRouter ────────────────────────────────────────────
 	let openRouterRes;
 	try {
@@ -12818,10 +13163,7 @@ app.post("/ai-resume-builder", async (c) => {
 				body: JSON.stringify({
 					model,
 					stream: true,
-					messages: [
-						{ role: "system", content: RESUME_SYSTEM_PROMPT },
-						{ role: "user", content: userMessage },
-					],
+					messages: resumeMessages,
 					temperature: 0.25,
 					max_tokens: 8000,
 				}),
@@ -12851,6 +13193,23 @@ app.post("/ai-resume-builder", async (c) => {
 	const outputStream = new ReadableStream({
 		async start(controller) {
 			let sseBuffer = "";
+			let streamUsageRaw = null;
+			let streamModel = model;
+			const sendMetaAndDone = () => {
+				controller.enqueue(
+					encoder.encode(
+						`data: ${JSON.stringify(
+							buildOpenRouterStreamClientMeta(
+								resumeMessages,
+								streamUsageRaw,
+								streamModel,
+							),
+						)}\n\n`,
+					),
+				);
+				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+				controller.close();
+			};
 			try {
 				while (true) {
 					const { done, value } = await upstreamReader.read();
@@ -12865,8 +13224,7 @@ app.post("/ai-resume-builder", async (c) => {
 						if (!trimmed.startsWith("data: ")) continue;
 						const payload = trimmed.slice(6);
 						if (payload === "[DONE]") {
-							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-							controller.close();
+							sendMetaAndDone();
 							return;
 						}
 						let parsed;
@@ -12884,6 +13242,8 @@ app.post("/ai-resume-builder", async (c) => {
 							controller.close();
 							return;
 						}
+						if (parsed?.usage) streamUsageRaw = parsed.usage;
+						if (parsed?.model) streamModel = parsed.model;
 						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
 						if (delta) {
 							controller.enqueue(
@@ -12892,8 +13252,7 @@ app.post("/ai-resume-builder", async (c) => {
 						}
 					}
 				}
-				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-				controller.close();
+				sendMetaAndDone();
 			} catch (err) {
 				try {
 					controller.enqueue(
@@ -12902,6 +13261,10 @@ app.post("/ai-resume-builder", async (c) => {
 						),
 					);
 					controller.close();
+				} catch {}
+			} finally {
+				try {
+					upstreamReader.releaseLock();
 				} catch {}
 			}
 		},
