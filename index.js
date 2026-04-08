@@ -1357,7 +1357,8 @@ app.use(
 			"https://www.inkgest.com",
 		], // Allow specific origins
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-		allowHeaders: ["Content-Type", "Authorization"],
+		// Do not set allowHeaders to a fixed list: browsers send Access-Control-Request-Headers
+		// (e.g. authorization, sentry-trace, baggage). Hono mirrors those when allowHeaders is empty.
 		exposeHeaders: [
 			"X-Video-Translate-Id",
 			"X-Caption-Url",
@@ -1365,6 +1366,7 @@ app.use(
 			"Cache-Control",
 		],
 		credentials: true,
+		maxAge: 86_400,
 	}),
 );
 
