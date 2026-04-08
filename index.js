@@ -19,6 +19,12 @@ import {
 	runG2CompetitorDeepResearch,
 } from "./lib/seoApis.js";
 import {
+	getVideoTranslateLanguagesResponse,
+	getVideoTranslateCaptionResponse,
+	createVideoTranslateJobs,
+	getVideoTranslateJobStatus,
+} from "./lib/videoTranslateOpenRouter.js";
+import {
 	parseRepoUrl,
 	analyzeRepo,
 	analyzeSingleFile,
@@ -1352,6 +1358,12 @@ app.use(
 		], // Allow specific origins
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 		allowHeaders: ["Content-Type", "Authorization"],
+		exposeHeaders: [
+			"X-Video-Translate-Id",
+			"X-Caption-Url",
+			"X-Content-Type-Options",
+			"Cache-Control",
+		],
 		credentials: true,
 	}),
 );
@@ -5323,7 +5335,13 @@ async function scrapeSingleUrlWithPuppeteer(
 					}
 				}
 
-				return { summary, scrapedData, markdown, screenshotUrl, openRouterSummary };
+				return {
+					summary,
+					scrapedData,
+					markdown,
+					screenshotUrl,
+					openRouterSummary,
+				};
 			});
 
 			return {
@@ -7231,9 +7249,7 @@ app.post("/inkgest-agent", async (c) => {
 										creditsUsed: state?.creditsUsed ?? creditsUsed,
 										creditsDistribution:
 											state?.creditsDistribution ?? creditsDistribution,
-										...usageFieldsFromSnake(
-											state?.tokenUsage ?? tokenUsage,
-										),
+										...usageFieldsFromSnake(state?.tokenUsage ?? tokenUsage),
 										openRouterCalls:
 											state?.openRouterCalls ?? pendingOpenRouterCalls ?? [],
 									}),
@@ -7669,6 +7685,26 @@ async function isLikelyStaticSite(url) {
 async function uploadScreenshotBuffer(buffer) {
 	const fileName = `screenshot-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
 	const utFile = new UTFile([buffer], fileName, { type: "image/png" });
+	const [response] = await utapi.uploadFiles([utFile]);
+	if (response.error) {
+		throw new Error(`UploadThing upload failed: ${response.error.message}`);
+	}
+	return response.data.ufsUrl;
+}
+
+async function uploadVideoBufferToUploadThing(buffer, originalName) {
+	const ext = path.extname(originalName || "").toLowerCase() || ".mp4";
+	const allowed = [".mp4", ".mov", ".webm", ".mkv"];
+	const useExt = allowed.includes(ext) ? ext : ".mp4";
+	const fileName = `video-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}${useExt}`;
+	const mimeByExt = {
+		".mp4": "video/mp4",
+		".mov": "video/quicktime",
+		".webm": "video/webm",
+		".mkv": "video/x-matroska",
+	};
+	const mime = mimeByExt[useExt] || "application/octet-stream";
+	const utFile = new UTFile([buffer], fileName, { type: mime });
 	const [response] = await utapi.uploadFiles([utFile]);
 	if (response.error) {
 		throw new Error(`UploadThing upload failed: ${response.error.message}`);
@@ -8540,7 +8576,7 @@ app.post("/scrape-reddit", async (c) => {
 
 			// Extract description from various meta tags
 			metadata.description =
-				$('meta[name="description"]').attr("content") ||
+				$('meta[nbrd.superproxy.ioame="description"]').attr("content") ||
 				$('meta[property="og:description"]').attr("content") ||
 				$('meta[name="twitter:description"]').attr("content") ||
 				$('meta[name="summary"]').attr("content") ||
@@ -11966,165 +12002,6 @@ app.post("/api/codegen", async (c) => {
 	});
 });
 
-// ─── Asset Generation — shared skill runner ───────────────────────────────────
-//
-// Maps URL-friendly route :type param → SKILLS key
-const ASSET_SKILL_MAP = {
-	blog: "blog",
-	article: "article",
-	email: "newsletter",
-	newsletter: "newsletter",
-	linkedin: "linkedin",
-	twitter: "twitter",
-	substack: "substack",
-	scrape: "scrape",
-	infographics: "infographics-svg-generator",
-	table: "table",
-	landing: "landing-page-generator",
-	"landing-page": "landing-page-generator",
-	gallery: "image-gallery-creator",
-	"image-gallery": "image-gallery-creator",
-};
-
-/**
- * Scrape a list of URLs, then run the requested SKILL against the scraped sources.
- * Returns the parsed result object (content string or structured JSON depending on skill).
- */
-function clampGalleryMaxImages(n) {
-	const x = Number(n);
-	if (!Number.isFinite(x)) return 6;
-	return Math.min(10, Math.max(1, Math.floor(x)));
-}
-
-async function runSkillAsset(
-	skillType,
-	{
-		urls = [],
-		prompt = "",
-		format = "substack",
-		style = "casual",
-		maxImages: maxImagesRaw,
-	} = {},
-) {
-	const skill = SKILLS[skillType];
-	if (!skill || skill.maxTokens <= 1) {
-		throw new Error(`"${skillType}" is not a content-generation skill`);
-	}
-
-	const maxImages =
-		skillType === "image-gallery-creator"
-			? clampGalleryMaxImages(maxImagesRaw)
-			: undefined;
-
-	// Scrape each URL in parallel; silently drop failures
-	const sources = [];
-	if (urls.length > 0) {
-		const settled = await Promise.allSettled(
-			urls.slice(0, 10).map(async (url) => {
-				const r = await scrapeSingleUrlWithPuppeteer(url, {
-					includeSemanticContent: true,
-					extractMetadata: true,
-					includeImages: true,
-					includeLinks: true,
-					timeout: 30_000,
-				});
-				return {
-					url,
-					markdown: r.markdown || "",
-					title: r.data?.title || "",
-					links: r.data?.links || [],
-					images: r.data?.images || [],
-				};
-			}),
-		);
-		for (const r of settled) {
-			if (r.status !== "fulfilled") continue;
-			const v = r.value;
-			const hasText = Boolean(v.markdown && String(v.markdown).trim());
-			const hasImgs = Array.isArray(v.images) && v.images.length > 0;
-			if (hasText || hasImgs) sources.push(v);
-		}
-	}
-
-	const skillOpts = skillType === "image-gallery-creator" ? { maxImages } : {};
-	const system = skill.buildSystemPrompt(
-		format,
-		style,
-		sources.length > 0,
-		skillOpts,
-	);
-	const user = skill.buildUserContent(
-		String(prompt).trim(),
-		sources,
-		skillOpts,
-	);
-	const fmt = String(format || "")
-		.trim()
-		.toLowerCase();
-	const isJson =
-		skillType === "infographics-svg-generator" ||
-		skillType === "image-gallery-creator" ||
-		skillType === "table" ||
-		(skillType === "scrape" && fmt === "json");
-	const maxOut = Math.min(skill.maxTokens, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
-
-	const or = await openRouterChatMessages(
-		process.env.OPENROUTER_API_KEY,
-		[
-			{ role: "system", content: system },
-			{ role: "user", content: user },
-		],
-		maxOut,
-		isJson ? { response_format: { type: "json_object" } } : {},
-	);
-	const content = or.content;
-
-	const attachOpenRouterMeta = (out) => ({
-		...out,
-		tokenUsage: or.tokenUsage,
-		usage: or.usage,
-		model: or.model,
-		aiPrompt: or.aiPrompt,
-	});
-
-	if (skill.parseResponse) {
-		const parsed = skill.parseResponse(content);
-		if (
-			skillType === "image-gallery-creator" &&
-			parsed &&
-			Array.isArray(parsed.images)
-		) {
-			parsed.images = parsed.images.slice(0, maxImages);
-			parsed.maxImages = maxImages;
-		}
-		return attachOpenRouterMeta(parsed);
-	}
-
-	// Table: try to parse as JSON, fall back to raw string
-	if (skillType === "table") {
-		try {
-			const j = JSON.parse(content.replace(/```json|```/gi, "").trim());
-			return attachOpenRouterMeta({ columns: j.columns || [], rows: j.rows || [] });
-		} catch {
-			return attachOpenRouterMeta({ content: content.trim() });
-		}
-	}
-
-	// Scrape + JSON: return parsed value (json_object mode returns a JSON string)
-	if (skillType === "scrape" && fmt === "json") {
-		try {
-			const raw = String(content || "")
-				.trim()
-				.replace(/```json|```/gi, "")
-				.trim();
-			return attachOpenRouterMeta({ content: JSON.parse(raw) });
-		} catch {
-			return attachOpenRouterMeta({ content: content.trim() });
-		}
-	}
-
-	return attachOpenRouterMeta({ content: content.trim() });
-}
 
 // ─── G2 product search — multi-page scrape + chunked LLM extraction ───────────
 // POST /g2-product-search-research
@@ -12412,10 +12289,7 @@ async function runG2ProductSearchResearchPipeline(opts) {
 				totalChunks: chunks.length,
 				markdown: chunks[ci],
 			});
-			aggUsageSnake = mergeOpenRouterUsageSnake(
-				aggUsageSnake,
-				extracted.usage,
-			);
+			aggUsageSnake = mergeOpenRouterUsageSnake(aggUsageSnake, extracted.usage);
 			openRouterCalls.push({
 				label: `g2_extract_p${page}_c${ci}`,
 				usage: extracted.usage,
@@ -12665,14 +12539,180 @@ app.post("/g2-product-search-research", async (c) => {
 	}
 });
 
+// ─── Asset Generation — shared skill runner ───────────────────────────────────
+//
+// Maps URL-friendly route :type param → SKILLS key
+const ASSET_SKILL_MAP = {
+	blog: "blog",
+	article: "article",
+	email: "newsletter",
+	newsletter: "newsletter",
+	linkedin: "linkedin",
+	twitter: "twitter",
+	substack: "substack",
+	scrape: "scrape",
+	invoice: "invoice",
+	infographics: "infographics-svg-generator",
+	table: "table",
+	landing: "landing-page-generator",
+	"landing-page": "landing-page-generator",
+	gallery: "image-gallery-creator",
+	"image-gallery": "image-gallery-creator",
+};
+
+/**
+ * Scrape a list of URLs, then run the requested SKILL against the scraped sources.
+ * Returns the parsed result object (content string or structured JSON depending on skill).
+ */
+function clampGalleryMaxImages(n) {
+	const x = Number(n);
+	if (!Number.isFinite(x)) return 6;
+	return Math.min(10, Math.max(1, Math.floor(x)));
+}
+
+async function runSkillAsset(
+	skillType,
+	{
+		urls = [],
+		prompt = "",
+		format = "substack",
+		style = "casual",
+		maxImages: maxImagesRaw,
+	} = {},
+) {
+	const skill = SKILLS[skillType];
+	if (!skill || skill.maxTokens <= 1) {
+		throw new Error(`"${skillType}" is not a content-generation skill`);
+	}
+
+	const maxImages =
+		skillType === "image-gallery-creator"
+			? clampGalleryMaxImages(maxImagesRaw)
+			: undefined;
+
+	// Scrape each URL in parallel; silently drop failures
+	const sources = [];
+	if (urls.length > 0) {
+		const settled = await Promise.allSettled(
+			urls.slice(0, 10).map(async (url) => {
+				const r = await scrapeSingleUrlWithPuppeteer(url, {
+					includeSemanticContent: true,
+					extractMetadata: true,
+					includeImages: true,
+					includeLinks: true,
+					timeout: 30_000,
+				});
+				return {
+					url,
+					markdown: r.markdown || "",
+					title: r.data?.title || "",
+					links: r.data?.links || [],
+					images: r.data?.images || [],
+				};
+			}),
+		);
+		for (const r of settled) {
+			if (r.status !== "fulfilled") continue;
+			const v = r.value;
+			const hasText = Boolean(v.markdown && String(v.markdown).trim());
+			const hasImgs = Array.isArray(v.images) && v.images.length > 0;
+			if (hasText || hasImgs) sources.push(v);
+		}
+	}
+
+	const skillOpts = skillType === "image-gallery-creator" ? { maxImages } : {};
+	const system = skill.buildSystemPrompt(
+		format,
+		style,
+		sources.length > 0,
+		skillOpts,
+	);
+	const user = skill.buildUserContent(
+		String(prompt).trim(),
+		sources,
+		skillOpts,
+	);
+	const fmt = String(format || "")
+		.trim()
+		.toLowerCase();
+	const isJson =
+		skillType === "infographics-svg-generator" ||
+		skillType === "image-gallery-creator" ||
+		skillType === "table" ||
+		(skillType === "scrape" && fmt === "json") ||
+		(skillType === "invoice" && fmt === "json");
+	const maxOut = Math.min(skill.maxTokens, INKGEST_SKILL_MAX_OUTPUT_TOKENS);
+
+	const or = await openRouterChatMessages(
+		process.env.OPENROUTER_API_KEY,
+		[
+			{ role: "system", content: system },
+			{ role: "user", content: user },
+		],
+		maxOut,
+		isJson ? { response_format: { type: "json_object" } } : {},
+	);
+	const content = or.content;
+
+	const attachOpenRouterMeta = (out) => ({
+		...out,
+		tokenUsage: or.tokenUsage,
+		usage: or.usage,
+		model: or.model,
+		aiPrompt: or.aiPrompt,
+	});
+
+	if (skill.parseResponse) {
+		const parsed = skill.parseResponse(content);
+		if (
+			skillType === "image-gallery-creator" &&
+			parsed &&
+			Array.isArray(parsed.images)
+		) {
+			parsed.images = parsed.images.slice(0, maxImages);
+			parsed.maxImages = maxImages;
+		}
+		return attachOpenRouterMeta(parsed);
+	}
+
+	// Table: try to parse as JSON, fall back to raw string
+	if (skillType === "table") {
+		try {
+			const j = JSON.parse(content.replace(/```json|```/gi, "").trim());
+			return attachOpenRouterMeta({
+				columns: j.columns || [],
+				rows: j.rows || [],
+			});
+		} catch {
+			return attachOpenRouterMeta({ content: content.trim() });
+		}
+	}
+
+	// Scrape + JSON: return parsed value (json_object mode returns a JSON string)
+	if (skillType === "scrape" && fmt === "json") {
+		try {
+			const raw = String(content || "")
+				.trim()
+				.replace(/```json|```/gi, "")
+				.trim();
+			return attachOpenRouterMeta({ content: JSON.parse(raw) });
+		} catch {
+			return attachOpenRouterMeta({ content: content.trim() });
+		}
+	}
+
+	return attachOpenRouterMeta({ content: content.trim() });
+}
+
 // ─── POST /generate/:type ─────────────────────────────────────────────────────
 // Supported :type values (see ASSET_SKILL_MAP):
-//   blog | article | email | newsletter | linkedin | twitter | substack | scrape | infographics | table |
+//   blog | article | email | newsletter | linkedin | twitter | substack | scrape | invoice | infographics | table |
 //   landing | landing-page | gallery | image-gallery |
 //   image-reading | images — body: { images: [...] } (Gemini vision; same as POST /image-reading)
 //
 // Request body: { urls?: string[], prompt?: string, format?: string, style?: string, maxImages?: number (1–10, gallery only) }
 //   scrape: format defaults to "markdown"; use markdown | html | plain | text | json (output shape follows format)
+//   invoice: format defaults to "json"; use json | markdown | react | html (structured invoice + optional scraped URLs)
 // Response: { success, type, skillType, urls, content|infographics|columns/rows|images|markdown, timestamp }
 app.post("/generate/:type", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
@@ -12773,7 +12813,9 @@ app.post("/generate/:type", async (c) => {
 			? formatRaw
 			: typeName === "scrape"
 				? "markdown"
-				: "substack";
+				: typeName === "invoice"
+					? "json"
+					: "substack";
 
 	const urlList = (Array.isArray(urls) ? urls : [urls]).filter(
 		(u) => typeof u === "string" && /^https?:\/\//i.test(u),
@@ -13279,6 +13321,289 @@ app.post("/ai-resume-builder", async (c) => {
 	});
 });
 
+/** Response headers for /api/video-translate/* (IDs + caption URL for clients that read headers). */
+function applyVideoTranslateApiHeaders(c, opts = {}) {
+	const { videoTranslateId, captionUrl, cacheLanguages } = opts;
+	c.header("X-Content-Type-Options", "nosniff");
+	if (cacheLanguages) {
+		c.header("Cache-Control", "public, max-age=86400");
+	} else {
+		c.header("Cache-Control", "no-store, private, max-age=0");
+	}
+	if (videoTranslateId) {
+		c.header("X-Video-Translate-Id", String(videoTranslateId));
+	}
+	if (captionUrl) {
+		c.header("X-Caption-Url", String(captionUrl));
+	}
+}
+
+/** GET /api/video-translate/languages — supported output_language labels (OpenRouter path) */
+app.get("/api/video-translate/languages", async (c) => {
+	applyVideoTranslateApiHeaders(c, { cacheLanguages: true });
+	return c.json(getVideoTranslateLanguagesResponse());
+});
+
+/** GET /api/video-translate/caption — caption text + caption URL (VTT on UploadThing) when job is complete */
+app.get("/api/video-translate/caption", async (c) => {
+	const videoTranslateId = c.req.query("video_translate_id");
+	const out = await getVideoTranslateCaptionResponse(videoTranslateId);
+	const status = out.httpStatus ?? 200;
+	const { httpStatus: _h, ...rest } = out;
+	const capUrl = rest?.data?.caption_url;
+	applyVideoTranslateApiHeaders(c, {
+		videoTranslateId,
+		captionUrl: capUrl,
+	});
+	return c.json(rest, status);
+});
+
+/** POST /api/video-translate only: per-IP sliding window (same mechanism as /generate/:type). */
+const VIDEO_TRANSLATE_POST_RATE_LIMIT = 10;
+const VIDEO_TRANSLATE_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * POST /api/video-translate
+ * JSON: { video_url | videoUrl, output_language | output_languages, ... }
+ * multipart: file or video (uploads to UploadThing), optional video_url, output_language, etc.
+ * Auth: non-empty Authorization (Bearer &lt;token&gt; or raw token string). Rate limited per IP.
+ */
+app.post("/api/video-translate", async (c) => {
+	const vtAuthHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const vtAuthToken = vtAuthHdr?.startsWith("Bearer ")
+		? vtAuthHdr.slice(7).trim()
+		: vtAuthHdr?.trim();
+	if (!vtAuthToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
+			401,
+		);
+	}
+
+	const xff = c.req.header("x-forwarded-for");
+	const vtIp =
+		xff?.split(",")?.[0]?.trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const vtRl = rateLimit(
+		vtIp,
+		VIDEO_TRANSLATE_POST_RATE_LIMIT,
+		VIDEO_TRANSLATE_POST_RATE_WINDOW_MS,
+	);
+	if (!vtRl.allowed) {
+		c.header("Retry-After", String(vtRl.retryAfter));
+		c.header("X-RateLimit-Limit", String(VIDEO_TRANSLATE_POST_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window", "10 minutes");
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: vtRl.retryAfter,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(VIDEO_TRANSLATE_POST_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(vtRl.remaining));
+	c.header("X-RateLimit-Window", "10 minutes");
+
+	const contentType = c.req.header("content-type") || "";
+	let videoUrl;
+	let body = {};
+
+	const parseBool = (v) => v === true || v === "true" || v === "1";
+
+	if (contentType.includes("multipart/form-data")) {
+		let form;
+		try {
+			form = await c.req.formData();
+		} catch {
+			return c.json(
+				{
+					error:
+						"Invalid multipart/form-data payload. Use proper multipart encoding (-F in curl) or send JSON.",
+				},
+				400,
+			);
+		}
+		const fileField = form.get("file") || form.get("video");
+		if (
+			fileField &&
+			typeof fileField === "object" &&
+			"arrayBuffer" in fileField
+		) {
+			if (!process.env.UPLOADTHING_TOKEN) {
+				return c.json(
+					{
+						error:
+							"UPLOADTHING_TOKEN not configured (required to upload video files)",
+						code: "MISSING_UPLOAD_TOKEN",
+					},
+					503,
+				);
+			}
+			try {
+				const ab = await fileField.arrayBuffer();
+				const buf = Buffer.from(ab);
+				const origName =
+					typeof fileField.name === "string" ? fileField.name : "upload.mp4";
+				videoUrl = await uploadVideoBufferToUploadThing(buf, origName);
+			} catch (e) {
+				return c.json(
+					{ error: e?.message || "Video upload failed" },
+					502,
+				);
+			}
+		}
+		if (!videoUrl) {
+			videoUrl = form.get("video_url") || form.get("videoUrl");
+		}
+		const ol = form.get("output_language");
+		const ols = form.get("output_languages");
+		if (ol) body.output_language = String(ol);
+		if (ols) {
+			try {
+				body.output_languages =
+					typeof ols === "string" ? JSON.parse(ols) : ols;
+			} catch {
+				return c.json(
+					{
+						error:
+							"output_languages must be a JSON array string (e.g. [\"Spanish\",\"French\"])",
+					},
+					400,
+				);
+			}
+		}
+		if (form.has("title")) body.title = String(form.get("title") ?? "");
+		if (form.has("translate_audio_only")) {
+			body.translate_audio_only = parseBool(form.get("translate_audio_only"));
+		}
+		if (form.has("keep_the_same_format")) {
+			body.keep_the_same_format = parseBool(form.get("keep_the_same_format"));
+		}
+		if (form.has("mode")) body.mode = String(form.get("mode") ?? "fast");
+		if (form.has("speaker_num")) {
+			const n = Number(form.get("speaker_num"));
+			if (!Number.isNaN(n)) body.speaker_num = n;
+		}
+		if (form.has("callback_id")) body.callback_id = String(form.get("callback_id") ?? "");
+		if (form.has("enable_dynamic_duration")) {
+			body.enable_dynamic_duration = String(
+				form.get("enable_dynamic_duration") ?? "",
+			);
+		}
+		if (form.has("brand_voice_id")) {
+			body.brand_voice_id = String(form.get("brand_voice_id") ?? "");
+		}
+		if (form.has("callback_url")) {
+			body.callback_url = String(form.get("callback_url") ?? "");
+		}
+	} else if (contentType.includes("application/json")) {
+		try {
+			body = await c.req.json();
+		} catch {
+			return c.json({ error: "Invalid JSON body" }, 400);
+		}
+		videoUrl = body.video_url || body.videoUrl;
+	} else {
+		return c.json(
+			{
+				error: "Unsupported Content-Type. Use application/json or multipart/form-data.",
+			},
+			415,
+		);
+	}
+
+	if (!videoUrl || !String(videoUrl).trim()) {
+		return c.json(
+			{
+				error:
+					"Provide video_url (or videoUrl) or upload a video file (field: file or video)",
+			},
+			400,
+		);
+	}
+
+	if (!body.output_language && !body.output_languages) {
+		return c.json(
+			{ error: "Provide output_language or output_languages" },
+			400,
+		);
+	}
+	if (body.output_language && body.output_languages) {
+		return c.json(
+			{ error: "Use only one of output_language or output_languages" },
+			400,
+		);
+	}
+
+	const payload = {
+		video_url: String(videoUrl).trim(),
+		translate_audio_only: body.translate_audio_only ?? false,
+		keep_the_same_format: body.keep_the_same_format ?? false,
+		mode: body.mode ?? "fast",
+	};
+	if (body.output_language) {
+		payload.output_language = body.output_language;
+	} else {
+		payload.output_languages = body.output_languages;
+	}
+	if (body.title) payload.title = body.title;
+	if (body.speaker_num != null && !Number.isNaN(Number(body.speaker_num))) {
+		payload.speaker_num = Number(body.speaker_num);
+	}
+	if (body.callback_id) payload.callback_id = body.callback_id;
+	if (body.enable_dynamic_duration) {
+		payload.enable_dynamic_duration = body.enable_dynamic_duration;
+	}
+	if (body.brand_voice_id) payload.brand_voice_id = body.brand_voice_id;
+	if (body.callback_url) payload.callback_url = body.callback_url;
+
+	const out = await createVideoTranslateJobs({
+		videoUrl: payload.video_url,
+		body: {
+			output_language: payload.output_language,
+			output_languages: payload.output_languages,
+			title: payload.title,
+			callback_id: payload.callback_id,
+		},
+	});
+	const status = out.httpStatus ?? 200;
+	const { httpStatus: _h, ...rest } = out;
+	const createdId =
+		rest?.data?.video_translate_id ??
+		(Array.isArray(rest?.data?.video_translate_ids)
+			? rest.data.video_translate_ids[0]
+			: null);
+	applyVideoTranslateApiHeaders(c, {
+		videoTranslateId: createdId,
+		captionUrl: rest?.data?.caption_url,
+	});
+	return c.json(rest, status);
+});
+
+/** GET /api/video-translate/:id — job status (Firestore); transcript, caption string, caption_url when success */
+app.get("/api/video-translate/:id", async (c) => {
+	const id = c.req.param("id");
+	const out = await getVideoTranslateJobStatus(id);
+	const status = out.httpStatus ?? 200;
+	const { httpStatus: _h, ...rest } = out;
+	const d = rest?.data;
+	applyVideoTranslateApiHeaders(c, {
+		videoTranslateId: id,
+		captionUrl: d?.caption_url,
+	});
+	return c.json(rest, status);
+});
+
 const port = 3002;
 console.log(`Server is running on port ${port}`);
 
@@ -13287,8 +13612,3 @@ serve({
 	fetch: app.fetch,
 	port,
 });
-
-const isDevelopment = process.env.NODE_ENV === "development";
-const origin = isDevelopment
-	? "http://localhost:3001"
-	: "https://ihatereading-ai.vercel.app";
