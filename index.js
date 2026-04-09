@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
+import { streamSSE } from "hono/streaming";
 import { cors } from "hono/cors";
 import { firestore, storage } from "./config/firebase.js";
 import { FieldValue } from "firebase-admin/firestore";
@@ -21,6 +22,8 @@ import {
 import {
 	getVideoTranslateLanguagesResponse,
 	getVideoTranslateCaptionResponse,
+	subscribeVideoTranslateCaptionUpdates,
+	VIDEO_TRANSLATE_CAPTION_SSE_MAX_MS,
 	createVideoTranslateJobs,
 	getVideoTranslateJobStatus,
 } from "./lib/videoTranslateOpenRouter.js";
@@ -13346,9 +13349,137 @@ app.get("/api/video-translate/languages", async (c) => {
 	return c.json(getVideoTranslateLanguagesResponse());
 });
 
-/** GET /api/video-translate/caption — caption text + caption URL (VTT on UploadThing) when job is complete */
+/**
+ * GET /api/video-translate/caption — caption text + caption URL (VTT on UploadThing) when job is complete.
+ * Default: JSON snapshot (404 until ready).
+ * SSE: ?stream=1 or Accept: text/event-stream — Firestore-backed progress + final caption (or error).
+ */
 app.get("/api/video-translate/caption", async (c) => {
 	const videoTranslateId = c.req.query("video_translate_id");
+	const accept = (c.req.header("accept") || "").toLowerCase();
+	const wantSse =
+		c.req.query("stream") === "1" ||
+		c.req.query("stream") === "true" ||
+		accept.includes("text/event-stream");
+
+	if (wantSse) {
+		if (!videoTranslateId || !String(videoTranslateId).trim()) {
+			return c.json(
+				{
+					error: "Query video_translate_id is required",
+					code: "BAD_REQUEST",
+				},
+				400,
+			);
+		}
+		const id = String(videoTranslateId).trim();
+		applyVideoTranslateApiHeaders(c, { videoTranslateId: id });
+
+		return streamSSE(c, async (stream) => {
+			let finished = false;
+			let unsubscribe = () => {};
+			const finish = () => {
+				if (finished) return;
+				finished = true;
+				try {
+					unsubscribe();
+				} catch {}
+			};
+
+			const timer = setTimeout(async () => {
+				if (finished) return;
+				finished = true;
+				try {
+					unsubscribe();
+				} catch {}
+				try {
+					await stream.writeSSE({
+						event: "error",
+						data: JSON.stringify({
+							error: "Caption wait exceeded max duration",
+							code: "TIMEOUT",
+						}),
+					});
+					await stream.writeSSE({
+						event: "done",
+						data: JSON.stringify({ ok: false }),
+					});
+				} catch {}
+			}, VIDEO_TRANSLATE_CAPTION_SSE_MAX_MS);
+
+			unsubscribe = subscribeVideoTranslateCaptionUpdates(id, (evt) => {
+				void (async () => {
+					try {
+						if (evt.kind === "progress") {
+							await stream.writeSSE({
+								event: "progress",
+								data: JSON.stringify({ status: evt.status }),
+							});
+							return;
+						}
+						clearTimeout(timer);
+						if (evt.kind === "ready") {
+							await stream.writeSSE({
+								event: "caption",
+								data: JSON.stringify({
+									error: null,
+									data: evt.data,
+								}),
+							});
+							await stream.writeSSE({
+								event: "done",
+								data: JSON.stringify({ ok: true }),
+							});
+							finish();
+							return;
+						}
+						if (evt.kind === "not_found") {
+							await stream.writeSSE({
+								event: "error",
+								data: JSON.stringify({
+									error: "Unknown video_translate_id",
+									code: "NOT_FOUND",
+								}),
+							});
+						} else if (evt.kind === "failed") {
+							await stream.writeSSE({
+								event: "error",
+								data: JSON.stringify({
+									error: evt.message || "Job failed",
+									code: "FAILED",
+								}),
+							});
+						} else if (evt.kind === "listener_error") {
+							await stream.writeSSE({
+								event: "error",
+								data: JSON.stringify({
+									error: evt.message || "Listener error",
+									code: "LISTENER_ERROR",
+								}),
+							});
+						}
+						await stream.writeSSE({
+							event: "done",
+							data: JSON.stringify({ ok: false }),
+						});
+						finish();
+					} catch (e) {
+						try {
+							await stream.writeSSE({
+								event: "error",
+								data: JSON.stringify({
+									error: e?.message || "Stream error",
+									code: "STREAM_ERROR",
+								}),
+							});
+						} catch {}
+						finish();
+					}
+				})();
+			});
+		});
+	}
+
 	const out = await getVideoTranslateCaptionResponse(videoTranslateId);
 	const status = out.httpStatus ?? 200;
 	const { httpStatus: _h, ...rest } = out;
