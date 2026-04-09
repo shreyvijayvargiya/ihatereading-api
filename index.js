@@ -28,6 +28,10 @@ import {
 	getVideoTranslateJobStatus,
 } from "./lib/videoTranslateOpenRouter.js";
 import {
+	runVoiceTranslateText,
+	guessAudioFormatFromFilename,
+} from "./lib/voiceTranslateText.js";
+import {
 	parseRepoUrl,
 	analyzeRepo,
 	analyzeSingleFile,
@@ -1365,6 +1369,7 @@ app.use(
 		exposeHeaders: [
 			"X-Video-Translate-Id",
 			"X-Caption-Url",
+			"X-Audio-Input-Url",
 			"X-Content-Type-Options",
 			"Cache-Control",
 		],
@@ -7717,6 +7722,45 @@ async function uploadVideoBufferToUploadThing(buffer, originalName) {
 	return response.data.ufsUrl;
 }
 
+async function uploadAudioBufferToUploadThing(buffer, originalName) {
+	const ext = path.extname(originalName || "").toLowerCase() || ".mp3";
+	const allowed = [
+		".mp3",
+		".wav",
+		".m4a",
+		".aac",
+		".ogg",
+		".oga",
+		".webm",
+		".flac",
+		".aiff",
+		".aif",
+		".mp4",
+	];
+	const useExt = allowed.includes(ext) ? ext : ".mp3";
+	const fileName = `audio-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}${useExt}`;
+	const mimeByExt = {
+		".mp3": "audio/mpeg",
+		".wav": "audio/wav",
+		".m4a": "audio/mp4",
+		".aac": "audio/aac",
+		".ogg": "audio/ogg",
+		".oga": "audio/ogg",
+		".webm": "audio/webm",
+		".flac": "audio/flac",
+		".aiff": "audio/aiff",
+		".aif": "audio/aiff",
+		".mp4": "audio/mp4",
+	};
+	const mime = mimeByExt[useExt] || "application/octet-stream";
+	const utFile = new UTFile([buffer], fileName, { type: mime });
+	const [response] = await utapi.uploadFiles([utFile]);
+	if (response.error) {
+		throw new Error(`UploadThing audio upload failed: ${response.error.message}`);
+	}
+	return response.data.ufsUrl;
+}
+
 async function smartCaptureScreenshot(url, options = {}) {
 	const {
 		device = "desktop",
@@ -13491,14 +13535,219 @@ app.get("/api/video-translate/caption", async (c) => {
 	return c.json(rest, status);
 });
 
+/** Headers for POST /api/voice-translate/text */
+function applyVoiceTranslateTextHeaders(c) {
+	c.header("X-Content-Type-Options", "nosniff");
+	c.header("Cache-Control", "no-store, private, max-age=0");
+}
+
+const VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT = 20;
+const VOICE_TRANSLATE_TEXT_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * POST /api/voice-translate/text (and alias POST /api/video-translate/text — same handler)
+ * JSON: { text | source_text, audio_url | audioUrl, languages | output_languages, include_audio?: boolean, model | llm_model?: preset }
+ * multipart: fields audio or file (upload → UploadThing), optional audio_url, optional text, languages (JSON array or comma-separated), include_audio, optional model / llm_model
+ * LLM preset (optional; default Gemini): gemini | gpt-4o-mini | sonnet | kimi | grok — see lib/translateLlmModels.js
+ * Source: text only, audio URL only, or audio file (file wins over text when both sent).
+ * Auth: Bearer token. Aggregated usage (transcribe + translation + TTS) in usage / tokenUsage.
+ */
+const handleVoiceTranslateTextPost = async (c) => {
+	const authHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const authToken = authHdr?.startsWith("Bearer ")
+		? authHdr.slice(7).trim()
+		: authHdr?.trim();
+	if (!authToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
+			401,
+		);
+	}
+
+	const xff = c.req.header("x-forwarded-for");
+	const vtIp =
+		xff?.split(",")?.[0]?.trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const rl = rateLimit(
+		vtIp,
+		VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT,
+		VOICE_TRANSLATE_TEXT_POST_RATE_WINDOW_MS,
+	);
+	if (!rl.allowed) {
+		c.header("Retry-After", String(rl.retryAfter));
+		c.header("X-RateLimit-Limit", String(VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window", "10 minutes");
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: rl.retryAfter,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(rl.remaining));
+	c.header("X-RateLimit-Window", "10 minutes");
+
+	const parseBool = (v) => v === true || v === "true" || v === "1";
+	const parseLanguages = (raw) => {
+		if (raw == null || raw === "") return undefined;
+		if (Array.isArray(raw)) return raw;
+		if (typeof raw === "string") {
+			const s = raw.trim();
+			if (s.startsWith("[")) {
+				try {
+					return JSON.parse(s);
+				} catch {
+					return undefined;
+				}
+			}
+			return s.split(",").map((x) => x.trim()).filter(Boolean);
+		}
+		return raw;
+	};
+
+	let text;
+	let audioUrl;
+	let audioBuffer;
+	let audioFormat;
+	let languages;
+	let includeAudio = true;
+	let modelOpt;
+	let llmModelOpt;
+
+	const contentType = c.req.header("content-type") || "";
+
+	if (contentType.includes("multipart/form-data")) {
+		let form;
+		try {
+			form = await c.req.formData();
+		} catch {
+			return c.json(
+				{ error: "Invalid multipart/form-data payload" },
+				400,
+			);
+		}
+		const fileField = form.get("audio") || form.get("file");
+		if (
+			fileField &&
+			typeof fileField === "object" &&
+			"arrayBuffer" in fileField
+		) {
+			if (!process.env.UPLOADTHING_TOKEN) {
+				return c.json(
+					{
+						error:
+							"UPLOADTHING_TOKEN not configured (required to upload audio files)",
+						code: "MISSING_UPLOAD_TOKEN",
+					},
+					503,
+				);
+			}
+			try {
+				const ab = await fileField.arrayBuffer();
+				audioBuffer = Buffer.from(ab);
+				const origName =
+					typeof fileField.name === "string" ? fileField.name : "audio.mp3";
+				audioFormat = guessAudioFormatFromFilename(origName);
+				const uploadedUrl = await uploadAudioBufferToUploadThing(
+					audioBuffer,
+					origName,
+				);
+				audioUrl = uploadedUrl;
+			} catch (e) {
+				return c.json(
+					{ error: e?.message || "Audio upload failed" },
+					502,
+				);
+			}
+		}
+		if (!audioUrl) {
+			audioUrl =
+				form.get("audio_url") ||
+				form.get("audioUrl") ||
+				undefined;
+		}
+		const tf = form.get("text");
+		const sf = form.get("source_text");
+		if (tf != null && String(tf).trim() !== "") text = String(tf);
+		else if (sf != null) text = String(sf);
+		languages = parseLanguages(form.get("languages") ?? form.get("output_languages"));
+		if (form.has("include_audio")) {
+			includeAudio = parseBool(form.get("include_audio"));
+		}
+		if (form.has("includeAudio")) {
+			includeAudio = parseBool(form.get("includeAudio"));
+		}
+		const mf = form.get("model");
+		const lmf = form.get("llm_model");
+		if (mf != null && String(mf).trim() !== "") modelOpt = String(mf).trim();
+		if (lmf != null && String(lmf).trim() !== "") llmModelOpt = String(lmf).trim();
+	} else if (contentType.includes("application/json")) {
+		let body = {};
+		try {
+			body = await c.req.json();
+		} catch {
+			return c.json({ error: "Invalid JSON body" }, 400);
+		}
+		text = body.text ?? body.source_text;
+		audioUrl = body.audio_url ?? body.audioUrl;
+		languages = body.languages ?? body.output_languages;
+		includeAudio =
+			body.include_audio !== false && body.includeAudio !== false;
+		modelOpt = body.model;
+		llmModelOpt = body.llm_model;
+	} else {
+		return c.json(
+			{
+				error:
+					"Unsupported Content-Type. Use application/json or multipart/form-data.",
+			},
+			415,
+		);
+	}
+
+	const out = await runVoiceTranslateText({
+		text,
+		audioUrl: audioUrl ? String(audioUrl).trim() : undefined,
+		audioBuffer,
+		audioFormat,
+		languages,
+		includeAudio,
+		model: modelOpt,
+		llmModel: llmModelOpt,
+	});
+	const status = out.httpStatus ?? 200;
+	const { httpStatus: _h, ...rest } = out;
+	applyVoiceTranslateTextHeaders(c);
+	if (audioUrl && rest?.data && typeof rest.data === "object") {
+		c.header("X-Audio-Input-Url", String(audioUrl).slice(0, 2048));
+	}
+	return c.json(rest, status);
+};
+
+app.post("/api/voice-translate/text", handleVoiceTranslateTextPost);
+/** Same as /api/voice-translate/text — avoids 404 when clients use "video" instead of "voice". */
+app.post("/api/video-translate/text", handleVoiceTranslateTextPost);
+
 /** POST /api/video-translate only: per-IP sliding window (same mechanism as /generate/:type). */
 const VIDEO_TRANSLATE_POST_RATE_LIMIT = 10;
 const VIDEO_TRANSLATE_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
 
 /**
  * POST /api/video-translate
- * JSON: { video_url | videoUrl, output_language | output_languages, ... }
- * multipart: file or video (uploads to UploadThing), optional video_url, output_language, etc.
+ * JSON: { video_url | videoUrl, output_language | output_languages, model | llm_model?: preset, ... }
+ * multipart: file or video (uploads to UploadThing), optional video_url, output_language, optional model / llm_model, etc.
+ * LLM preset (optional; default Gemini): gemini | gpt-4o-mini | sonnet | kimi | grok — see lib/translateLlmModels.js
  * Auth: non-empty Authorization (Bearer &lt;token&gt; or raw token string). Rate limited per IP.
  */
 app.post("/api/video-translate", async (c) => {
@@ -13639,6 +13888,14 @@ app.post("/api/video-translate", async (c) => {
 		if (form.has("callback_url")) {
 			body.callback_url = String(form.get("callback_url") ?? "");
 		}
+		const modelField = form.get("model");
+		if (modelField != null && String(modelField).trim() !== "") {
+			body.model = String(modelField).trim();
+		}
+		const llmModelField = form.get("llm_model");
+		if (llmModelField != null && String(llmModelField).trim() !== "") {
+			body.llm_model = String(llmModelField).trim();
+		}
 	} else if (contentType.includes("application/json")) {
 		try {
 			body = await c.req.json();
@@ -13707,6 +13964,8 @@ app.post("/api/video-translate", async (c) => {
 			output_languages: payload.output_languages,
 			title: payload.title,
 			callback_id: payload.callback_id,
+			model: body.model,
+			llm_model: body.llm_model,
 		},
 	});
 	const status = out.httpStatus ?? 200;
