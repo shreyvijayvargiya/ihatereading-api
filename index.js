@@ -1362,6 +1362,9 @@ app.use(
 			"http://localhost:3001",
 			"https://ihatereading.in",
 			"https://www.inkgest.com",
+			"https://vaantra.vercel.app",
+			"https://gettemplate.website/",
+			"https://swipe-emails.vercel.app",
 		], // Allow specific origins
 		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 		// Do not set allowHeaders to a fixed list: browsers send Access-Control-Request-Headers
