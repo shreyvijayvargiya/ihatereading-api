@@ -13825,6 +13825,9 @@ app.post("/api/video-translate", async (c) => {
 			"arrayBuffer" in fileField
 		) {
 			if (!process.env.UPLOADTHING_TOKEN) {
+				console.warn(
+					"[POST /api/video-translate] 503 MISSING_UPLOAD_TOKEN: multipart video upload requires UPLOADTHING_TOKEN",
+				);
 				return c.json(
 					{
 						error:
@@ -13973,6 +13976,11 @@ app.post("/api/video-translate", async (c) => {
 	});
 	const status = out.httpStatus ?? 200;
 	const { httpStatus: _h, ...rest } = out;
+	if (status === 503 && rest?.code) {
+		console.warn(
+			`[POST /api/video-translate] 503 ${rest.code}: ${rest.error || "service unavailable"} (set OPENROUTER_API_KEY and UPLOADTHING_TOKEN in .env for local runs)`,
+		);
+	}
 	const createdId =
 		rest?.data?.video_translate_id ??
 		(Array.isArray(rest?.data?.video_translate_ids)
