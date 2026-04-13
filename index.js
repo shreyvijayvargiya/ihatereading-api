@@ -30,6 +30,7 @@ import {
 import {
 	runVoiceTranslateText,
 	guessAudioFormatFromFilename,
+	uploadVoiceTranslateTtsToUploadThing,
 } from "./lib/voiceTranslateText.js";
 import {
 	parseRepoUrl,
@@ -13553,9 +13554,13 @@ const VOICE_TRANSLATE_TEXT_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
  * multipart: fields audio or file (upload → UploadThing), optional audio_url, optional text, languages (JSON array or comma-separated), include_audio, optional model / llm_model
  * LLM preset (optional; default Gemini): gemini | gpt-4o-mini | sonnet | kimi | grok — see lib/translateLlmModels.js
  * Source: text only, audio URL only, or audio file (file wins over text when both sent).
- * Auth: Bearer token. Aggregated usage (transcribe + translation + TTS) in usage / tokenUsage.
+ * Auth: Bearer token. `usage` / `tokenUsage` include prompt token counts only (no cost or price).
+ * Flow: (1) Optional file → UploadThing. (2) translate + TTS. (3) `uploadVoiceTranslateTtsToUploadThing` → `results[].audio_url` (no base64).
  */
+
+
 const handleVoiceTranslateTextPost = async (c) => {
+	const vtReqId = uuidv4();
 	const authHdr =
 		c.req.header("Authorization") || c.req.header("authorization");
 	const authToken = authHdr?.startsWith("Bearer ")
@@ -13600,6 +13605,7 @@ const handleVoiceTranslateTextPost = async (c) => {
 	c.header("X-RateLimit-Limit", String(VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT));
 	c.header("X-RateLimit-Remaining", String(rl.remaining));
 	c.header("X-RateLimit-Window", "10 minutes");
+	c.header("X-Voice-Translate-Request-Id", vtReqId);
 
 	const parseBool = (v) => v === true || v === "true" || v === "1";
 	const parseLanguages = (raw) => {
@@ -13685,12 +13691,7 @@ const handleVoiceTranslateTextPost = async (c) => {
 		if (tf != null && String(tf).trim() !== "") text = String(tf);
 		else if (sf != null) text = String(sf);
 		languages = parseLanguages(form.get("languages") ?? form.get("output_languages"));
-		if (form.has("include_audio")) {
-			includeAudio = parseBool(form.get("include_audio"));
-		}
-		if (form.has("includeAudio")) {
-			includeAudio = parseBool(form.get("includeAudio"));
-		}
+		includeAudio = true
 		const mf = form.get("model");
 		const lmf = form.get("llm_model");
 		if (mf != null && String(mf).trim() !== "") modelOpt = String(mf).trim();
@@ -13705,8 +13706,7 @@ const handleVoiceTranslateTextPost = async (c) => {
 		text = body.text ?? body.source_text;
 		audioUrl = body.audio_url ?? body.audioUrl;
 		languages = body.languages ?? body.output_languages;
-		includeAudio =
-			body.include_audio !== false && body.includeAudio !== false;
+		includeAudio = true
 		modelOpt = body.model;
 		llmModelOpt = body.llm_model;
 	} else {
@@ -13719,6 +13719,7 @@ const handleVoiceTranslateTextPost = async (c) => {
 		);
 	}
 
+	const utTok = process.env.UPLOADTHING_TOKEN?.trim();
 	const out = await runVoiceTranslateText({
 		text,
 		audioUrl: audioUrl ? String(audioUrl).trim() : undefined,
@@ -13728,9 +13729,19 @@ const handleVoiceTranslateTextPost = async (c) => {
 		includeAudio,
 		model: modelOpt,
 		llmModel: llmModelOpt,
+		afterTranslatedTts:
+			includeAudio && utTok
+				? (results) =>
+						uploadVoiceTranslateTtsToUploadThing(
+							results,
+							uploadAudioBufferToUploadThing,
+							vtReqId,
+						)
+				: undefined,
 	});
 	const status = out.httpStatus ?? 200;
 	const { httpStatus: _h, ...rest } = out;
+
 	applyVoiceTranslateTextHeaders(c);
 	if (audioUrl && rest?.data && typeof rest.data === "object") {
 		c.header("X-Audio-Input-Url", String(audioUrl).slice(0, 2048));
