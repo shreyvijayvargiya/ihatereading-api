@@ -25,6 +25,30 @@ const CHROME_LAUNCH_ARGS = [
 	"--single-process",
 ];
 
+function localChromeCandidates() {
+	if (process.platform === "darwin") {
+		return [
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		];
+	}
+	if (process.platform === "linux") {
+		return [
+			"/usr/bin/google-chrome-stable",
+			"/usr/bin/google-chrome",
+			"/usr/bin/chromium-browser",
+			"/usr/bin/chromium",
+		];
+	}
+	if (process.platform === "win32") {
+		return [
+			"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+			"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+		];
+	}
+	return [];
+}
+
 /**
  * @typedef {Object} PoolEntry
  * @property {import('puppeteer-core').Browser} browser
@@ -61,46 +85,87 @@ class BrowserPool {
 	async _launchBrowser() {
 		await this._loadDeps();
 
-		let browser;
+		const launchErrors = [];
+		const envExecutablePath = (
+			process.env.PUPPETEER_EXECUTABLE_PATH ||
+			process.env.CHROME_EXECUTABLE_PATH ||
+			process.env.CHROME_PATH ||
+			""
+		).trim();
+
+		const tryLaunch = async (label, launchOptions) => {
+			try {
+				const browser = await this._puppeteer.launch(launchOptions);
+				console.log(`[BrowserPool] Launched browser via ${label}`);
+				return browser;
+			} catch (err) {
+				launchErrors.push(
+					`${label}: ${err?.message || String(err)}`,
+				);
+				return null;
+			}
+		};
+
+		if (envExecutablePath) {
+			const viaEnv = await tryLaunch("env executable path", {
+				headless: true,
+				executablePath: envExecutablePath,
+				args: CHROME_LAUNCH_ARGS,
+			});
+			if (viaEnv) return viaEnv;
+		}
+
 		try {
 			const executablePath = await this._chromium.executablePath();
-			browser = await this._puppeteer.launch({
+			const viaSparticuz = await tryLaunch("@sparticuz/chromium", {
 				headless: true,
 				args: [...this._chromium.args, "--disable-web-security"],
 				executablePath,
 				ignoreDefaultArgs: ["--disable-extensions"],
 			});
-		} catch {
-			// Fallback to system Chrome (local dev)
-			browser = await this._puppeteer.launch({
+			if (viaSparticuz) return viaSparticuz;
+		} catch (err) {
+			launchErrors.push(
+				`@sparticuz/chromium executablePath: ${err?.message || String(err)}`,
+			);
+		}
+
+		for (const candidatePath of localChromeCandidates()) {
+			const browser = await tryLaunch(`local candidate ${candidatePath}`, {
 				headless: true,
-				executablePath:
-					"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				executablePath: candidatePath,
 				args: CHROME_LAUNCH_ARGS,
 			});
+			if (browser) return browser;
 		}
-		return browser;
+
+		throw new Error(
+			`Browser launch failed. Tried env path, @sparticuz/chromium, and local candidates. Details: ${launchErrors.join(" | ")}`,
+		);
 	}
 
 	async initialise() {
 		if (this._initialised || this._initialising) return;
 		this._initialising = true;
-		console.log(`🚀 BrowserPool: launching ${this._poolSize} browser(s)…`);
-		const launches = Array.from({ length: this._poolSize }, (_, i) =>
-			this._launchBrowser().then((browser) => {
-				const entry = { browser, busy: false, lastUsed: Date.now(), index: i };
-				this._pool.push(entry);
-				this._attachCrashHandler(entry);
-				console.log(`  ✅ Browser #${i} ready`);
-				return entry;
-			}),
-		);
-		await Promise.all(launches);
-		this._initialised = true;
-		this._initialising = false;
-		console.log(
-			`🎉 BrowserPool initialised with ${this._pool.length} browser(s)`,
-		);
+		try {
+			console.log(`🚀 BrowserPool: launching ${this._poolSize} browser(s)…`);
+			const launches = Array.from({ length: this._poolSize }, (_, i) =>
+				this._launchBrowser().then((browser) => {
+					const entry = { browser, busy: false, lastUsed: Date.now(), index: i };
+					this._pool.push(entry);
+					this._attachCrashHandler(entry);
+					console.log(`  ✅ Browser #${i} ready`);
+					return entry;
+				}),
+			);
+			await Promise.all(launches);
+			this._initialised = true;
+			console.log(
+				`🎉 BrowserPool initialised with ${this._pool.length} browser(s)`,
+			);
+		} finally {
+			this._initialising = false;
+		}
 	}
 
 	// ─── Crash handling ────────────────────────────────────────────────────────

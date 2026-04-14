@@ -1363,7 +1363,8 @@ app.use(
 			"http://localhost:3001",
 			"https://ihatereading.in",
 			"https://www.inkgest.com",
-			"https://vaantra.vercel.app",
+			"https://aantraa.vercel.app",
+			"https://aantraa.site",
 			"https://gettemplate.website/",
 			"https://swipe-emails.vercel.app",
 		], // Allow specific origins
@@ -13902,6 +13903,12 @@ app.post("/api/video-translate", async (c) => {
 		if (form.has("callback_url")) {
 			body.callback_url = String(form.get("callback_url") ?? "");
 		}
+		if (form.has("plan")) body.plan = String(form.get("plan") ?? "");
+		if (form.has("user_plan")) body.user_plan = String(form.get("user_plan") ?? "");
+		if (form.has("subscription_plan")) {
+			body.subscription_plan = String(form.get("subscription_plan") ?? "");
+		}
+		if (form.has("tier")) body.tier = String(form.get("tier") ?? "");
 		const modelField = form.get("model");
 		if (modelField != null && String(modelField).trim() !== "") {
 			body.model = String(modelField).trim();
@@ -13978,6 +13985,10 @@ app.post("/api/video-translate", async (c) => {
 			output_languages: payload.output_languages,
 			title: payload.title,
 			callback_id: payload.callback_id,
+			plan: body.plan,
+			user_plan: body.user_plan,
+			subscription_plan: body.subscription_plan,
+			tier: body.tier,
 			model: body.model,
 			llm_model: body.llm_model,
 		},
