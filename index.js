@@ -249,7 +249,7 @@ function pushOpenRouterCall(state, label, meta) {
 
 // Wrapper around OpenRouter chat completions with error checking
 async function openRouterChat({
-	model = "openai/gpt-4o-mini",
+	model = "openrouter/elephant-alpha",
 	prompt,
 	temperature = 0.7,
 	label = "AI",
