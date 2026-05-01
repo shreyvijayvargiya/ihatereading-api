@@ -33,6 +33,14 @@ import {
 	uploadVoiceTranslateTtsToUploadThing,
 } from "./lib/voiceTranslateText.js";
 import {
+	runGroqVoiceTranslateText,
+	uploadGroqVoiceTranslateTtsToUploadThing,
+} from "./lib/groqVoiceTranslateText.js";
+import {
+	createGroqVideoTranslateJobs,
+	getGroqVideoTranslateJobStatus,
+} from "./lib/groqVideoTranslate.js";
+import {
 	parseRepoUrl,
 	analyzeRepo,
 	analyzeSingleFile,
@@ -78,6 +86,7 @@ import {
 	fetchTranscript,
 	YoutubeTranscriptNotAvailableLanguageError,
 } from "youtube-transcript-plus";
+import { openRouterTranslateAuthMiddleware } from "./lib/translateFirebaseAuth.js";
 
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1382,6 +1391,9 @@ app.use(
 		maxAge: 86_400,
 	}),
 );
+
+/** OpenRouter-only video/voice translate: Firebase ID token + Firestore credits (see lib/translateFirebaseAuth.js). Set TRANSLATE_FIREBASE_AUTH_ENABLED=1 to enable. Remove this line to disable the plugin. */
+app.use("*", openRouterTranslateAuthMiddleware);
 
 // Apply performance monitoring middleware
 app.use("*", performanceMiddleware);
@@ -2713,262 +2725,6 @@ async function runMapsQuery(browser, query) {
 	}
 }
 
-/**
- * Start a Lightpanda process and connect Puppeteer to it via CDP WebSocket.
- * Returns { browser, proc } — caller must disconnect browser and kill proc when done.
- */
-async function startLightpanda(port = 9222) {
-	const { lightpanda } = await import("@lightpanda/browser");
-	const puppeteer = (await import("puppeteer-core")).default;
-	const proc = await lightpanda.serve({ host: "127.0.0.1", port });
-	// Give Lightpanda a moment to bind the port
-	await new Promise((r) => setTimeout(r, 500));
-	const browser = await puppeteer.connect({
-		browserWSEndpoint: `ws://127.0.0.1:${port}`,
-	});
-	return { browser, proc };
-}
-
-function stopLightpanda({ browser, proc }) {
-	try {
-		browser?.disconnect();
-	} catch {
-		/* ignore */
-	}
-	try {
-		proc?.stdout?.destroy();
-	} catch {
-		/* ignore */
-	}
-	try {
-		proc?.stderr?.destroy();
-	} catch {
-		/* ignore */
-	}
-	try {
-		proc?.kill();
-	} catch {
-		/* ignore */
-	}
-}
-
-/**
- * Helper: open a fresh Lightpanda context+page, navigate to url, run fn(page),
- * then fully tear down the context before returning.
- * Lightpanda rules: ONE context at a time, no re-navigation of a live page.
- * Pattern mirrors lightpanda-browser.js: createBrowserContext → context.newPage
- * → navigate → evaluate → page.close → context.close.
- */
-async function withLightpandaPage(browser, url, fn) {
-	const context = await browser.createBrowserContext();
-	const page = await context.newPage();
-	try {
-		await page
-			.setUserAgent(
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			)
-			.catch(() => {});
-		await page.goto(url, { waitUntil: "load", timeout: 30000 });
-		await new Promise((r) => setTimeout(r, 3000));
-		return await fn(page);
-	} finally {
-		await page.close().catch(() => {});
-		await context.close().catch(() => {});
-	}
-}
-
-/**
- * Same scraping logic as runMapsQuery but tailored for Lightpanda.
- * Lightpanda constraints:
- *   - ONE context allowed at a time (no concurrent contexts)
- *   - Re-navigating a page causes "Navigating frame was detached"
- * Solution: create a fresh context for every navigation step; close it fully
- * before opening the next one (sequential, never concurrent).
- */
-async function runMapsQueryLightpanda(browser, query) {
-	// ── Step 1: Search results page ──────────────────────────────────────────
-	const feedEntries = await withLightpandaPage(
-		browser,
-		`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`,
-		async (page) => {
-			// Scroll feed to trigger lazy-loaded cards
-			await page
-				.evaluate(async () => {
-					for (let i = 0; i < 5; i++) {
-						try {
-							const feed = document.querySelector('div[role="feed"]');
-							if (feed) {
-								feed.scrollTop = (feed.scrollTop || 0) + 1000;
-							} else {
-								document.documentElement.scrollTop += 1000;
-							}
-						} catch {
-							/* ignore */
-						}
-						await new Promise((r) => setTimeout(r, 1000));
-					}
-				})
-				.catch(() => {});
-
-			await new Promise((r) => setTimeout(r, 2000));
-
-			return page
-				.evaluate(() => {
-					try {
-						const feed = document.querySelector('div[role="feed"]');
-						const root = feed || document;
-						return Array.from(root.querySelectorAll('a[href*="/maps/place/"]'))
-							.slice(0, 10)
-							.map((card) => {
-								const url = card.href || card.getAttribute("href") || "";
-								const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
-								const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
-								const name =
-									(card.getAttribute("aria-label") || "").trim() ||
-									(card.textContent || "").trim().split("\n")[0] ||
-									"";
-								return {
-									name,
-									url,
-									coordinates:
-										latMatch && lngMatch
-											? {
-													lat: parseFloat(latMatch[1]),
-													lng: parseFloat(lngMatch[1]),
-												}
-											: null,
-								};
-							})
-							.filter((e) => e.name.length > 0 && e.url.length > 0);
-					} catch {
-						return [];
-					}
-				})
-				.catch(() => []);
-		},
-	);
-
-	// ── Step 2: Visit each place page in its own fresh context ───────────────
-	const places = [];
-	for (const entry of feedEntries) {
-		try {
-			const details = await withLightpandaPage(
-				browser,
-				entry.url,
-				async (page) => {
-					return page
-						.evaluate(() => {
-							try {
-								let rating = null;
-								for (const el of document.querySelectorAll("[aria-label]")) {
-									try {
-										const al = el.getAttribute("aria-label") || "";
-										const m =
-											al.match(/([1-5]\.[0-9])\s*stars?/i) ||
-											al.match(/rated\s+([1-5]\.[0-9])/i);
-										if (m) {
-											rating = parseFloat(m[1]);
-											break;
-										}
-									} catch {
-										/* skip */
-									}
-								}
-								let reviews = null;
-								for (const el of document.querySelectorAll("[aria-label]")) {
-									try {
-										const al = el.getAttribute("aria-label") || "";
-										const m = al.match(/([\d,]+)\s*reviews?/i);
-										if (m) {
-											reviews = m[1].replace(/,/g, "");
-											break;
-										}
-									} catch {
-										/* skip */
-									}
-								}
-								const addrEl =
-									document.querySelector('button[data-item-id="address"]') ||
-									document.querySelector('[data-tooltip="Copy address"]');
-								const address = (addrEl?.getAttribute("aria-label") || "")
-									.replace(/^Address:\s*/i, "")
-									.trim();
-								const phoneEl =
-									document.querySelector('[data-item-id^="phone"]') ||
-									document.querySelector('[data-tooltip="Copy phone number"]');
-								const phone =
-									(phoneEl?.getAttribute("aria-label") || "")
-										.replace(/^Phone:\s*/i, "")
-										.trim() || (phoneEl?.textContent || "").trim();
-								const websiteEl = document.querySelector(
-									'a[data-item-id="authority"]',
-								);
-								const rawWebsite = websiteEl?.href || "";
-								let website = rawWebsite;
-								try {
-									const u = new URL(rawWebsite);
-									const q = u.searchParams.get("q");
-									if (q) website = q;
-								} catch {
-									/* keep rawWebsite */
-								}
-								const category = (
-									document.querySelector('button[jsaction*="category"]')
-										?.textContent || ""
-								).trim();
-								const image =
-									document
-										.querySelector('meta[property="og:image"]')
-										?.getAttribute("content") || "";
-								return {
-									rating,
-									reviews,
-									address,
-									phone,
-									website,
-									category,
-									image,
-								};
-							} catch {
-								return {
-									rating: null,
-									reviews: null,
-									address: "",
-									phone: "",
-									website: "",
-									category: "",
-									image: "",
-								};
-							}
-						})
-						.catch(() => ({
-							rating: null,
-							reviews: null,
-							address: "",
-							phone: "",
-							website: "",
-							category: "",
-							image: "",
-						}));
-				},
-			);
-			places.push({ ...entry, ...details });
-		} catch {
-			places.push({
-				...entry,
-				rating: null,
-				reviews: null,
-				address: "",
-				phone: "",
-				website: "",
-				category: "",
-				image: "",
-			});
-		}
-	}
-
-	return places;
-}
 
 // Google Maps scraping endpoint using headless Chrome
 app.post("/scrape-google-maps", async (c) => {
@@ -4395,10 +4151,7 @@ app.post("/seo-competitor-audit", async (c) => {
 	}
 });
 
-// POST /seo-g2-competitor-deep-research
-// Body: { url, query?, maxCompetitors?, useAi?, deepScrape?: true, useProxy?: false }
-// SERP + HTML (seoApis) discovers G2 anchor + competitor /products/ URLs, ratings from JSON-LD.
-// When deepScrape is true (default): Puppeteer each page + LLM JSON (problems/strengths) from excerpts.
+
 app.post("/seo-g2-competitor-deep-research", async (c) => {
 	try {
 		const body = await c.req.json();
@@ -5456,7 +5209,6 @@ app.post("/scrape", async (c) => {
 			...result,
 			url: url,
 			timestamp: new Date().toISOString(),
-			poolStats: browserPool.stats,
 		});
 	} catch (error) {
 		console.error("❌ Web scraping error (Puppeteer):", error);
@@ -5596,7 +5348,6 @@ app.post("/scrape-multiple", async (c) => {
 		success: true,
 		results,
 		timestamp: new Date().toISOString(),
-		poolStats: browserPool.stats,
 	});
 });
 
@@ -13551,8 +13302,9 @@ const VOICE_TRANSLATE_TEXT_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
 
 /**
  * POST /api/voice-translate/text (and alias POST /api/video-translate/text — same handler)
- * JSON: { text | source_text, audio_url | audioUrl, languages | output_languages, include_audio?: boolean, model | llm_model?: preset }
- * multipart: fields audio or file (upload → UploadThing), optional audio_url, optional text, languages (JSON array or comma-separated), include_audio, optional model / llm_model
+ * JSON: { text | source_text, audio_url | audioUrl, languages | output_languages, include_audio?, model | llm_model, translation_engine?, tts_engine?, glossary_refinement?, piper_model?, source_nllb?, transcript_language?, source_language?, glossary_refine_model? }
+ * Cost options (OpenRouter): translation_engine: llm (default) | nllb; tts_engine: openrouter (default) | piper; glossary_refinement; same hints as /api/video-translate.
+ * multipart: as above; optional form fields for the same keys.
  * LLM preset (optional; default Gemini): gemini | gpt-4o-mini | sonnet | kimi | grok — see lib/translateLlmModels.js
  * Source: text only, audio URL only, or audio file (file wins over text when both sent).
  * Auth: Bearer token. `usage` / `tokenUsage` include prompt token counts only (no cost or price).
@@ -13634,6 +13386,14 @@ const handleVoiceTranslateTextPost = async (c) => {
 	let includeAudio = true;
 	let modelOpt;
 	let llmModelOpt;
+	let translationEngineOpt;
+	let ttsEngineOpt;
+	let glossaryRefinementOpt;
+	let piperModelOpt;
+	let sourceNllbOpt;
+	let transcriptLanguageOpt;
+	let sourceLanguageOpt;
+	let glossaryRefineModelOpt;
 
 	const contentType = c.req.header("content-type") || "";
 
@@ -13682,21 +13442,42 @@ const handleVoiceTranslateTextPost = async (c) => {
 			}
 		}
 		if (!audioUrl) {
-			audioUrl =
-				form.get("audio_url") ||
-				form.get("audioUrl") ||
-				undefined;
+			audioUrl = pickAudioSourceUrlFromVoiceFormFields(form);
 		}
 		const tf = form.get("text");
 		const sf = form.get("source_text");
 		if (tf != null && String(tf).trim() !== "") text = String(tf);
 		else if (sf != null) text = String(sf);
 		languages = parseLanguages(form.get("languages") ?? form.get("output_languages"));
-		includeAudio = true
+		if (form.has("include_audio")) {
+			includeAudio = parseBool(form.get("include_audio"));
+		}
 		const mf = form.get("model");
 		const lmf = form.get("llm_model");
 		if (mf != null && String(mf).trim() !== "") modelOpt = String(mf).trim();
 		if (lmf != null && String(lmf).trim() !== "") llmModelOpt = String(lmf).trim();
+		if (form.has("translation_engine")) {
+			translationEngineOpt = String(form.get("translation_engine") ?? "");
+		}
+		if (form.has("tts_engine")) ttsEngineOpt = String(form.get("tts_engine") ?? "");
+		if (form.has("glossary_refinement")) {
+			glossaryRefinementOpt = parseBool(form.get("glossary_refinement"));
+		}
+		if (form.has("piper_model")) {
+			piperModelOpt = String(form.get("piper_model") ?? "");
+		}
+		if (form.has("source_nllb")) {
+			sourceNllbOpt = String(form.get("source_nllb") ?? "");
+		}
+		if (form.has("transcript_language")) {
+			transcriptLanguageOpt = String(form.get("transcript_language") ?? "");
+		}
+		if (form.has("source_language")) {
+			sourceLanguageOpt = String(form.get("source_language") ?? "");
+		}
+		if (form.has("glossary_refine_model")) {
+			glossaryRefineModelOpt = String(form.get("glossary_refine_model") ?? "");
+		}
 	} else if (contentType.includes("application/json")) {
 		let body = {};
 		try {
@@ -13705,11 +13486,19 @@ const handleVoiceTranslateTextPost = async (c) => {
 			return c.json({ error: "Invalid JSON body" }, 400);
 		}
 		text = body.text ?? body.source_text;
-		audioUrl = body.audio_url ?? body.audioUrl;
+		audioUrl = pickAudioSourceUrlFromVoiceJsonBody(body);
 		languages = body.languages ?? body.output_languages;
-		includeAudio = true
+		if (body.include_audio != null) includeAudio = parseBool(body.include_audio);
 		modelOpt = body.model;
 		llmModelOpt = body.llm_model;
+		translationEngineOpt = body.translation_engine;
+		ttsEngineOpt = body.tts_engine;
+		glossaryRefinementOpt = body.glossary_refinement;
+		piperModelOpt = body.piper_model;
+		sourceNllbOpt = body.source_nllb;
+		transcriptLanguageOpt = body.transcript_language;
+		sourceLanguageOpt = body.source_language;
+		glossaryRefineModelOpt = body.glossary_refine_model;
 	} else {
 		return c.json(
 			{
@@ -13730,6 +13519,14 @@ const handleVoiceTranslateTextPost = async (c) => {
 		includeAudio,
 		model: modelOpt,
 		llmModel: llmModelOpt,
+		translation_engine: translationEngineOpt,
+		tts_engine: ttsEngineOpt,
+		glossary_refinement: glossaryRefinementOpt,
+		piper_model: piperModelOpt,
+		source_nllb: sourceNllbOpt,
+		transcript_language: transcriptLanguageOpt,
+		source_language: sourceLanguageOpt,
+		glossary_refine_model: glossaryRefineModelOpt,
 		afterTranslatedTts:
 			includeAudio && utTok
 				? (results) =>
@@ -13754,15 +13551,305 @@ app.post("/api/voice-translate/text", handleVoiceTranslateTextPost);
 /** Same as /api/voice-translate/text — avoids 404 when clients use "video" instead of "voice". */
 app.post("/api/video-translate/text", handleVoiceTranslateTextPost);
 
+/**
+ * POST /api/groq/voice-translate/text (alias: /api/groq/video-translate/text)
+ * Same request shape as /api/voice-translate/text; uses Groq (Whisper + chat + TTS) only — no OpenRouter.
+ * JSON: text or remote media URL as `audio_url` | `audioUrl` | `url` | `link` | `media_url` | `video_url`, plus `languages`.
+ * Optional `model` / `llm_model` = Groq chat model id (default from GROQ_CHAT_MODEL).
+ */
+const handleGroqVoiceTranslateTextPost = async (c) => {
+	const vtReqId = uuidv4();
+	const authHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const authToken = authHdr?.startsWith("Bearer ")
+		? authHdr.slice(7).trim()
+		: authHdr?.trim();
+	if (!authToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
+			401,
+		);
+	}
+
+	const xff = c.req.header("x-forwarded-for");
+	const vtIp =
+		xff?.split(",")?.[0]?.trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const rl = rateLimit(
+		vtIp,
+		VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT,
+		VOICE_TRANSLATE_TEXT_POST_RATE_WINDOW_MS,
+	);
+	if (!rl.allowed) {
+		c.header("Retry-After", String(rl.retryAfter));
+		c.header("X-RateLimit-Limit", String(VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window", "10 minutes");
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: rl.retryAfter,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(VOICE_TRANSLATE_TEXT_POST_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(rl.remaining));
+	c.header("X-RateLimit-Window", "10 minutes");
+	c.header("X-Voice-Translate-Request-Id", vtReqId);
+	c.header("X-Translate-Engine", "groq");
+
+	const parseLanguages = (raw) => {
+		if (raw == null || raw === "") return undefined;
+		if (Array.isArray(raw)) return raw;
+		if (typeof raw === "string") {
+			const s = raw.trim();
+			if (s.startsWith("[")) {
+				try {
+					return JSON.parse(s);
+				} catch {
+					return undefined;
+				}
+			}
+			return s.split(",").map((x) => x.trim()).filter(Boolean);
+		}
+		return raw;
+	};
+
+	let text;
+	let audioUrl;
+	let audioBuffer;
+	let audioFormat;
+	let languages;
+	let includeAudio = true;
+	let modelOpt;
+	let llmModelOpt;
+
+	const contentType = c.req.header("content-type") || "";
+
+	if (contentType.includes("multipart/form-data")) {
+		let form;
+		try {
+			form = await c.req.formData();
+		} catch {
+			return c.json(
+				{ error: "Invalid multipart/form-data payload" },
+				400,
+			);
+		}
+		const fileField = form.get("audio") || form.get("file");
+		if (
+			fileField &&
+			typeof fileField === "object" &&
+			"arrayBuffer" in fileField
+		) {
+			if (!process.env.UPLOADTHING_TOKEN) {
+				return c.json(
+					{
+						error:
+							"UPLOADTHING_TOKEN not configured (required to upload audio files)",
+						code: "MISSING_UPLOAD_TOKEN",
+					},
+					503,
+				);
+			}
+			try {
+				const ab = await fileField.arrayBuffer();
+				audioBuffer = Buffer.from(ab);
+				const origName =
+					typeof fileField.name === "string" ? fileField.name : "audio.mp3";
+				audioFormat = guessAudioFormatFromFilename(origName);
+				const uploadedUrl = await uploadAudioBufferToUploadThing(
+					audioBuffer,
+					origName,
+				);
+				audioUrl = uploadedUrl;
+			} catch (e) {
+				return c.json(
+					{ error: e?.message || "Audio upload failed" },
+					502,
+				);
+			}
+		}
+		if (!audioUrl) {
+			audioUrl = pickAudioSourceUrlFromVoiceFormFields(form);
+		}
+		const tf = form.get("text");
+		const sf = form.get("source_text");
+		if (tf != null && String(tf).trim() !== "") text = String(tf);
+		else if (sf != null) text = String(sf);
+		languages = parseLanguages(form.get("languages") ?? form.get("output_languages"));
+		includeAudio = true;
+		const mf = form.get("model");
+		const lmf = form.get("llm_model");
+		if (mf != null && String(mf).trim() !== "") modelOpt = String(mf).trim();
+		if (lmf != null && String(lmf).trim() !== "") llmModelOpt = String(lmf).trim();
+	} else if (contentType.includes("application/json")) {
+		let body = {};
+		try {
+			body = await c.req.json();
+		} catch {
+			return c.json({ error: "Invalid JSON body" }, 400);
+		}
+		text = body.text ?? body.source_text;
+		audioUrl = pickAudioSourceUrlFromVoiceJsonBody(body);
+		languages = body.languages ?? body.output_languages;
+		includeAudio = true;
+		modelOpt = body.model;
+		llmModelOpt = body.llm_model;
+	} else {
+		return c.json(
+			{
+				error:
+					"Unsupported Content-Type. Use application/json or multipart/form-data.",
+			},
+			415,
+		);
+	}
+
+	const utTok = process.env.UPLOADTHING_TOKEN?.trim();
+	const out = await runGroqVoiceTranslateText({
+		text,
+		audioUrl: audioUrl ? String(audioUrl).trim() : undefined,
+		audioBuffer,
+		audioFormat,
+		languages,
+		includeAudio,
+		model: modelOpt,
+		llmModel: llmModelOpt,
+		afterTranslatedTts:
+			includeAudio && utTok
+				? (results) =>
+						uploadGroqVoiceTranslateTtsToUploadThing(
+							results,
+							uploadAudioBufferToUploadThing,
+							vtReqId,
+						)
+				: undefined,
+	});
+	const status = out.httpStatus ?? 200;
+	const { httpStatus: _gh, ...rest } = out;
+
+	applyVoiceTranslateTextHeaders(c);
+	if (audioUrl && rest?.data && typeof rest.data === "object") {
+		c.header("X-Audio-Input-Url", String(audioUrl).slice(0, 2048));
+	}
+	return c.json(rest, status);
+};
+
+app.post("/api/groq/voice-translate/text", handleGroqVoiceTranslateTextPost);
+app.post("/api/groq/video-translate/text", handleGroqVoiceTranslateTextPost);
+
 /** POST /api/video-translate only: per-IP sliding window (same mechanism as /generate/:type). */
 const VIDEO_TRANSLATE_POST_RATE_LIMIT = 10;
 const VIDEO_TRANSLATE_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
 
+function normalizeVideoUrlString(v) {
+	if (v == null) return "";
+	const s = String(v).trim();
+	return s;
+}
+
+/** JSON body keys for a remote video URL (same for /api/video-translate and /api/groq/video-translate). */
+function pickVideoUrlFromJsonBody(body) {
+	if (!body || typeof body !== "object") return "";
+	const keys = [
+		"video_url",
+		"videoUrl",
+		"url",
+		"video",
+		"source_url",
+		"sourceUrl",
+		"link",
+	];
+	for (const k of keys) {
+		if (!(k in body)) continue;
+		const s = normalizeVideoUrlString(body[k]);
+		if (s) return s;
+	}
+	return "";
+}
+
+/**
+ * Multipart text fields for a video URL. `video` is only used when the value is a string
+ * (file upload uses file + video fields via arrayBuffer branch above).
+ */
+function pickVideoUrlFromFormFields(form) {
+	const keys = [
+		"video_url",
+		"videoUrl",
+		"url",
+		"source_url",
+		"sourceUrl",
+		"link",
+	];
+	for (const k of keys) {
+		const raw = form.get(k);
+		if (typeof raw === "string") {
+			const s = normalizeVideoUrlString(raw);
+			if (s) return s;
+		}
+	}
+	const v = form.get("video");
+	if (typeof v === "string") {
+		const s = normalizeVideoUrlString(v);
+		if (s) return s;
+	}
+	return "";
+}
+
+/** Remote audio (or media) URL for /api/*voice-translate/text — JSON fields. */
+function pickAudioSourceUrlFromVoiceJsonBody(body) {
+	if (!body || typeof body !== "object") return undefined;
+	const v =
+		body.audio_url ??
+		body.audioUrl ??
+		body.url ??
+		body.link ??
+		body.media_url ??
+		body.mediaUrl ??
+		body.video_url ??
+		body.videoUrl;
+	if (v == null) return undefined;
+	const s = String(v).trim();
+	return s || undefined;
+}
+
+function pickAudioSourceUrlFromVoiceFormFields(form) {
+	const keys = [
+		"audio_url",
+		"audioUrl",
+		"url",
+		"link",
+		"media_url",
+		"mediaUrl",
+		"video_url",
+		"videoUrl",
+	];
+	for (const k of keys) {
+		const raw = form.get(k);
+		if (typeof raw === "string") {
+			const s = normalizeVideoUrlString(raw);
+			if (s) return s;
+		}
+	}
+	return undefined;
+}
+
 /**
  * POST /api/video-translate
- * JSON: { video_url | videoUrl, output_language | output_languages, model | llm_model?: preset, ... }
- * multipart: file or video (uploads to UploadThing), optional video_url, output_language, optional model / llm_model, etc.
+ * JSON: { video_url | videoUrl | url | video | source_url | link, output_language | output_languages, ... }
+ * multipart: file or video (upload), or string URL fields above, optional output_language, etc.
  * LLM preset (optional; default Gemini): gemini | gpt-4o-mini | sonnet | kimi | grok — see lib/translateLlmModels.js
+ * Cost controls: translation_engine: llm (default) | nllb; tts_engine: openrouter (default) | piper; glossary_refinement: bool;
+ *   source_nllb (FLORES) or transcript_language / source_language (ISO) for NLLB source; piper_model; glossary_refine_model (OpenRouter id for glossary pass).
  * Auth: non-empty Authorization (Bearer &lt;token&gt; or raw token string). Rate limited per IP.
  */
 app.post("/api/video-translate", async (c) => {
@@ -13860,7 +13947,7 @@ app.post("/api/video-translate", async (c) => {
 			}
 		}
 		if (!videoUrl) {
-			videoUrl = form.get("video_url") || form.get("videoUrl");
+			videoUrl = pickVideoUrlFromFormFields(form);
 		}
 		const ol = form.get("output_language");
 		const ols = form.get("output_languages");
@@ -13917,13 +14004,37 @@ app.post("/api/video-translate", async (c) => {
 		if (llmModelField != null && String(llmModelField).trim() !== "") {
 			body.llm_model = String(llmModelField).trim();
 		}
+		if (form.has("translation_engine")) {
+			body.translation_engine = String(form.get("translation_engine") ?? "");
+		}
+		if (form.has("tts_engine")) {
+			body.tts_engine = String(form.get("tts_engine") ?? "");
+		}
+		if (form.has("glossary_refinement")) {
+			body.glossary_refinement = parseBool(form.get("glossary_refinement"));
+		}
+		if (form.has("piper_model")) {
+			body.piper_model = String(form.get("piper_model") ?? "");
+		}
+		if (form.has("source_nllb")) {
+			body.source_nllb = String(form.get("source_nllb") ?? "");
+		}
+		if (form.has("transcript_language")) {
+			body.transcript_language = String(form.get("transcript_language") ?? "");
+		}
+		if (form.has("source_language")) {
+			body.source_language = String(form.get("source_language") ?? "");
+		}
+		if (form.has("glossary_refine_model")) {
+			body.glossary_refine_model = String(form.get("glossary_refine_model") ?? "");
+		}
 	} else if (contentType.includes("application/json")) {
 		try {
 			body = await c.req.json();
 		} catch {
 			return c.json({ error: "Invalid JSON body" }, 400);
 		}
-		videoUrl = body.video_url || body.videoUrl;
+		videoUrl = pickVideoUrlFromJsonBody(body);
 	} else {
 		return c.json(
 			{
@@ -13937,7 +14048,7 @@ app.post("/api/video-translate", async (c) => {
 		return c.json(
 			{
 				error:
-					"Provide video_url (or videoUrl) or upload a video file (field: file or video)",
+					"Provide video_url, videoUrl, url, or video (string URL), or upload a file (field: file or video)",
 			},
 			400,
 		);
@@ -13991,6 +14102,14 @@ app.post("/api/video-translate", async (c) => {
 			tier: body.tier,
 			model: body.model,
 			llm_model: body.llm_model,
+			translation_engine: body.translation_engine,
+			tts_engine: body.tts_engine,
+			glossary_refinement: body.glossary_refinement,
+			piper_model: body.piper_model,
+			source_nllb: body.source_nllb,
+			transcript_language: body.transcript_language,
+			source_language: body.source_language,
+			glossary_refine_model: body.glossary_refine_model,
 		},
 	});
 	const status = out.httpStatus ?? 200;
@@ -14003,6 +14122,296 @@ app.post("/api/video-translate", async (c) => {
 	applyVideoTranslateApiHeaders(c, {
 		videoTranslateId: createdId,
 		captionUrl: rest?.data?.caption_url,
+	});
+	return c.json(rest, status);
+});
+
+/**
+ * POST /api/groq/video-translate
+ * Same URL / output_language shape as POST /api/video-translate; jobs in `groqVideoTranslateJobs`.
+ * Cost options: translation_engine: llm (default) | nllb; tts_engine: groq (default) | piper; glossary_refinement; source_nllb or transcript_language.
+ */
+app.post("/api/groq/video-translate", async (c) => {
+	const vtAuthHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const vtAuthToken = vtAuthHdr?.startsWith("Bearer ")
+		? vtAuthHdr.slice(7).trim()
+		: vtAuthHdr?.trim();
+	if (!vtAuthToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
+			401,
+		);
+	}
+
+	const xff = c.req.header("x-forwarded-for");
+	const vtIp =
+		xff?.split(",")?.[0]?.trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const vtRl = rateLimit(
+		vtIp,
+		VIDEO_TRANSLATE_POST_RATE_LIMIT,
+		VIDEO_TRANSLATE_POST_RATE_WINDOW_MS,
+	);
+	if (!vtRl.allowed) {
+		c.header("Retry-After", String(vtRl.retryAfter));
+		c.header("X-RateLimit-Limit", String(VIDEO_TRANSLATE_POST_RATE_LIMIT));
+		c.header("X-RateLimit-Remaining", "0");
+		c.header("X-RateLimit-Window", "10 minutes");
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: vtRl.retryAfter,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(VIDEO_TRANSLATE_POST_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(vtRl.remaining));
+	c.header("X-RateLimit-Window", "10 minutes");
+	c.header("X-Translate-Engine", "groq");
+
+	const contentType = c.req.header("content-type") || "";
+	let videoUrl;
+	let body = {};
+
+	const parseBool = (v) => v === true || v === "true" || v === "1";
+
+	if (contentType.includes("multipart/form-data")) {
+		let form;
+		try {
+			form = await c.req.formData();
+		} catch {
+			return c.json(
+				{
+					error:
+						"Invalid multipart/form-data payload. Use proper multipart encoding (-F in curl) or send JSON.",
+				},
+				400,
+			);
+		}
+		const fileField = form.get("file") || form.get("video");
+		if (
+			fileField &&
+			typeof fileField === "object" &&
+			"arrayBuffer" in fileField
+		) {
+			if (!process.env.UPLOADTHING_TOKEN) {
+				return c.json(
+					{
+						error:
+							"UPLOADTHING_TOKEN not configured (required to upload video files)",
+						code: "MISSING_UPLOAD_TOKEN",
+					},
+					503,
+				);
+			}
+			try {
+				const ab = await fileField.arrayBuffer();
+				const buf = Buffer.from(ab);
+				const origName =
+					typeof fileField.name === "string" ? fileField.name : "upload.mp4";
+				videoUrl = await uploadVideoBufferToUploadThing(buf, origName);
+			} catch (e) {
+				return c.json(
+					{ error: e?.message || "Video upload failed" },
+					502,
+				);
+			}
+		}
+		if (!videoUrl) {
+			videoUrl = pickVideoUrlFromFormFields(form);
+		}
+		const ol = form.get("output_language");
+		const ols = form.get("output_languages");
+		if (ol) body.output_language = String(ol);
+		if (ols) {
+			try {
+				body.output_languages =
+					typeof ols === "string" ? JSON.parse(ols) : ols;
+			} catch {
+				return c.json(
+					{
+						error:
+							"output_languages must be a JSON array string (e.g. [\"Spanish\",\"French\"])",
+					},
+					400,
+				);
+			}
+		}
+		if (form.has("title")) body.title = String(form.get("title") ?? "");
+		if (form.has("translate_audio_only")) {
+			body.translate_audio_only = parseBool(form.get("translate_audio_only"));
+		}
+		if (form.has("keep_the_same_format")) {
+			body.keep_the_same_format = parseBool(form.get("keep_the_same_format"));
+		}
+		if (form.has("mode")) body.mode = String(form.get("mode") ?? "fast");
+		if (form.has("speaker_num")) {
+			const n = Number(form.get("speaker_num"));
+			if (!Number.isNaN(n)) body.speaker_num = n;
+		}
+		if (form.has("callback_id")) body.callback_id = String(form.get("callback_id") ?? "");
+		if (form.has("enable_dynamic_duration")) {
+			body.enable_dynamic_duration = String(
+				form.get("enable_dynamic_duration") ?? "",
+			);
+		}
+		if (form.has("brand_voice_id")) {
+			body.brand_voice_id = String(form.get("brand_voice_id") ?? "");
+		}
+		if (form.has("callback_url")) {
+			body.callback_url = String(form.get("callback_url") ?? "");
+		}
+		if (form.has("plan")) body.plan = String(form.get("plan") ?? "");
+		if (form.has("user_plan")) body.user_plan = String(form.get("user_plan") ?? "");
+		if (form.has("subscription_plan")) {
+			body.subscription_plan = String(form.get("subscription_plan") ?? "");
+		}
+		if (form.has("tier")) body.tier = String(form.get("tier") ?? "");
+		const modelField = form.get("model");
+		if (modelField != null && String(modelField).trim() !== "") {
+			body.model = String(modelField).trim();
+		}
+		const llmModelField = form.get("llm_model");
+		if (llmModelField != null && String(llmModelField).trim() !== "") {
+			body.llm_model = String(llmModelField).trim();
+		}
+		if (form.has("translation_engine")) {
+			body.translation_engine = String(form.get("translation_engine") ?? "");
+		}
+		if (form.has("tts_engine")) {
+			body.tts_engine = String(form.get("tts_engine") ?? "");
+		}
+		if (form.has("glossary_refinement")) {
+			body.glossary_refinement = parseBool(form.get("glossary_refinement"));
+		}
+		if (form.has("piper_model")) {
+			body.piper_model = String(form.get("piper_model") ?? "");
+		}
+		if (form.has("source_nllb")) {
+			body.source_nllb = String(form.get("source_nllb") ?? "");
+		}
+		if (form.has("transcript_language")) {
+			body.transcript_language = String(form.get("transcript_language") ?? "");
+		}
+		if (form.has("source_language")) {
+			body.source_language = String(form.get("source_language") ?? "");
+		}
+	} else if (contentType.includes("application/json")) {
+		try {
+			body = await c.req.json();
+		} catch {
+			return c.json({ error: "Invalid JSON body" }, 400);
+		}
+		videoUrl = pickVideoUrlFromJsonBody(body);
+	} else {
+		return c.json(
+			{
+				error: "Unsupported Content-Type. Use application/json or multipart/form-data.",
+			},
+			415,
+		);
+	}
+
+	if (!videoUrl || !String(videoUrl).trim()) {
+		return c.json(
+			{
+				error:
+					"Provide video_url, videoUrl, url, or video (string URL), or upload a file (field: file or video)",
+			},
+			400,
+		);
+	}
+
+	if (!body.output_language && !body.output_languages) {
+		return c.json(
+			{ error: "Provide output_language or output_languages" },
+			400,
+		);
+	}
+	if (body.output_language && body.output_languages) {
+		return c.json(
+			{ error: "Use only one of output_language or output_languages" },
+			400,
+		);
+	}
+
+	const payload = {
+		video_url: String(videoUrl).trim(),
+		translate_audio_only: body.translate_audio_only ?? false,
+		keep_the_same_format: body.keep_the_same_format ?? false,
+		mode: body.mode ?? "fast",
+	};
+	if (body.output_language) {
+		payload.output_language = body.output_language;
+	} else {
+		payload.output_languages = body.output_languages;
+	}
+	if (body.title) payload.title = body.title;
+	if (body.speaker_num != null && !Number.isNaN(Number(body.speaker_num))) {
+		payload.speaker_num = Number(body.speaker_num);
+	}
+	if (body.callback_id) payload.callback_id = body.callback_id;
+	if (body.enable_dynamic_duration) {
+		payload.enable_dynamic_duration = body.enable_dynamic_duration;
+	}
+	if (body.brand_voice_id) payload.brand_voice_id = body.brand_voice_id;
+	if (body.callback_url) payload.callback_url = body.callback_url;
+
+	const out = await createGroqVideoTranslateJobs({
+		videoUrl: payload.video_url,
+		body: {
+			output_language: payload.output_language,
+			output_languages: payload.output_languages,
+			title: payload.title,
+			callback_id: payload.callback_id,
+			plan: body.plan,
+			user_plan: body.user_plan,
+			subscription_plan: body.subscription_plan,
+			tier: body.tier,
+			model: body.model,
+			llm_model: body.llm_model,
+			translation_engine: body.translation_engine,
+			tts_engine: body.tts_engine,
+			glossary_refinement: body.glossary_refinement,
+			piper_model: body.piper_model,
+			source_nllb: body.source_nllb,
+			transcript_language: body.transcript_language,
+			source_language: body.source_language,
+		},
+	});
+	const status = out.httpStatus ?? 200;
+	const { httpStatus: _gqh, ...rest } = out;
+	const createdId =
+		rest?.data?.video_translate_id ??
+		(Array.isArray(rest?.data?.video_translate_ids)
+			? rest.data.video_translate_ids[0]
+			: null);
+	applyVideoTranslateApiHeaders(c, {
+		videoTranslateId: createdId,
+		captionUrl: rest?.data?.caption_url,
+	});
+	return c.json(rest, status);
+});
+
+/** GET /api/groq/video-translate/:id — Groq job status (collection groqVideoTranslateJobs) */
+app.get("/api/groq/video-translate/:id", async (c) => {
+	const id = c.req.param("id");
+	const out = await getGroqVideoTranslateJobStatus(id);
+	const status = out.httpStatus ?? 200;
+	const { httpStatus: _gqh2, ...rest } = out;
+	const d = rest?.data;
+	applyVideoTranslateApiHeaders(c, {
+		videoTranslateId: id,
+		captionUrl: d?.caption_url,
 	});
 	return c.json(rest, status);
 });

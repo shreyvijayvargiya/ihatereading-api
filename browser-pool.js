@@ -69,9 +69,25 @@ class BrowserPool {
 		this._idleTimer = null;
 		this._puppeteer = null;
 		this._chromium = null;
+		/** @type {Promise<string> | null} */
+		this._sparticuzExecutablePathPromise = null;
 	}
 
 	// ─── Lazy initialisation ───────────────────────────────────────────────────
+
+	/**
+	 * @sparticuz/chromium extracts the binary on first `executablePath()`.
+	 * Parallel pool launches used to call it concurrently → Linux ETXTBSY on spawn.
+	 */
+	async _getSparticuzExecutablePath() {
+		if (!this._sparticuzExecutablePathPromise) {
+			this._sparticuzExecutablePathPromise = (async () => {
+				await this._loadDeps();
+				return this._chromium.executablePath();
+			})();
+		}
+		return this._sparticuzExecutablePathPromise;
+	}
 
 	async _loadDeps() {
 		if (!this._puppeteer) {
@@ -116,7 +132,7 @@ class BrowserPool {
 		}
 
 		try {
-			const executablePath = await this._chromium.executablePath();
+			const executablePath = await this._getSparticuzExecutablePath();
 			const viaSparticuz = await tryLaunch("@sparticuz/chromium", {
 				headless: true,
 				args: [...this._chromium.args, "--disable-web-security"],
