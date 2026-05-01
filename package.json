@@ -7,8 +7,8 @@
 		"node": ">=18"
 	},
 	"scripts": {
-		"start": "node index.js",
-		"dev": "nodemon index.js",
+		"start": "NLLB_MODULE_PATH=${NLLB_MODULE_PATH:-./lib/nllbTranslate.local.js} node index.js",
+		"dev": "NLLB_MODULE_PATH=${NLLB_MODULE_PATH:-./lib/nllbTranslate.local.js} nodemon index.js",
 		"kixi": "nodemon ai-examples/kixi.js",
 		"simba": "nodemon ai-examples/simba-ui-ux/simba.js",
 		"ai-next-react-coder": "nodemon ai-examples/ai-next-react-coder.js",
@@ -62,7 +62,6 @@
 		"parse-url": "^10.0.3",
 		"playwright": "^1.54.2",
 		"proxy-chain": "^2.5.9",
-		"puppeteer": "^24.20.0",
 		"puppeteer-core": "^24.17.0",
 		"puppeteer-extra": "^3.3.6",
 		"puppeteer-extra-plugin-stealth": "^2.11.2",
@@ -103,7 +102,7 @@
 	},
 	"pkg": {
 		"scripts": [
-			"node_modules/puppeteer/lib/*.js",
+			"node_modules/puppeteer-core/lib/*.js",
 			"node_modules/puppeteer-extra-plugin-stealth/**/*.js"
 		]
 	}
