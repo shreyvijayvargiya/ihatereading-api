@@ -91,51 +91,6 @@ async function getPromptEmbeddings() {
 	return embeddings;
 }
 
-async function findRelevantTemplate(prompt) {
-	const promptEmbedding = await getEmbedding(prompt);
-	if (!promptEmbedding) return null;
-	const templateEmbeddings = await getTemplateEmbeddings();
-	let bestMatchKey = null;
-	let maxSimilarity = -1;
-	for (const [key, embedding] of Object.entries(templateEmbeddings)) {
-		const similarity = cosineSimilarity(promptEmbedding, embedding);
-		if (similarity > maxSimilarity) {
-			maxSimilarity = similarity;
-			bestMatchKey = key;
-		}
-	}
-	return maxSimilarity > 0.3
-		? {
-				key: bestMatchKey,
-				template: templates[bestMatchKey],
-				code: templates[bestMatchKey].code,
-				similarity: maxSimilarity,
-			}
-		: null;
-}
-
-async function findRelevantBlocks(prompt, limit = 10) {
-	const promptEmbedding = await getEmbedding(prompt);
-	if (!promptEmbedding)
-		return uiBlockLibrary
-			.slice(0, limit)
-			.map((b) => b.code)
-			.join("\n\n");
-	const blockEmbeddings = await getBlockEmbeddings();
-	const scores = [];
-	for (const item of blockEmbeddings) {
-		const similarity = cosineSimilarity(promptEmbedding, item.embedding);
-		scores.push({ index: item.index, similarity });
-	}
-	const topMatches = scores
-		.sort((a, b) => b.similarity - a.similarity)
-		.slice(0, limit);
-
-	return topMatches
-		.map((match) => uiBlockLibrary[match.index].code)
-		.join("\n\n");
-}
-
 const app = new Hono();
 
 // Add CORS middleware
@@ -238,25 +193,6 @@ Return a JSON object:
 
 // above this simple one prompt we need skills to improve UI for existing code based on the product requirements
 // for example product is landing page than landing page skills load for AI agent post generation making it better UI
-
-async function findRelevantDesignSystem(prompt) {
-	const promptEmbedding = await getEmbedding(prompt);
-	if (!promptEmbedding) return prompts.modernDark.prompt;
-
-	const promptEmbeddings = await getPromptEmbeddings();
-	let bestMatchKey = "modernDark";
-	let maxSimilarity = -1;
-
-	for (const [key, embedding] of Object.entries(promptEmbeddings)) {
-		const similarity = cosineSimilarity(promptEmbedding, embedding);
-		if (similarity > maxSimilarity) {
-			maxSimilarity = similarity;
-			bestMatchKey = key;
-		}
-	}
-
-	return prompts[bestMatchKey]?.prompt || prompts.modernDark.prompt;
-}
 
 async function callMonolithicAgent({ prompt }) {
 	const response = await openai.chat.completions.create({

@@ -7,7 +7,7 @@ import { getDownloadURL, getStorage } from "firebase-admin/storage";
 if (getApps().length === 0) {
 	initializeApp({
 		credential: cert(serviceAccount),
-	projectId: "vaantra-4c87e",
+		projectId: "ihatereading-4ba52",
 	});
 }
 

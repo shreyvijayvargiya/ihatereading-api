@@ -14,8 +14,6 @@ const openai = new OpenAI({
 	apiKey: process.env.OPENROUTER_API_KEY,
 });
 
-const baseURL = "https://openrouter.ai/api/v1/chat/completions";
-const apiKey = process.env.OPENROUTER_API_KEY;
 
 // CORS middleware
 app.use("/*", cors());
