@@ -47,7 +47,6 @@ import { browserAgentRouter } from "./lib/inkgestBrowserAgent.js";
 import { logger } from "hono/logger";
 import UserAgents from "user-agents";
 import browserPool from "./browser-pool.js";
-import fs from "fs";
 import fsp from "fs/promises";
 import { exec } from "child_process";
 import { promisify } from "util";
@@ -64,6 +63,16 @@ import {
 	YoutubeTranscriptNotAvailableLanguageError,
 } from "youtube-transcript-plus";
 import { openRouterTranslateAuthMiddleware } from "./lib/translateFirebaseAuth.js";
+import {
+	createComposioLink,
+	deleteStoredConnection,
+	executeCmsTool,
+	getStoredConnection,
+	isComposioPlatform,
+	resolveActiveConnectedAccount,
+	setStoredConnection,
+	summarizeComposioToolFailure,
+} from "./lib/composioCms.js";
 import { GoogleGenAI } from "@google/genai";
 
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
@@ -291,62 +300,6 @@ async function openRouterChat({
 	};
 }
 
-const OUTPUT_FILE = "./templates.json";
-
-const EMAIL_DIR = path.join(__dirname, "./templates");
-const INDEX_FILE = path.join(__dirname, "../templates-index.json");
-
-async function getEmbedding(text) {
-	const res = await fetch("http://localhost:11434/api/embeddings", {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			model: "mxbai-embed-large",
-			prompt: `Represent this sentence for searching relevant passages: ${text}`,
-		}),
-	});
-	const { embedding } = await res.json();
-	return embedding;
-}
-
-async function indexAll() {
-	const files = fs
-		.readdirSync(EMAIL_DIR)
-		.filter((f) => /\.(html|jsx|tsx)$/.test(f));
-	console.log(`Indexing ${files.length} emails...`);
-
-	const index = [];
-
-	for (let i = 0; i < files.length; i++) {
-		const file = files[i];
-		const html = fs.readFileSync(path.join(EMAIL_DIR, file), "utf8");
-
-		const base = path.basename(file, path.extname(file));
-		const category = base.split("-")[0];
-		const stripped = html
-			.replace(/<[^>]+>/g, " ")
-			.replace(/\s+/g, " ")
-			.slice(0, 800);
-		const subject = base.replace(/-/g, " ");
-
-		const embedding = await getEmbedding(`${subject} ${category} ${stripped}`);
-
-		index.push({
-			filename: file,
-			category,
-			subject,
-			description: stripped.slice(0, 200),
-			embedding, // just a number[] in JSON
-		});
-
-		console.log(`[${i + 1}/${files.length}] ${file}`);
-	}
-
-	fs.writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
-	console.log(`✅ email-index.json written (${index.length} entries)`);
-}
-
-indexAll().catch(console.error);
 
 const userAgents = new UserAgent();
 
@@ -10909,6 +10862,60 @@ async function verifyApiToken(token) {
 	return { valid: true, userId, credits };
 }
 
+/**
+ * Same as verifyApiToken but does not require credits — for OAuth / integration routes.
+ */
+async function verifyApiTokenIdentity(rawToken) {
+	let payload;
+	try {
+		payload = jwt.verify(rawToken, JWT_SECRET);
+	} catch {
+		return {
+			valid: false,
+			error: "Invalid or expired API token",
+			code: "INVALID_TOKEN",
+		};
+	}
+	const { userId } = payload;
+	if (!userId) {
+		return {
+			valid: false,
+			error: "Token payload missing userId",
+			code: "INVALID_TOKEN",
+		};
+	}
+	const [tokenSnap, userSnap] = await Promise.all([
+		firestore.collection(API_TOKENS_COLL).doc(userId).get(),
+		firestore.collection(USERS_COLL).doc(userId).get(),
+	]);
+	if (!tokenSnap.exists) {
+		return {
+			valid: false,
+			error: "API token not found — generate one via /api-token/create",
+			code: "TOKEN_NOT_FOUND",
+		};
+	}
+	const tokenData = tokenSnap.data();
+	if (!tokenData.isActive) {
+		return {
+			valid: false,
+			error: "API token has been revoked",
+			code: "TOKEN_REVOKED",
+		};
+	}
+	if (tokenData.token !== rawToken) {
+		return {
+			valid: false,
+			error: "Token does not match the active token for this user",
+			code: "TOKEN_MISMATCH",
+		};
+	}
+	if (!userSnap.exists) {
+		return { valid: false, error: "User not found", code: "USER_NOT_FOUND" };
+	}
+	return { valid: true, userId };
+}
+
 /** Decrement the user's credit balance by API_CREDIT_COST (fire-and-forget safe). */
 async function deductCredit(userId) {
 	await firestore
@@ -11029,6 +11036,291 @@ app.get("/api-token/credits/:userId", async (c) => {
 		return c.json({ success: true, userId, credits });
 	} catch (err) {
 		return c.json({ error: err?.message || "Failed to fetch credits" }, 500);
+	}
+});
+
+// ─── Composio — Notion & Google Docs (OAuth + push) ───────────────────────────
+// Requires the same Bearer JWT as /api-token (identity only; no credit deduction).
+// Env: COMPOSIO_API_KEY, COMPOSIO_NOTION_AUTH_CONFIG_ID, COMPOSIO_GOOGLEDOCS_AUTH_CONFIG_ID,
+//      optional COMPOSIO_OAUTH_CALLBACK_URL, COMPOSIO_*_TOOLKIT_VERSION pins, tool slug overrides — lib/composioCms.js.
+
+async function requireIntegrationAuth(c) {
+	const authHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const rawToken = authHdr?.startsWith("Bearer ")
+		? authHdr.slice(7).trim()
+		: authHdr?.trim();
+	if (!rawToken) {
+		return {
+			ok: false,
+			response: c.json(
+				{
+					error: "API token required",
+					code: "MISSING_TOKEN",
+					details:
+						"Authorization: Bearer <jwt from POST /api-token/create>",
+				},
+				401,
+			),
+		};
+	}
+	const result = await verifyApiTokenIdentity(rawToken);
+	if (!result.valid) {
+		return {
+			ok: false,
+			response: c.json(
+				{ error: result.error, code: result.code },
+				401,
+			),
+		};
+	}
+	return { ok: true, userId: result.userId };
+}
+
+/** POST /integrations/composio/oauth-link — start OAuth; returns Composio redirect URL. */
+app.post("/integrations/composio/oauth-link", async (c) => {
+	const auth = await requireIntegrationAuth(c);
+	if (!auth.ok) return auth.response;
+
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+	const platform = String(body.platform || "")
+		.trim()
+		.toLowerCase();
+	if (!isComposioPlatform(platform)) {
+		return c.json(
+			{
+				error: 'platform must be "notion" or "googledocs"',
+				code: "INVALID_PLATFORM",
+			},
+			400,
+		);
+	}
+	try {
+		const connectionRequest = await createComposioLink(
+			auth.userId,
+			platform,
+			body.callbackUrl,
+		);
+		return c.json({
+			success: true,
+			redirectUrl: connectionRequest.redirectUrl,
+			connectedAccountId: connectionRequest.id,
+			platform,
+			hint: "After the user returns from OAuth, call POST /integrations/composio/connection to persist the link (or pass connectedAccountId from this response).",
+		});
+	} catch (err) {
+		console.error("[integrations/composio/oauth-link]", err?.message);
+		return c.json(
+			{
+				success: false,
+				error: err?.message || "Failed to create Composio auth link",
+				code: "COMPOSIO_LINK_FAILED",
+			},
+			502,
+		);
+	}
+});
+
+/**
+ * POST /integrations/composio/connection — confirm ACTIVE connection & store connectedAccountId in Firestore.
+ * Body: { platform, connectedAccountId? } — if omitted, uses latest ACTIVE account for your auth config.
+ */
+app.post("/integrations/composio/connection", async (c) => {
+	const auth = await requireIntegrationAuth(c);
+	if (!auth.ok) return auth.response;
+
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+	const platform = String(body.platform || "")
+		.trim()
+		.toLowerCase();
+	if (!isComposioPlatform(platform)) {
+		return c.json(
+			{ error: 'platform must be "notion" or "googledocs"' },
+			400,
+		);
+	}
+	try {
+		const { connectedAccountId, authConfigId } =
+			await resolveActiveConnectedAccount(
+				auth.userId,
+				platform,
+				body.connectedAccountId,
+			);
+		await setStoredConnection(auth.userId, platform, {
+			connectedAccountId,
+			authConfigId,
+		});
+		return c.json({
+			success: true,
+			platform,
+			connectedAccountId,
+		});
+	} catch (err) {
+		console.error("[integrations/composio/connection]", err?.message);
+		return c.json(
+			{
+				success: false,
+				error: err?.message || "Failed to verify Composio connection",
+				code: "COMPOSIO_CONNECTION_FAILED",
+			},
+			400,
+		);
+	}
+});
+
+/** GET /integrations/composio/connection/:platform — read stored connection (no secrets). */
+app.get("/integrations/composio/connection/:platform", async (c) => {
+	const auth = await requireIntegrationAuth(c);
+	if (!auth.ok) return auth.response;
+	const platform = String(c.req.param("platform") || "")
+		.trim()
+		.toLowerCase();
+	if (!isComposioPlatform(platform)) {
+		return c.json({ error: "Invalid platform" }, 400);
+	}
+	const row = await getStoredConnection(auth.userId, platform);
+	if (!row) {
+		return c.json(
+			{
+				success: false,
+				connected: false,
+				platform,
+				code: "NOT_CONNECTED",
+			},
+			404,
+		);
+	}
+	return c.json({
+		success: true,
+		connected: true,
+		platform,
+		connectedAccountId: row.connectedAccountId,
+		updatedAt: row.updatedAt || null,
+	});
+});
+
+/** DELETE /integrations/composio/connection/:platform — forget stored mapping (OAuth stays in Composio). */
+app.delete("/integrations/composio/connection/:platform", async (c) => {
+	const auth = await requireIntegrationAuth(c);
+	if (!auth.ok) return auth.response;
+	const platform = String(c.req.param("platform") || "")
+		.trim()
+		.toLowerCase();
+	if (!isComposioPlatform(platform)) {
+		return c.json({ error: "Invalid platform" }, 400);
+	}
+	await deleteStoredConnection(auth.userId, platform);
+	return c.json({ success: true, platform });
+});
+
+/**
+ * POST /integrations/composio/push — create or update doc/page via Composio tools.
+ * Body: { platform, action: "create"|"update", title?, content?, documentId?, notionParentId?, toolArguments? }
+ * On provider/tool failure (result.successful === false): HTTP 502, success: false, message, links[], hints[], retryable.
+ */
+app.post("/integrations/composio/push", async (c) => {
+	const auth = await requireIntegrationAuth(c);
+	if (!auth.ok) return auth.response;
+
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+	const platform = String(body.platform || "")
+		.trim()
+		.toLowerCase();
+	if (!isComposioPlatform(platform)) {
+		return c.json(
+			{ error: 'platform must be "notion" or "googledocs"' },
+			400,
+		);
+	}
+	const action = String(body.action || "create")
+		.trim()
+		.toLowerCase();
+	if (action !== "create" && action !== "update") {
+		return c.json(
+			{ error: 'action must be "create" or "update"' },
+			400,
+		);
+	}
+	const title = body.title != null ? String(body.title) : "";
+	const content = body.content != null ? String(body.content) : "";
+	const documentId =
+		body.documentId != null ? String(body.documentId).trim() : "";
+	if (action === "create" && !content.trim() && !title.trim()) {
+		return c.json(
+			{
+				error: "For create, provide title and/or content (e.g. markdown from /generate/blog)",
+			},
+			400,
+		);
+	}
+	try {
+		const result = await executeCmsTool(auth.userId, platform, action, {
+			title: title || undefined,
+			content: content || undefined,
+			documentId: documentId || undefined,
+			notionParentId:
+				body.notionParentId != null
+					? String(body.notionParentId).trim()
+					: undefined,
+			toolArguments:
+				body.toolArguments &&
+				typeof body.toolArguments === "object" &&
+				!Array.isArray(body.toolArguments)
+					? body.toolArguments
+					: undefined,
+		});
+		if (!result.successful) {
+			const failure = summarizeComposioToolFailure(result, platform);
+			return c.json(
+				{
+					success: false,
+					platform,
+					action,
+					code: "COMPOSIO_TOOL_FAILED",
+					message: failure.message,
+					links: failure.links,
+					hints: failure.hints,
+					reason: failure.reason,
+					retryable: failure.retryable,
+					logId: failure.logId,
+					result,
+					timestamp: new Date().toISOString(),
+				},
+				502,
+			);
+		}
+		return c.json({
+			success: true,
+			platform,
+			action,
+			result,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (err) {
+		console.error("[integrations/composio/push]", err?.message);
+		return c.json(
+			{
+				success: false,
+				error: err?.message || "Composio tool execution failed",
+				code: "COMPOSIO_PUSH_FAILED",
+			},
+			502,
+		);
 	}
 });
 
@@ -13088,6 +13380,8 @@ async function runSkillAsset(
 	return attachOpenRouterMeta({ content: content.trim() });
 }
 
+
+
 // ─── POST /generate/:type ─────────────────────────────────────────────────────
 // Supported :type values (see ASSET_SKILL_MAP):
 //   blog | article | email | newsletter | linkedin | twitter | substack | scrape | invoice | infographics | table |
@@ -13098,6 +13392,10 @@ async function runSkillAsset(
 //   scrape: format defaults to "markdown"; use markdown | html | plain | text | json (output shape follows format)
 //   invoice: format defaults to "json"; use json | markdown | react | html (structured invoice + optional scraped URLs)
 // Response: { success, type, skillType, urls, content|infographics|columns/rows|images|markdown, timestamp }
+//
+// Export to Notion / Google Docs (after OAuth): Bearer JWT same family as below, then
+// POST /integrations/composio/oauth-link → POST /integrations/composio/connection → POST /integrations/composio/push with { platform, action, content, ... } (see composio routes).
+//
 app.post("/generate/:type", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
 	const genAuthHdr =

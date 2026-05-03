@@ -8,21 +8,10 @@
 	},
 	"scripts": {
 		"start": "NLLB_MODULE_PATH=${NLLB_MODULE_PATH:-./lib/nllbTranslate.local.js} node index.js",
-		"dev": "NLLB_MODULE_PATH=${NLLB_MODULE_PATH:-./lib/nllbTranslate.local.js} nodemon index.js",
-		"kixi": "nodemon ai-examples/kixi.js",
-		"simba": "nodemon ai-examples/simba-ui-ux/simba.js",
-		"ai-next-react-coder": "nodemon ai-examples/ai-next-react-coder.js",
-		"lightpanda": "nodemon lightpanda-browser.js",
-		"dev:profiler": "nodemon index.js --firebase_env=profiler",
-		"build": "npm install && npm install --only=dev",
-		"test:load": "node tests/test-load.js",
-		"pentest": "node tests/pentest-load.js",
-		"pentest:pool": "node tests/test-load.js",
-		"monitor": "node monitor-resources.js",
-		"test:with-monitor": "concurrently \"npm run monitor\" \"npm run test:load\"",
-		"mcp:scrape": "node mcp-scrape-server.js"
+		"dev": "nodemon index.js"
 	},
 	"dependencies": {
+		"@composio/core": "^0.8.1",
 		"@google/genai": "^1.10.0",
 		"@hono/node-server": "^1.8.0",
 		"@hono/react-renderer": "^1.0.1",
