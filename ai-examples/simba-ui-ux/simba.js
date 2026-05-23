@@ -1,17 +1,15 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-import { streamSSE } from "hono/streaming";
 import OpenAI from "openai";
 import { cors } from "hono/cors";
 import dotenv from "dotenv";
-import { search } from "./scripts/core.js";
 import { uiBlockLibrary } from "../tailwind-ui-blocks.js";
 import { templates } from "../templates.js";
-import cosineSimilarity from "../../utils/cosineSimilarity.js";
 import { prompts } from "./prompts/prompts.js";
-import { loadSkills } from "./skills/loadSkills.js";
 
 dotenv.config();
+
+const port = Number(process.env.PORT) || 4001;
 
 const openai = new OpenAI({
 	baseURL: "https://openrouter.ai/api/v1",
@@ -78,17 +76,324 @@ async function getBlockEmbeddings() {
 	return embeddings;
 }
 
+function getPromptMarkdownText(entry) {
+	if (typeof entry === "string") return entry;
+	if (entry && typeof entry.prompt === "string") return entry.prompt;
+	return "";
+}
+
 async function getPromptEmbeddings() {
 	if (promptEmbeddingsCache) return promptEmbeddingsCache;
 	const embeddings = {};
 	for (const [key, promptObj] of Object.entries(prompts)) {
-		// Extract first 500 chars as context for embedding to understand design system meaning
-		const text = promptObj.prompt?.slice(0, 500).replace(/<[^>]*>/g, "") || ""; // strip tags
+		const raw = getPromptMarkdownText(promptObj);
+		const text = raw.slice(0, 500).replace(/<[^>]*>/g, "") || "";
 		const embedding = await getEmbedding(text);
 		if (embedding) embeddings[key] = embedding;
 	}
 	promptEmbeddingsCache = embeddings;
 	return embeddings;
+}
+
+function cosineSimilarity(a, b) {
+	if (!a?.length || !b?.length || a.length !== b.length) return -1;
+	let dot = 0,
+		na = 0,
+		nb = 0;
+	for (let i = 0; i < a.length; i++) {
+		dot += a[i] * b[i];
+		na += a[i] * a[i];
+		nb += b[i] * b[i];
+	}
+	const denom = Math.sqrt(na) * Math.sqrt(nb);
+	return denom === 0 ? 0 : dot / denom;
+}
+
+function normalizeVariantToken(s) {
+	return String(s || "")
+		.toLowerCase()
+		.trim()
+		.replace(/[\s_]+/g, "-");
+}
+
+/** Resolve prompts key from API variant (camelCase key, slug, or display name). */
+function resolvePromptKey(variantRaw) {
+	const v = normalizeVariantToken(variantRaw);
+	if (!v) return null;
+	for (const [key, entry] of Object.entries(prompts)) {
+		if (normalizeVariantToken(key) === v) return key;
+		const name = typeof entry === "object" && entry?.name ? entry.name : "";
+		if (name && normalizeVariantToken(name) === v) return key;
+	}
+	return null;
+}
+
+async function resolveDesignMarkdown({ variant, theme }) {
+	if (variant) {
+		const key = resolvePromptKey(variant);
+		if (!key) {
+			return {
+				ok: false,
+				error: `Unknown design variant "${variant}". Use a key or slug from prompts (e.g. neoBrutalism, neo-brutalism).`,
+			};
+		}
+		const text = getPromptMarkdownText(prompts[key]);
+		if (!text.trim()) {
+			return { ok: false, error: `Design markdown is empty for variant "${key}".` };
+		}
+		return { ok: true, promptKey: key, designMarkdown: text };
+	}
+
+	const themeText = typeof theme === "string" ? theme.trim() : "";
+	if (!themeText) {
+		return {
+			ok: false,
+			error:
+				'Provide `variant` (prompts key or slug) or `theme` (short natural-language design style) to select a design MDX.',
+		};
+	}
+
+	const queryVec = await getEmbedding(themeText);
+	if (!queryVec) {
+		return { ok: false, error: "Could not embed `theme` for design selection." };
+	}
+
+	const cache = await getPromptEmbeddings();
+	let bestKey = null;
+	let bestScore = -1;
+	for (const [key, vec] of Object.entries(cache)) {
+		const s = cosineSimilarity(queryVec, vec);
+		if (s > bestScore) {
+			bestScore = s;
+			bestKey = key;
+		}
+	}
+
+	if (bestKey === null || bestScore < 0.25) {
+		return {
+			ok: false,
+			error:
+				"No confident design match for `theme`. Pass an explicit `variant` or a clearer `theme` description.",
+		};
+	}
+
+	const designMarkdown = getPromptMarkdownText(prompts[bestKey]);
+	return {
+		ok: true,
+		promptKey: bestKey,
+		designMarkdown,
+		matchedScore: bestScore,
+	};
+}
+
+/** Mirrors index.js codegen constraints; kept in system message (compact task lines, no long section recipes). */
+const CODEGEN_CRITICAL_HTML = `CRITICAL OUTPUT FORMAT — HTML ONLY:
+- Your ENTIRE response must be ONE complete HTML5 document. First line MUST be <!DOCTYPE html> (or start with <html).
+- Put <script src="https://cdn.tailwindcss.com"></script> in <head> before </head>.
+- FORBIDDEN: React, JSX, import/export, lucide-react, framer-motion, or .tsx syntax.
+- Use semantic HTML, Tailwind utility classes only, inline SVG or Unicode icons as needed.
+
+`;
+
+const CODEGEN_CRITICAL_REACT = `CRITICAL OUTPUT FORMAT — REACT / JSX ONLY:
+- Your ENTIRE response must be ONE file: a default-exported React functional component (JSX).
+- FORBIDDEN: <!DOCTYPE html> or a full HTML document as the only output.
+- Use Tailwind. You may import from "lucide-react" and "framer-motion" when appropriate.
+
+`;
+
+const OUTPUT_TYPE_HINT = {
+	landing: "Full marketing landing: sticky nav, hero, social proof, features, how-it-works, pricing, FAQ, footer.",
+	app: "Single app shell: sidebar + main (top bar + content); product-style hierarchy.",
+	page: "Lighter page: hero, 2–3 sections, CTA, compact footer.",
+	mobile: "Mobile-first: max-w-md / sm breakpoints, large tap targets, bottom nav or drawer where it fits.",
+};
+
+/** Keeps generated UIs shippable: real copy, responsive layout, accessible interaction, no brittle assets. */
+const IMPLEMENTATION_QUALITY_RULES = `Implementation quality:
+- Responsive layout is mandatory: use Tailwind breakpoints (e.g. sm:, md:, lg:), fluid widths (w-full, max-w-*, min-h-0 where needed), and flex/grid that reflows on small screens—never ship a layout that only works at one desktop width.
+- Avoid images: do not use <img>, src="…" photos, or external image URLs. Prefer inline SVG, lucide-react icons in React, or simple vector/icon treatments so the UI never depends on missing assets.
+- Every visible piece of UI must be finished: all nav links, headings, labels, buttons, cards, features, and list items need concrete, readable text that reflects the user’s build request—no empty tags, no “Title”/“Description” placeholders, and no lorem ipsum.
+
+Semantics, accessibility, and resilient layout:
+- Use semantic elements: header/nav/main/section/footer where appropriate; one clear <h1> (or single top-level heading) per screen, then h2/h3 without skipping levels.
+- Clickable controls must be real <button type="button"> (or type="submit" in forms) or <a href="…"> with a purposeful URL—never a bare <div onClick>. Icon-only buttons need aria-label (or visually hidden text).
+- Every input, select, and textarea needs an associated <label htmlFor> (React) or matching for/id (HTML), or explicit aria-label—no orphan fields.
+- All interactive elements need visible focus styles (e.g. focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none) and comfortable hit targets (at least ~44px min height/width on touch areas via padding or min-h-11/min-w-11).
+- Flex/grid hygiene: use min-w-0 on flex children that should shrink or truncate; use overflow-x-hidden on the page wrapper when horizontal scroll would break mobile; use line-clamp-* only when copy should truncate, not as an excuse to omit text.
+- Motion: keep animations subtle; prefer CSS transitions or light framer-motion; respect prefers-reduced-motion with motion-reduce:transition-none motion-reduce:animate-none where you add transitions/animation classes.
+- Do not rely on color alone for state (errors, success)—pair with text, icons, or borders. Ensure contrast stays readable against the design system’s backgrounds.`;
+
+function buildDesignAwareSystemPrompt(format, outputType, options = {}) {
+	const { siblingPage } = options;
+	const isHtml = format === "html";
+	const critical = isHtml ? CODEGEN_CRITICAL_HTML : CODEGEN_CRITICAL_REACT;
+	const hint = OUTPUT_TYPE_HINT[outputType] || OUTPUT_TYPE_HINT.page;
+	const fmtRules =
+		format === "react"
+			? "Tailwind only; one default export; import React if needed."
+			: "One HTML file; Tailwind CDN in <head>; utility classes only.";
+	const siblingBlock = siblingPage
+		? `
+
+Multi-page / sibling: The user may include a reference page from the same product. Reuse its Tailwind habits (spacing, radii, shadows, type scale), nav/header branding, and tone so the new file feels like the same site—while still delivering a complete new page for the described role (not a copy-paste of unrelated sections).`
+		: "";
+	return `${critical}You are an expert frontend engineer. The user message starts with an authoritative DESIGN SYSTEM (markdown from our MDX library). Follow it strictly for colors, typography, surfaces, and patterns—do not invent a different visual language unless the design doc explicitly allows choices.
+
+${IMPLEMENTATION_QUALITY_RULES}
+
+Task shape: ${hint}
+${fmtRules}${siblingBlock}
+
+Output ONLY raw code — no markdown fences, no explanation before or after.`;
+}
+
+function buildDesignUpdateSystemPrompt(format, outputType) {
+	const base = buildDesignAwareSystemPrompt(format, outputType);
+	return `${base}
+
+Editing mode: The user message includes CURRENT SOURCE CODE. Apply the change request and output ONE complete updated file in the same format (React or HTML). Keep parts that still apply; change only what is needed plus any necessary follow-on edits for consistency. No diffs, no partial-only snippets, no commentary—full file only.`;
+}
+
+/** Large pastes from prior codegen; clipped to protect context limits. */
+const CODE_CONTEXT_MAX_CHARS = 48_000;
+const EXISTING_CODE_MIN_CHARS = 80;
+
+function clipCodeForPrompt(code, labelForTruncation = "truncated") {
+	const t = String(code).replace(/\r\n/g, "\n").trim();
+	if (t.length <= CODE_CONTEXT_MAX_CHARS) return t;
+	return `${t.slice(0, CODE_CONTEXT_MAX_CHARS)}\n\n/* … ${labelForTruncation} … */`;
+}
+
+function streamOpenRouterSseToPlainText(openRouterBody) {
+	const encoder = new TextEncoder();
+	const upstreamReader = openRouterBody.getReader();
+	const upstreamDecoder = new TextDecoder();
+	return new ReadableStream({
+		async start(controller) {
+			let sseBuffer = "";
+			try {
+				while (true) {
+					const { done, value } = await upstreamReader.read();
+					if (done) break;
+
+					sseBuffer += upstreamDecoder.decode(value, { stream: true });
+					const lines = sseBuffer.split("\n");
+					sseBuffer = lines.pop();
+
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed.startsWith("data: ")) continue;
+
+						const payload = trimmed.slice(6);
+						if (payload === "[DONE]") {
+							controller.close();
+							return;
+						}
+
+						let parsed;
+						try {
+							parsed = JSON.parse(payload);
+						} catch {
+							continue;
+						}
+
+						if (parsed?.error) {
+							const errMsg =
+								typeof parsed.error === "string"
+									? parsed.error
+									: parsed.error.message || "OpenRouter error";
+							controller.enqueue(encoder.encode(errMsg));
+							controller.close();
+							return;
+						}
+
+						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
+						if (delta) {
+							controller.enqueue(encoder.encode(delta));
+						}
+					}
+				}
+				controller.close();
+			} catch (err) {
+				try {
+					controller.enqueue(encoder.encode(err.message));
+					controller.close();
+				} catch {}
+			} finally {
+				upstreamReader.releaseLock();
+			}
+		},
+	});
+}
+
+async function fetchOpenRouterPlainTextStream({
+	openRouterApiKey,
+	model,
+	messages,
+	title,
+	temperature = 0.35,
+}) {
+	let openRouterRes;
+	try {
+		openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${openRouterApiKey}`,
+				"HTTP-Referer": "https://ihatereading.in",
+				"X-Title": title,
+			},
+			body: JSON.stringify({
+				model,
+				stream: true,
+				messages,
+				temperature,
+			}),
+		});
+	} catch (fetchErr) {
+		return {
+			ok: false,
+			status: 502,
+			text: `Failed to reach OpenRouter: ${fetchErr.message}`,
+		};
+	}
+
+	if (!openRouterRes.ok) {
+		let detail = `OpenRouter ${openRouterRes.status}`;
+		try {
+			const errJson = await openRouterRes.json();
+			detail = errJson?.error?.message || detail;
+		} catch {}
+		return { ok: false, status: openRouterRes.status, text: detail };
+	}
+
+	return {
+		ok: true,
+		stream: streamOpenRouterSseToPlainText(openRouterRes.body),
+	};
+}
+
+function buildCodegenSuccessResponse({
+	outputStream,
+	format,
+	outputType,
+	promptKey,
+	extraHeaders = {},
+}) {
+	return new Response(outputStream, {
+		status: 200,
+		headers: {
+			"Content-Type": "text/plain; charset=utf-8",
+			"Cache-Control": "no-cache",
+			Connection: "keep-alive",
+			"X-Accel-Buffering": "no",
+			"X-Codegen-Format": format,
+			"X-Codegen-Output-Type": outputType,
+			"X-Design-Variant-Key": promptKey,
+			...extraHeaders,
+		},
+	});
 }
 
 const app = new Hono();
@@ -108,1053 +413,247 @@ app.use(
 	}),
 );
 
-const monolithicSimbaPrompt = `
-[C] CONTEXT
-You are a deterministic HTML rendering engine.
-You strictly transform structured input into production-grade HTML.
-
-────────────────────────────────────────
-[R] DESIGN REASONING ENGINE (MANDATORY)
-Before generating any code, you MUST internally reason through:
-1. INDUSTRY MATCHING: Identify the product category (SaaS, Fintech, Healthcare, E-commerce, Luxury, etc.).
-2. STYLE PRIORITY: Choose the best UI style (Minimalism, Glassmorphism, Neo-Brutalism, Soft UI, etc.).
-3. COLOR PSYCHOLOGY: Select an industry-appropriate palette (e.g., Soft Pink/Sage for Wellness, Navy/Indigo for SaaS).
-4. TYPOGRAPHY PAIRING: Select a Google Font combination that matches the brand mood.
-5. ANTI-PATTERN FILTERING: Identify industry-specific "no-gos" (e.g., NO harsh animations for Healthcare, NO bright neons for Finance).
-
-────────────────────────────────────────
-[S] PRODUCTION LAWS (NON-NEGOTIABLE)
-
-1. NO PLACEHOLDERS / NO COMMENTS:
-   - NEVER use comments like "<!-- 3 more cards -->" or "<!-- Add others here -->".
-   - You MUST render EVERY SINGLE item specified in the architecture. If architecture says 10 items, you render 10 distinct HTML blocks with 10 distinct real names/values.
-   - NO placeholders ("Item 1", "Placeholder", "Lorem Ipsum"). Use domain-specific real data.
-   - FAILURE TO COMPLY = IMMEDIATE FAILURE.
-
-2. ARCHITECTURAL DENSITY (MANDATORY MINIMUMS):
-   - DASHBOARD: Sidebar (min 10 REAL items) + TopBar + StatsRow (min 4 distinct cards with trends) + Filters + Data View (min 10 rows/cards) + RightPanel (activity feed).
-   - LANDING PAGE: 10+ sections (Hero, Multi-column Features, Bento Grid, Problem/Solution, How it Works, Testimonials (min 6), Pricing (3 tiers), FAQ (8+ items), Footer).
-   - Sidebar/Navbar MUST have 8-12 navigation items, search, and user profile.
-   - ALL lists (cards, table rows, nav items) must have at least 8-10 unique items.
-   - OMISSION = FAILURE. Every view MUST be fully realized with no empty spaces or placeholders.
-
-3. INTERACTION & ACCESSIBILITY:
-   - MANDATORY: Add CSS transitions to every button, card, and link (hover:scale-[1.02], transition-all duration-300).
-   - MANDATORY: Use entrance animations on EVERY section and major card (class="animate-in fade-in slide-in-from-bottom-4 duration-1000").
-   - MANDATORY: Ensure WCAG AA compliance (text contrast, focus states, cursor-pointer on all clickables).
-
-4. TECH STACK & ICONS:
-   - HTML5 + Tailwind CSS v3 (Play CDN: <script src="https://cdn.tailwindcss.com"></script>).
-   - Lucide Icons: MANDATORY USE <i data-lucide="icon-name"></i>. 
-   - NEVER use <img> tags for icons. NEVER use "lucide-static" images.
-   - Initialize with <script src="https://unpkg.com/lucide@latest"></script> and <script>lucide.createIcons();</script> before </body>.
-   - Real Unsplash images only (e.g., https://images.unsplash.com/photo-...).
-
-5. REAL CONTENT PROTOCOL:
-  - All names, metrics, and testimonials must be fictional but realistic.
-	- Do not claim affiliation with real companies.
-	- Do not fabricate real-world claims.
-
-────────────────────────────────────────
-[OUTPUT FORMAT — STRICT JSON]
-Return a JSON object:
-{
-  "design_system_reasoning": {
-    "industry": "Identified Industry",
-    "style": "Chosen UI Style",
-    "color_palette": { "primary": "HEX", "secondary": "HEX", "cta": "HEX" },
-    "typography": "Chosen Font Pairing",
-    "anti_patterns_avoided": ["Rule 1", "Rule 2"]
-  },
-  "intent": "single-page | multi-page | component",
-  "pages": [
-    {
-      "slug": "index",
-      "html": "<!DOCTYPE html>...",
-      "summary": "Concise 1-2 line summary of this specific page"
-    }
-  ],
-  "next_updates": [
-    "Feature idea 1 (3-5 words)",
-    "Feature idea 2 (3-5 words)",
-    "Feature idea 3 (3-5 words)",
-    "Feature idea 4 (3-5 words)",
-    "Feature idea 5 (3-5 words)"
-  ]
-}
-- NO markdown.
-- NO explanations.
-- Use relative links (href="product.html") between pages.
-- Avoid unnecessary verbose markup.
-- Avoid redundant wrapper divs.
-- Keep class lists efficient.
-- REINFORCEMENT: If you use placeholders or comments, the generation will be REJECTED. Build it like a $100k production project.
-`;
-
-// above this simple one prompt we need skills to improve UI for existing code based on the product requirements
-// for example product is landing page than landing page skills load for AI agent post generation making it better UI
-
-async function callMonolithicAgent({ prompt }) {
-	const response = await openai.chat.completions.create({
-		model: "openai/gpt-4o", // Upgraded to gpt-4o for production density
-		messages: [
-			{
-				role: "system",
-				content: monolithicSimbaPrompt,
-			},
-			{
-				role: "user",
-				content: `User Request: ${prompt}`,
-			},
-		],
-		response_format: { type: "json_object" },
-	});
-
-	const content = JSON.parse(response.choices[0].message.content);
-	const pages = (content.pages || []).map((page) => ({
-		...page,
-		html: stripCodeFences(page.html || "", "html").trim(),
-	}));
-
-	return {
-		intent: content.intent || "single-page",
-		design_system_reasoning: content.design_system_reasoning,
-		pages,
-		next_updates: content.next_updates,
-		usage: response.usage.total_tokens,
-	};
-}
-
 /**
- * Utility to strip markdown code fences from AI output
- * @param {string} content - The content to strip
- * @param {string} language - The language to strip (e.g. "html", "json")
- * @returns {string} - The stripped content
+ * POST /codegen-design?format=react|html&outputType=…&model=<optional>
+ * Body: { query, prompt?, variant?, theme?, referenceCode? }
+ * Optional referenceCode: prior page from same site (e.g. landing) so new pages stay visually aligned.
+ * Streams text/plain.
  */
-function stripCodeFences(content, language = "") {
-	if (!content) return "";
-	const regex = new RegExp(`^\`\`\`${language}[\\s\\S]*?\\n|\\n\`\`\`$`, "g");
-	const fallbackRegex = /^\s*```[\w-]*\n([\s\S]*?)\n```\s*$/;
-
-	// Try standard regex
-	let stripped = content.replace(regex, "");
-
-	// If still has fences, try fallback
-	const match = content.match(fallbackRegex);
-	if (match) {
-		stripped = match[1];
+app.post("/codegen-design", async (c) => {
+	let body = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.text("Invalid JSON body", 400);
 	}
 
-	return stripped.replace(/```/g, "").trim();
-}
+	const formatRaw =
+		c.req.query("format") ||
+		(typeof body.format === "string" ? body.format : "") ||
+		"react";
+	const format = String(formatRaw).toLowerCase().trim();
+	if (format !== "react" && format !== "html") {
+		return c.text('format must be "react" or "html"', 400);
+	}
 
-async function callDesignWebsiteAgent({ prompt }) {
-	// 1. Find relevant product features and required sections from CSVs
-	const [productInfo, sectionInfo] = await Promise.all([
-		search(prompt, "product", 1),
-		search(prompt, "section", 1),
-	]);
+	const outputTypeRaw =
+		c.req.query("outputType") ||
+		(typeof body.outputType === "string" ? body.outputType : "") ||
+		"page";
+	const outputType = String(outputTypeRaw).toLowerCase().trim();
+	const VALID = new Set(["landing", "app", "page", "mobile"]);
+	if (!VALID.has(outputType)) {
+		return c.text("Invalid outputType. Allowed: landing, app, page, mobile.", 400);
+	}
 
-	const productDetails = productInfo.results[0]
-		? JSON.stringify(productInfo.results[0], null, 2)
-		: "No specific product guidelines found.";
+	const query =
+		typeof body.query === "string"
+			? body.query.trim()
+			: typeof body.userQuery === "string"
+				? body.userQuery.trim()
+				: "";
+	if (query.length < 10) {
+		return c.text(
+			"query (or userQuery) must be at least 10 characters",
+			400,
+		);
+	}
 
-	const sectionDetails = sectionInfo.results[0]
-		? JSON.stringify(sectionInfo.results[0], null, 2)
-		: "No specific section requirements found.";
+	const extraPrompt =
+		typeof body.prompt === "string" ? body.prompt.trim() : "";
+	const variantRaw =
+		c.req.query("variant") ||
+		(typeof body.variant === "string" ? body.variant : "") ||
+		"";
+	const themeRaw =
+		c.req.query("theme") ||
+		(typeof body.theme === "string" ? body.theme : "") ||
+		"";
 
-	// 2. DESIGNER AGENT: Finalize Design, Wireframe, and High-Fidelity Content
-	const availableThemes = Object.keys(prompts);
-	const designerResponse = await openai.chat.completions.create({
-		model: "openai/gpt-4o", // Upgraded to gpt-4o for high-fidelity content planning
-		messages: [
-			{
-				role: "system",
-				content: `You are a World-Class UI/UX Designer and Content Strategist. 
-Your task is to analyze the user's request and industry context to create a COMPLETE, High-Fidelity Wireframe and Content Plan.
+	const referenceRaw =
+		typeof body.referenceCode === "string" ? body.referenceCode : "";
+	const hasReference = referenceRaw.trim().length > 0;
 
-INDUSTRY GUIDELINES:
-${productDetails}
+	const resolved = await resolveDesignMarkdown({
+		variant: variantRaw.trim(),
+		theme: themeRaw,
+	});
+	if (!resolved.ok) {
+		return c.text(resolved.error, 400);
+	}
 
-REQUIRED PAGE SECTIONS & DATA:
-${sectionDetails}
+	const { designMarkdown, promptKey } = resolved;
+	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+	if (!openRouterApiKey) {
+		return c.text("OpenRouter API key not configured", 503);
+	}
 
-You MUST:
-1. Select the most appropriate visual theme from this list: ${availableThemes.join(", ")}.
-2. Design the FULL page architecture based on the REQUIRED SECTIONS above.
-3. High-fidelity content for EVERY section: Write the actual headlines, descriptions, labels, and features. NO PLACEHOLDERS.
-4. For Dashboards: Define Sidebar with 10+ items, TopBar, 4+ Stat Cards with real labels/values, and a complex Data View (table or kanban).
-5. Design System reasoning: Explain colors, typography, and layout choices based on the product type.
-6. Interactive Elements: Define specific buttons, hover states, and animations.
+	const model =
+		c.req.query("model") ||
+		process.env.CODEGEN_MODEL ||
+		"google/gemini-2.0-flash-001";
 
-Return a JSON object:
-{
-  "selected_theme": "selected_theme_key",
-  "design_reasoning": "Detailed explanation of the visual strategy",
-  "wireframe": {
-    "navigation": { "style": "navbar | sidebar", "logo": "...", "links": ["...", "..."], "cta": "..." },
-    "pages": [
-      {
-        "slug": "index",
-        "sections": [
-          {
-            "id": "hero",
-            "content": { "headline": "...", "subheadline": "...", "cta_primary": "...", "cta_secondary": "..." },
-            "visual_spec": "Detailed description of layout, background, and animations for this section"
-          },
-          {
-            "id": "features",
-            "content": { "title": "...", "items": [{ "title": "...", "desc": "...", "icon": "..." }] },
-            "visual_spec": "..."
-          }
-          // ... more sections
-        ],
-        "footer": { "columns": [...] }
-      }
-    ]
-  }
-}`,
-			},
-			{ role: "user", content: prompt },
-		],
-		response_format: { type: "json_object" },
+	const systemPrompt = buildDesignAwareSystemPrompt(format, outputType, {
+		siblingPage: hasReference,
 	});
 
-	const designPlan = JSON.parse(designerResponse.choices[0].message.content);
-	const selectedKey = designPlan.selected_theme;
-	const themePrompt = prompts[selectedKey] || prompts.modernDark;
-	const wireframeJson = JSON.stringify(designPlan.wireframe, null, 2);
+	let userMessage = `# DESIGN SYSTEM (authoritative — follow this markdown exactly)\n\n${designMarkdown}\n\n---\n`;
+	if (hasReference) {
+		const refClipped = clipCodeForPrompt(referenceRaw, "reference truncated");
+		userMessage += `\n# Reference page (same product or site — align patterns; new page must be a full standalone file)\n\n${refClipped}\n\n---\n`;
+	}
+	userMessage += `\n# Build request\n\n${query}`;
+	if (extraPrompt) {
+		userMessage += `\n\n## Additional instructions\n\n${extraPrompt}`;
+	}
 
-	// Combine the theme prompt with the production standards
-	const systemPrompt = `
-${themePrompt}
+	const messages = [
+		{ role: "system", content: systemPrompt },
+		{ role: "user", content: userMessage },
+	];
 
-────────────────────────────────────────
-[OUTPUT FORMAT — STRICT JSON]
-Return a JSON object:
-{
-  "design_system_reasoning": {
-    "industry": "Identified Industry",
-    "style": "Chosen UI Style",
-    "color_palette": { "primary": "HEX", "secondary": "HEX", "cta": "HEX" },
-    "typography": "Chosen Font Pairing",
-    "anti_patterns_avoided": ["Rule 1", "Rule 2"]
-  },
-  "intent": "single-page | multi-page | component",
-  "pages": [
-    {
-      "slug": "index",
-      "html": "<!DOCTYPE html>...",
-      "summary": "Concise 1-2 line summary of this specific page"
-    }
-  ],
-  "next_updates": [
-    "Feature idea 1 (3-5 words)",
-    "Feature idea 2 (3-5 words)",
-    "Feature idea 3 (3-5 words)",
-    "Feature idea 4 (3-5 words)",
-    "Feature idea 5 (3-5 words)"
-  ]
-}
-- NO markdown.
-- NO explanations.
-- Use relative links (href="product.html") between pages.
-- Avoid unnecessary verbose markup.
-- Avoid redundant wrapper divs.
-- Keep class lists efficient.
-- REINFORCEMENT: If you use placeholders or comments, the generation will be REJECTED. Build it like a $100k production project.
-`;
-
-	// 3. FRONTEND DEVELOPER AGENT: Implement the wireframe into pixel-perfect code
-	const response = await openai.chat.completions.create({
-		model: "openai/gpt-4o",
-		messages: [
-			{
-				role: "system",
-				content: systemPrompt,
-			},
-			{
-				role: "user",
-				content: `User Request: ${prompt}
-
-HIGH-FIDELITY WIREFRAME & CONTENT PLAN (FOLLOW THIS EXACTLY):
-${wireframeJson}
-
-DESIGN STRATEGY:
-${designPlan.design_reasoning}
-
-PRODUCT GUIDELINES:
-${productDetails}
-
-FRONTEND DEVELOPER INSTRUCTIONS:
-- You are a Senior Frontend Engineer. Your ONLY job is to implement the above wireframe into a pixel-perfect, high-fidelity production application.
-- Use the content (headlines, text, lists) provided in the wireframe exactly. Do not invent new content unless requested.
-- CORE PRODUCTION LAWS:
-  - NO PLACEHOLDERS. Render every single section and item defined in the wireframe.
-  - NO COMMENTS like "<!-- add more -->". The output must be 100% complete.
-  - MANDATORY ANIMATIONS: Use Tailwind entrance animations on every major section.
-  - INTERACTION: Every clickable element MUST have hover states and smooth transitions.
-  - ICONS: Use Lucide icons strictly as <i data-lucide="...">.
-
-OUTPUT: Return the strict JSON format specified in the system instructions.`,
-			},
-		],
-		response_format: { type: "json_object" },
+	const streamResult = await fetchOpenRouterPlainTextStream({
+		openRouterApiKey,
+		model,
+		messages,
+		title: "Simba design-aware codegen",
+		temperature: 0.35,
 	});
-	const content = JSON.parse(response.choices[0].message.content);
-	const pages = (content.pages || []).map((page) => ({
-		...page,
-		html: stripCodeFences(page.html || "", "html").trim(),
-	}));
+	if (!streamResult.ok) {
+		return c.text(streamResult.text, streamResult.status);
+	}
 
-	return {
-		intent: content.intent || "single-page",
-		design_system_reasoning:
-			content.design_system_reasoning || designPlan.design_reasoning,
-		pages,
-		next_updates: content.next_updates,
-		usage: response.usage,
-	};
-}
-
-// Internal Agent Methods (Encapsulated)
-const agents = {
-	monolithic: callMonolithicAgent,
-	designWebsite: callDesignWebsiteAgent,
-};
-
-// Main Public Orchestrator
-app.post("/simba", async (c) => {
-	const { prompt } = await c.req.json();
-
-	// ALWAYS STREAM
-	return streamSSE(c, async (stream) => {
-		try {
-			// 1️⃣ MONOLITHIC GENERATION
-			// This single call handles Intent, Architecture, and Rendering
-			const { intent, design_system_reasoning, pages, next_updates, usage } =
-				await agents.monolithic({
-					prompt,
-				});
-
-			// 2. Send Meta (Now we know the actual intent and pages)
-			await stream.writeSSE({
-				event: "meta",
-				data: JSON.stringify({
-					type: intent,
-					design_system_reasoning,
-					pages: pages.map((p) => p.slug),
-					intent: {
-						app_intent: {
-							type: intent,
-							domain: "generated",
-							description: prompt,
-						},
-						pages: pages.map((p) => ({
-							name: p.slug.charAt(0).toUpperCase() + p.slug.slice(1),
-							slug: p.slug,
-							purpose: p.summary,
-						})),
-					},
-				}),
-			});
-
-			// 3. Send each page data
-			for (const page of pages) {
-				await stream.writeSSE({
-					event: "page",
-					data: JSON.stringify({
-						slug: page.slug,
-						html: page.html,
-						summary: page.summary,
-						next_updates, // Same next updates for the whole app
-						usage: {
-							renderer: usage.total_tokens,
-						},
-					}),
-				});
-			}
-
-			// 4. Send Done with final usage
-			await stream.writeSSE({
-				event: "done",
-				data: JSON.stringify({
-					status: "complete",
-					usage: {
-						total: usage.total_tokens,
-					},
-				}),
-			});
-		} catch (err) {
-			console.error(`Error in monolithic generation:`, err);
-			await stream.writeSSE({
-				event: "error",
-				data: JSON.stringify({
-					error: "Generation failed",
-				}),
-			});
-		}
+	return buildCodegenSuccessResponse({
+		outputStream: streamResult.stream,
+		format,
+		outputType,
+		promptKey,
+		extraHeaders: hasReference
+			? { "X-Codegen-Sibling-Reference": "1" }
+			: {},
 	});
 });
 
-const MOBILE_SCREEN_GENERATOR_PROMPT = `You are an elite mobile UI/UX designer and frontend developer specializing in creating production-ready mobile app screens. You generate complete, pixel-perfect HTML/CSS code for mobile applications in a single response.
-
-# CRITICAL RULES - READ CAREFULLY
-
-1. **OUTPUT FORMAT**: Return ONLY a valid JSON object with this EXACT structure (no markdown, no code blocks, no extra text):
-{
-  "html": "complete HTML string",
-  "css": "complete CSS string",
-  "metadata": {
-    "title": "Screen Name",
-    "description": "Brief description",
-    "screenType": "type",
-    "primaryColor": "#hex",
-    "categories": ["category1", "category2"]
-  }
-}
-
-2. **MOBILE-FIRST**: Every screen MUST be optimized for mobile devices (375px-428px width)
-
-3. **PRODUCTION QUALITY**: Code must be deployment-ready, not a prototype
-
-# TECH STACK REQUIREMENTS
-
-## Required CDNs (ALWAYS include in HTML):
-\`\`\`html
-<!-- Tailwind CSS Browser -->
-<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-
-<!-- Iconify Icons -->
-<script src="https://code.iconify.design/iconify-icon/3.0.0/iconify-icon.min.js"></script>
-\`\`\`
-
-## Fonts (Choose based on style):
-- Modern/Tech: 'Inter', 'Geist', 'DM Sans'
-- Friendly/Casual: 'Nunito', 'Poppins', 'Quicksand'
-- Professional: 'Roboto', 'Open Sans', 'Work Sans'
-- Editorial/Premium: 'Playfair Display', 'Crimson Pro', 'Merriweather'
-- Monospace/Tech: 'JetBrains Mono', 'Fira Code', 'IBM Plex Mono'
-
-Load via Google Fonts:
-\`\`\`html
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=FontName:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
-\`\`\`
-
-## Icons (Use Iconify):
-- Find icons at: https://icon-sets.iconify.design/
-- Common sets: solar, lucide, mdi, ri, ph, heroicons
-- Usage: \`<iconify-icon icon="solar:home-bold" class="size-6"></iconify-icon>\`
-
-## Images (Use Unsplash):
-- Format: \`https://source.unsplash.com/{width}x{height}/?{query}\`
-- Examples: 
-  - Food: \`https://source.unsplash.com/400x300/?food,healthy\`
-  - Profile: \`https://source.unsplash.com/200x200/?person,portrait\`
-  - Product: \`https://source.unsplash.com/300x300/?product,{category}\`
-
-# HTML STRUCTURE REQUIREMENTS
-
-## Document Template:
-\`\`\`html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>[Screen Title]</title>
-  
-  <!-- Google Fonts -->
-  [Font Links]
-  
-  <!-- Tailwind CSS -->
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-  
-  <!-- Iconify Icons -->
-  <script src="https://code.iconify.design/iconify-icon/3.0.0/iconify-icon.min.js"></script>
-  
-  <!-- Custom Tailwind Theme -->
-  <style type="text/tailwindcss">
-    @theme inline {
-      [Custom theme variables]
-    }
-    
-    :root {
-      [CSS variables for colors, fonts, spacing]
-    }
-  </style>
-</head>
-<body>
-  <div class="flex flex-col h-screen bg-background">
-    [Screen Content]
-  </div>
-</body>
-</html>
-\`\`\`
-
-## Mobile Screen Layout Pattern:
-\`\`\`html
-<div class="flex flex-col h-screen bg-background">
-  <!-- Header/Top Bar (optional) -->
-  <div class="flex-none px-4 py-3 border-b border-border">
-    [Navigation, title, actions]
-  </div>
-  
-  <!-- Main Scrollable Content -->
-  <div class="flex-1 overflow-y-auto">
-    <div class="p-4 space-y-6">
-      [Content sections]
-    </div>
-  </div>
-  
-  <!-- Bottom Bar/CTA (optional) -->
-  <div class="flex-none p-4 border-t border-border">
-    [Primary action or bottom navigation]
-  </div>
-</div>
-\`\`\`
-
-# TAILWIND THEME SYSTEM
-
-## Create a Complete Theme with CSS Variables:
-\`\`\`css
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-secondary: var(--secondary);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
-  --color-card: var(--card);
-  --color-border: var(--border);
-  --color-input: var(--input);
-  --color-ring: var(--ring);
-  
-  --font-font-sans: var(--font-sans);
-  --font-font-heading: var(--font-heading);
-  --font-font-mono: var(--font-mono);
-  
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
-}
-
-:root {
-  /* Colors - Use OKLCH for better color consistency */
-  --background: oklch(0.15 0.01 240);
-  --foreground: oklch(0.95 0.01 240);
-  --primary: #3B82F6;
-  --primary-foreground: oklch(0.98 0 0);
-  --secondary: oklch(0.25 0.015 240);
-  --muted: oklch(0.22 0.015 240);
-  --muted-foreground: oklch(0.65 0.01 240);
-  --accent: oklch(0.28 0.02 240);
-  --card: oklch(0.18 0.01 240);
-  --border: oklch(0.30 0.015 240);
-  --input: oklch(0.25 0.015 240);
-  --ring: #3B82F6;
-  
-  /* Fonts */
-  --font-sans: "Inter", sans-serif;
-  --font-heading: "Inter", sans-serif;
-  --font-mono: "JetBrains Mono", monospace;
-  
-  /* Border Radius */
-  --radius: 1rem;
-}
-\`\`\`
-
-## Color Scheme Guidelines:
-
-### Dark Themes (Most mobile apps):
-- Background: oklch(0.15-0.20)
-- Foreground: oklch(0.90-0.98)
-- Cards: slightly lighter than background
-- Borders: subtle, 30-40% lightness
-
-### Light Themes:
-- Background: oklch(0.95-1.0)
-- Foreground: oklch(0.10-0.20)
-- Cards: pure white or slight tint
-- Borders: subtle, 85-90% lightness
-
-### Accent Colors (Choose based on app type):
-- Finance/Trust: Blue (#3B82F6)
-- Success/Health: Green (#10B981)
-- Warning/Energy: Amber (#F59E0B)
-- Error/Action: Red (#EF4444)
-- Creative/Fun: Purple (#8B5CF6)
-- Social: Pink (#EC4899)
-
-# MOBILE UI PATTERNS & COMPONENTS
-
-## 1. Top Navigation Bar
-\`\`\`html
-<!-- With back button and title -->
-<div class="flex items-center justify-between px-4 py-3 border-b border-border">
-  <button class="flex items-center justify-center size-10 -ml-2">
-    <iconify-icon icon="solar:arrow-left-linear" class="size-6 text-foreground"></iconify-icon>
-  </button>
-  <h1 class="text-lg font-semibold text-foreground">Screen Title</h1>
-  <button class="flex items-center justify-center size-10">
-    <iconify-icon icon="solar:menu-dots-bold" class="size-6 text-foreground"></iconify-icon>
-  </button>
-</div>
-
-<!-- Simple header with title -->
-<div class="px-4 py-6">
-  <h1 class="text-3xl font-bold text-foreground">Welcome Back</h1>
-  <p class="text-muted-foreground mt-1">Here's what's happening today</p>
-</div>
-\`\`\`
-
-## 2. Bottom Navigation
-\`\`\`html
-<div class="flex items-center justify-around px-4 py-3 border-t border-border bg-background">
-  <button class="flex flex-col items-center gap-1 min-w-[60px]">
-    <iconify-icon icon="solar:home-bold" class="size-6 text-primary"></iconify-icon>
-    <span class="text-xs font-medium text-primary">Home</span>
-  </button>
-  <button class="flex flex-col items-center gap-1 min-w-[60px]">
-    <iconify-icon icon="solar:chart-bold" class="size-6 text-muted-foreground"></iconify-icon>
-    <span class="text-xs font-medium text-muted-foreground">Stats</span>
-  </button>
-  <button class="flex flex-col items-center gap-1 min-w-[60px]">
-    <iconify-icon icon="solar:user-bold" class="size-6 text-muted-foreground"></iconify-icon>
-    <span class="text-xs font-medium text-muted-foreground">Profile</span>
-  </button>
-</div>
-\`\`\`
-
-## 3. Cards
-\`\`\`html
-<!-- Standard Card -->
-<div class="bg-card rounded-2xl p-4 border border-border">
-  <div class="flex items-center justify-between mb-3">
-    <h3 class="font-semibold text-foreground">Card Title</h3>
-    <iconify-icon icon="solar:alt-arrow-right-linear" class="size-5 text-muted-foreground"></iconify-icon>
-  </div>
-  <p class="text-sm text-muted-foreground">Card content goes here</p>
-</div>
-
-<!-- Metric Card -->
-<div class="bg-card rounded-2xl p-5">
-  <div class="flex items-center gap-3 mb-2">
-    <div class="size-10 rounded-full bg-primary/10 flex items-center justify-center">
-      <iconify-icon icon="solar:chart-bold" class="size-5 text-primary"></iconify-icon>
-    </div>
-    <span class="text-sm text-muted-foreground">Total Sales</span>
-  </div>
-  <div class="text-3xl font-bold text-foreground">$12,450</div>
-  <div class="text-sm text-green-500 mt-1">+12.5% from last month</div>
-</div>
-\`\`\`
-
-## 4. Lists & Items
-\`\`\`html
-<!-- List Item with Avatar -->
-<div class="flex items-center gap-3 p-3 rounded-xl bg-card">
-  <img src="https://source.unsplash.com/100x100/?person" 
-       class="size-12 rounded-full object-cover" />
-  <div class="flex-1 min-w-0">
-    <div class="font-semibold text-foreground truncate">John Doe</div>
-    <div class="text-sm text-muted-foreground truncate">john@example.com</div>
-  </div>
-  <iconify-icon icon="solar:alt-arrow-right-linear" class="size-5 text-muted-foreground flex-none"></iconify-icon>
-</div>
-
-<!-- List Item with Icon -->
-<div class="flex items-center gap-4 p-4 rounded-xl bg-card">
-  <div class="size-12 rounded-full bg-primary/10 flex items-center justify-center flex-none">
-    <iconify-icon icon="solar:shopping-bag-bold" class="size-6 text-primary"></iconify-icon>
-  </div>
-  <div class="flex-1 min-w-0">
-    <div class="font-semibold text-foreground">Shopping</div>
-    <div class="text-sm text-muted-foreground">Grocery store</div>
-  </div>
-  <div class="text-right flex-none">
-    <div class="font-semibold text-foreground">-$45.00</div>
-    <div class="text-xs text-muted-foreground">Today</div>
-  </div>
-</div>
-\`\`\`
-
-## 5. Buttons
-\`\`\`html
-<!-- Primary Button -->
-<button class="w-full py-4 px-6 bg-primary text-primary-foreground rounded-xl font-semibold text-base">
-  Primary Action
-</button>
-
-<!-- Secondary Button -->
-<button class="w-full py-4 px-6 bg-secondary text-secondary-foreground rounded-xl font-semibold text-base">
-  Secondary Action
-</button>
-
-<!-- Outline Button -->
-<button class="w-full py-4 px-6 bg-transparent text-foreground rounded-xl font-semibold text-base border-2 border-border">
-  Outline Action
-</button>
-
-<!-- Icon Button -->
-<button class="size-12 rounded-full bg-card flex items-center justify-center border border-border">
-  <iconify-icon icon="solar:add-circle-bold" class="size-6 text-foreground"></iconify-icon>
-</button>
-\`\`\`
-
-## 6. Input Fields
-\`\`\`html
-<!-- Text Input -->
-<div>
-  <label class="block text-sm font-medium text-foreground mb-2">Label</label>
-  <input type="text" 
-         class="w-full px-4 py-3 bg-input border border-border rounded-xl text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-         placeholder="Enter text..." />
-</div>
-
-<!-- Search Input -->
-<div class="relative">
-  <iconify-icon icon="solar:magnifer-linear" class="absolute left-4 top-1/2 -translate-y-1/2 size-5 text-muted-foreground"></iconify-icon>
-  <input type="search"
-         class="w-full pl-12 pr-4 py-3 bg-input border border-border rounded-xl text-foreground placeholder:text-muted-foreground"
-         placeholder="Search..." />
-</div>
-\`\`\`
-
-## 7. Tabs
-\`\`\`html
-<div class="flex gap-2 p-1 bg-muted rounded-xl">
-  <button class="flex-1 py-2.5 px-4 bg-primary text-primary-foreground rounded-lg font-semibold text-sm">
-    Tab 1
-  </button>
-  <button class="flex-1 py-2.5 px-4 bg-transparent text-muted-foreground rounded-lg font-semibold text-sm">
-    Tab 2
-  </button>
-  <button class="flex-1 py-2.5 px-4 bg-transparent text-muted-foreground rounded-lg font-semibold text-sm">
-    Tab 3
-  </button>
-</div>
-\`\`\`
-
-## 8. Category/Tag Buttons
-\`\`\`html
-<div class="grid grid-cols-4 gap-3">
-  <button class="flex flex-col items-center gap-2 p-3 rounded-xl bg-card border-2 border-primary">
-    <div class="size-12 rounded-full bg-primary/10 flex items-center justify-center">
-      <iconify-icon icon="solar:food-bold" class="size-6 text-primary"></iconify-icon>
-    </div>
-    <span class="text-xs font-medium text-foreground">Food</span>
-  </button>
-  <!-- More categories... -->
-</div>
-\`\`\`
-
-## 9. Progress Indicators
-\`\`\`html
-<!-- Progress Bar -->
-<div class="space-y-2">
-  <div class="flex justify-between text-sm">
-    <span class="text-muted-foreground">Progress</span>
-    <span class="text-foreground font-semibold">65%</span>
-  </div>
-  <div class="h-2 bg-muted rounded-full overflow-hidden">
-    <div class="h-full bg-primary rounded-full" style="width: 65%"></div>
-  </div>
-</div>
-
-<!-- Circular Progress (using conic-gradient) -->
-<div class="relative size-32">
-  <svg class="size-32 transform -rotate-90">
-    <circle cx="64" cy="64" r="56" stroke="currentColor" stroke-width="8" fill="none" class="text-muted" />
-    <circle cx="64" cy="64" r="56" stroke="currentColor" stroke-width="8" fill="none" 
-            class="text-primary" stroke-dasharray="352" stroke-dashoffset="105" />
-  </svg>
-  <div class="absolute inset-0 flex items-center justify-center">
-    <span class="text-2xl font-bold text-foreground">70%</span>
-  </div>
-</div>
-\`\`\`
-
-## 10. Image Containers
-\`\`\`html
-<!-- Avatar -->
-<img src="https://source.unsplash.com/200x200/?person" 
-     class="size-16 rounded-full object-cover border-2 border-border" />
-
-<!-- Product Image -->
-<div class="aspect-square rounded-2xl overflow-hidden bg-muted">
-  <img src="https://source.unsplash.com/400x400/?product" 
-       class="w-full h-full object-cover" />
-</div>
-
-<!-- Cover Image -->
-<div class="aspect-video rounded-2xl overflow-hidden bg-muted">
-  <img src="https://source.unsplash.com/800x450/?nature" 
-       class="w-full h-full object-cover" />
-</div>
-\`\`\`
-
-# CONTENT GENERATION RULES
-
-## 1. ALWAYS Use Realistic Content
-❌ DON'T: "Lorem ipsum", "Product Name", "User 1"
-✅ DO: Real names, actual amounts, specific descriptions
-
-## 2. Context-Appropriate Data
-- **Finance App**: Real currency amounts ($1,234.56), transaction descriptions ("Whole Foods Market", "Shell Gas Station")
-- **Health App**: Real metrics (2,450 steps, 85 bpm, 450 calories)
-- **Social App**: Real names (Emma Johnson, Michael Chen), realistic posts
-- **E-commerce**: Real product names (Nike Air Max, iPhone 15 Pro), actual prices
-
-## 3. Use Appropriate Icons
-- Find icons at: https://icon-sets.iconify.design/
-- Match icon style to app theme (bold for modern, outline for minimal)
-- Popular sets:
-  - **solar**: Modern, bold style
-  - **lucide**: Clean, minimal
-  - **heroicons**: Professional
-  - **mdi**: Comprehensive library
-
-## 4. Smart Image Queries
-- Be specific: "healthy food bowl" not just "food"
-- Match app context: "fitness workout" for health apps
-- Use multiple keywords: "product,modern,minimal" for e-commerce
-
-# SCREEN TYPE PATTERNS
-
-## Finance/Money Management Apps
-**Features**:
-- Large amount displays ($1,234.56)
-- Transaction lists with icons
-- Category chips with colors
-- Charts/graphs (can use placeholder divs with gradients)
-- Date selectors
-- Payment method toggles
-
-**Color Scheme**: Blue/Green accents on dark background
-**Fonts**: Inter, DM Sans (professional)
-
-## Health & Fitness Apps
-**Features**:
-- Circular progress indicators
-- Metric cards (steps, calories, heart rate)
-- Activity lists with times
-- Goal trackers
-- Charts showing trends
-
-**Color Scheme**: Green/Blue accents, energetic
-**Fonts**: Poppins, Nunito (friendly)
-
-## E-commerce Apps
-**Features**:
-- Product grids/lists with images
-- Price displays
-- Add to cart buttons
-- Size/color selectors
-- Product detail cards
-- Review stars
-
-**Color Scheme**: Clean, image-focused
-**Fonts**: Inter, DM Sans (clean)
-
-## Social/Communication Apps
-**Features**:
-- User avatars
-- Post cards with images
-- Like/comment/share actions
-- Story circles (horizontal scroll)
-- Message bubbles
-- Status indicators
-
-**Color Scheme**: Vibrant, colorful
-**Fonts**: Poppins, Quicksand (friendly)
-
-## Productivity/Task Apps
-**Features**:
-- Checkboxes
-- Priority indicators
-- Date/time displays
-- Category tags
-- Progress trackers
-- List items with drag handles
-
-**Color Scheme**: Minimal, focus on content
-**Fonts**: Inter, Roboto (clean)
-
-# MOBILE-SPECIFIC CONSIDERATIONS
-
-## Touch Targets
-- Minimum button size: 44x44px (size-11 in Tailwind)
-- Adequate spacing between interactive elements (gap-3 or gap-4)
-- Use padding for larger touch areas
-
-## Typography Scale
-- Titles: text-2xl to text-4xl (24px-36px)
-- Headings: text-lg to text-xl (18px-20px)
-- Body: text-base (16px)
-- Captions: text-sm (14px)
-- Labels: text-xs (12px)
-
-## Spacing
-- Content padding: p-4 or p-6
-- Section gaps: space-y-4 or space-y-6
-- Card padding: p-4 to p-6
-- List item padding: p-3 to p-4
-
-## Safe Areas
-- Account for notches: Add extra padding-top if needed
-- Bottom safe area: Add padding-bottom for home indicators
-
-# QUALITY CHECKLIST
-
-Before returning your response, verify:
-- ✅ Valid JSON format (no markdown, no code blocks)
-- ✅ Complete HTML document with all CDN links
-- ✅ Custom Tailwind theme with CSS variables
-- ✅ Google Fonts properly loaded
-- ✅ All icons use valid Iconify icon names
-- ✅ Images use specific Unsplash queries
-- ✅ Realistic content (no placeholders)
-- ✅ Mobile-optimized layout (flex-col, h-screen)
-- ✅ Proper color contrast (WCAG AA)
-- ✅ Touch-friendly sizes (size-11+ for buttons)
-- ✅ Consistent spacing throughout
-- ✅ Border radius using theme variables
-
-# EXAMPLES OF EXCELLENT OUTPUT
-
-## Example 1: Finance Transaction Screen
-\`\`\`json
-{
-  "html": "<!DOCTYPE html>\\n<html>...</html>",
-  "css": "/* Additional custom CSS if needed */",
-  "metadata": {
-    "title": "Add Transaction",
-    "description": "Mobile screen for adding expense/income transactions",
-    "screenType": "form",
-    "primaryColor": "#3B82F6",
-    "categories": ["finance", "expense-tracking", "form"]
-  }
-}
-\`\`\`
-
-## Example 2: Fitness Dashboard
-\`\`\`json
-{
-  "html": "<!DOCTYPE html>\\n<html>...</html>",
-  "css": "/* Additional custom CSS if needed */",
-  "metadata": {
-    "title": "Fitness Dashboard",
-    "description": "Daily activity tracking with calories, steps, and workout stats",
-    "screenType": "dashboard",
-    "primaryColor": "#10B981",
-    "categories": ["health", "fitness", "dashboard"]
-  }
-}
-\`\`\`
-
-# YOUR TASK
-
-When given a prompt, you will:
-1. **Analyze** the request to understand the app type, target audience, and required features
-2. **Design** an appropriate layout using the patterns above
-3. **Select** the right theme colors, fonts, and styling for the context
-4. **Generate** realistic content that matches the app's purpose
-5. **Code** a complete, production-ready HTML/CSS mobile screen
-6. **Return** a valid JSON object with html, css, and metadata
-
-Remember: Your output should be so good that a developer can directly use it in their app without modifications. Think like a senior mobile designer who cares about every pixel, interaction, and detail.`;
-
-async function generateMobileScreen(prompt, options = {}) {
-	const userPrompt = `Generate a mobile app screen for the following requirement:
-
-USER REQUEST: ${prompt}
-
-PREFERENCES:
-- Theme: ${options.theme || "auto (choose the most appropriate)"}
-- Style: ${options.style || "modern"}
-- Color Preference: ${options.colorPreference || "auto"}
-
-Generate a complete, production-ready mobile screen make sure you create the entire mobile app screen do not leave any empty section or place. Return ONLY the JSON object with html, css, and metadata fields.`;
-
-	const response = await openai.chat.completions.create({
-		model: "openai/gpt-4o",
-		messages: [
-			{ role: "system", content: MOBILE_SCREEN_GENERATOR_PROMPT },
-			{ role: "user", content: userPrompt },
-		],
-		max_completion_tokens: 8000,
-		response_format: { type: "json_object" },
+/**
+ * POST /codegen-design/update — edit code previously produced by /codegen-design (or any matching React/HTML file).
+ * Body: { existingCode, query, prompt?, variant?, theme?, format?, outputType? }
+ * Streams text/plain full updated file.
+ */
+app.post("/codegen-design/update", async (c) => {
+	let body = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.text("Invalid JSON body", 400);
+	}
+
+	const formatRaw =
+		c.req.query("format") ||
+		(typeof body.format === "string" ? body.format : "") ||
+		"react";
+	const format = String(formatRaw).toLowerCase().trim();
+	if (format !== "react" && format !== "html") {
+		return c.text('format must be "react" or "html"', 400);
+	}
+
+	const outputTypeRaw =
+		c.req.query("outputType") ||
+		(typeof body.outputType === "string" ? body.outputType : "") ||
+		"page";
+	const outputType = String(outputTypeRaw).toLowerCase().trim();
+	const VALID = new Set(["landing", "app", "page", "mobile"]);
+	if (!VALID.has(outputType)) {
+		return c.text("Invalid outputType. Allowed: landing, app, page, mobile.", 400);
+	}
+
+	const query =
+		typeof body.query === "string"
+			? body.query.trim()
+			: typeof body.userQuery === "string"
+				? body.userQuery.trim()
+				: "";
+	if (query.length < 10) {
+		return c.text(
+			"query (or userQuery) must be at least 10 characters",
+			400,
+		);
+	}
+
+	const existingCode =
+		typeof body.existingCode === "string"
+			? body.existingCode
+			: typeof body.code === "string"
+				? body.code
+				: "";
+	if (existingCode.trim().length < EXISTING_CODE_MIN_CHARS) {
+		return c.text(
+			`existingCode (or code) must be at least ${EXISTING_CODE_MIN_CHARS} characters`,
+			400,
+		);
+	}
+
+	const extraPrompt =
+		typeof body.prompt === "string" ? body.prompt.trim() : "";
+	const variantRaw =
+		c.req.query("variant") ||
+		(typeof body.variant === "string" ? body.variant : "") ||
+		"";
+	const themeRaw =
+		c.req.query("theme") ||
+		(typeof body.theme === "string" ? body.theme : "") ||
+		"";
+
+	const resolved = await resolveDesignMarkdown({
+		variant: variantRaw.trim(),
+		theme: themeRaw,
 	});
+	if (!resolved.ok) {
+		return c.text(resolved.error, 400);
+	}
 
-	const content = JSON.parse(response.choices[0].message.content);
-	const tokens = response.usage.total_tokens || 0;
+	const { designMarkdown, promptKey } = resolved;
+	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+	if (!openRouterApiKey) {
+		return c.text("OpenRouter API key not configured", 503);
+	}
 
-	return {
-		content,
-		tokens: {
-			total: tokens,
-			model: "openai/gpt-4o",
-		},
-		metadata: content?.metadata,
-	};
-}
+	const model =
+		c.req.query("model") ||
+		process.env.CODEGEN_MODEL ||
+		"google/gemini-2.0-flash-001";
 
-app.post("/generate-mobile-screen", async (c) => {
-	const { prompt } = await c.req.json();
+	const systemPrompt = buildDesignUpdateSystemPrompt(format, outputType);
+	const codeClipped = clipCodeForPrompt(existingCode, "existing code truncated");
 
-	// ALWAYS STREAM
-	return streamSSE(c, async (stream) => {
-		try {
-			// 1️⃣ MONOLITHIC GENERATION
-			// This single call handles Intent, Architecture, and Rendering
-			const { content, tokens, metadata } = await generateMobileScreen({
-				prompt,
-			});
-			// 2. Send Meta (Now we know the actual intent and pages)
-			await stream.writeSSE({
-				event: "meta",
-				data: JSON.stringify({
-					type: metadata?.screenType,
-					pages: [
-						{
-							html: content.html,
-							metadata: content.metadata,
-						},
-					],
-				}),
-			});
+	let userMessage = `# DESIGN SYSTEM (authoritative — follow this markdown exactly)\n\n${designMarkdown}\n\n---\n\n# Current code (edit this)\n\n${codeClipped}\n\n---\n\n# Change request\n\n${query}`;
+	if (extraPrompt) {
+		userMessage += `\n\n## Additional instructions\n\n${extraPrompt}`;
+	}
 
-			// 4. Send Done with final usage
-			await stream.writeSSE({
-				event: "done",
-				data: JSON.stringify({
-					status: "complete",
-					usage: {
-						total: tokens,
-					},
-				}),
-			});
-		} catch (err) {
-			console.error(`Error in monolithic generation:`, err);
-			await stream.writeSSE({
-				event: "error",
-				data: JSON.stringify({
-					error: "Generation failed",
-				}),
-			});
-		}
+	const messages = [
+		{ role: "system", content: systemPrompt },
+		{ role: "user", content: userMessage },
+	];
+
+	const streamResult = await fetchOpenRouterPlainTextStream({
+		openRouterApiKey,
+		model,
+		messages,
+		title: "Simba design-aware codegen update",
+		temperature: 0.25,
+	});
+	if (!streamResult.ok) {
+		return c.text(streamResult.text, streamResult.status);
+	}
+
+	return buildCodegenSuccessResponse({
+		outputStream: streamResult.stream,
+		format,
+		outputType,
+		promptKey,
+		extraHeaders: { "X-Codegen-Mode": "update" },
 	});
 });
-
-const port = process.env.PORT || 3002;
-console.log(`Simba UI/UX agent running on port ${port}`);
 
 serve({
 	fetch: app.fetch,

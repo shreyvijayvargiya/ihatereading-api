@@ -89,7 +89,10 @@ export const prompts = {
     name: "crypto",
     prompt: await readFile(path.join(__dirname, "crypto.mdx"), "utf-8"),
   },
-  material: await readFile(path.join(__dirname, "material-prompt.mdx"), "utf-8"),
+  material: {
+    name: "material",
+    prompt: await readFile(path.join(__dirname, "material-prompt.mdx"), "utf-8"),
+  },
   academia: {
     name: "academia",
     prompt: await readFile(path.join(__dirname, "academia-prompt.mdx"), "utf-8"),
@@ -98,4 +101,8 @@ export const prompts = {
     name: "neo-brutalism",
     prompt: await readFile(path.join(__dirname, "neo-brutalism.mdx"), "utf-8"),
   },
+  ramp: {
+    name: "ramp",
+    prompt: await readFile(path.join(__dirname, "ramp-prompt.mdx"), "utf-8"),
+  }
 };

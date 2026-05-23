@@ -1,0 +1,235 @@
+---
+version: alpha
+name: Ramp
+description: >-
+  Ramp is a unified spend management platform combining corporate cards, expenses, bill payments, and AI-powered
+  automation to streamline back-office finance operations.
+logo:
+  src: https://ramp.com/favicon.ico?favicon.0-xml9at58h_3.ico
+colors:
+  surface: '#ffffff'
+  surface-dim: '#f4f1ef'
+  surface-bright: '#ffffff'
+  surface-container-lowest: '#fafaf9'
+  surface-container-low: '#f4f2f0'
+  surface-container: '#ede8e5'
+  surface-container-high: '#e7e4e1'
+  surface-container-highest: '#d2cdca'
+  on-surface: '#0c0a08'
+  on-surface-variant: '#6e6a68'
+  inverse-surface: '#1a1918'
+  inverse-on-surface: '#f4f1ef'
+  outline: '#777776'
+  outline-variant: '#d8d7d7'
+  surface-tint: '#e7f056'
+  primary: '#e7f056'
+  on-primary: '#0c0a08'
+  primary-container: '#d4e844'
+  on-primary-container: '#1a1918'
+  inverse-primary: '#c4d940'
+  secondary: '#6e6a68'
+  on-secondary: '#ffffff'
+  secondary-container: '#d2cdca'
+  on-secondary-container: '#1a1918'
+  tertiary: '#1a1918'
+  on-tertiary: '#ffffff'
+  tertiary-container: '#6e6a68'
+  on-tertiary-container: '#ffffff'
+  error: '#d32f2f'
+  on-error: '#ffffff'
+  error-container: '#ffcdd2'
+  on-error-container: '#b71c1c'
+  primary-fixed: '#e7f056'
+  primary-fixed-dim: '#d4e844'
+  on-primary-fixed: '#0c0a08'
+  on-primary-fixed-variant: '#1a1918'
+  secondary-fixed: '#d2cdca'
+  secondary-fixed-dim: '#b8b3b0'
+  on-secondary-fixed: '#0c0a08'
+  on-secondary-fixed-variant: '#6e6a68'
+  tertiary-fixed: '#6e6a68'
+  tertiary-fixed-dim: '#5a5754'
+  on-tertiary-fixed: '#ffffff'
+  on-tertiary-fixed-variant: '#d2cdca'
+  background: '#ffffff'
+  on-background: '#0c0a08'
+  surface-variant: '#ede8e5'
+typography:
+  display:
+    fontFamily: TWK Lausanne
+    fontSize: 60px
+    fontWeight: '400'
+    lineHeight: 68px
+    letterSpacing: '-0.02em'
+  headline-lg:
+    fontFamily: TWK Lausanne
+    fontSize: 48px
+    fontWeight: '400'
+    lineHeight: 56px
+    letterSpacing: '-0.015em'
+  headline-md:
+    fontFamily: TWK Lausanne
+    fontSize: 32px
+    fontWeight: '400'
+    lineHeight: 40px
+    letterSpacing: '-0.01em'
+  title-lg:
+    fontFamily: TWK Lausanne
+    fontSize: 24px
+    fontWeight: '400'
+    lineHeight: 32px
+  body-lg:
+    fontFamily: TWK Lausanne
+    fontSize: 18px
+    fontWeight: '400'
+    lineHeight: 28px
+    letterSpacing: 0em
+  body-md:
+    fontFamily: TWK Lausanne
+    fontSize: 16px
+    fontWeight: '400'
+    lineHeight: 24px
+  label-md:
+    fontFamily: TWK Lausanne
+    fontSize: 14px
+    fontWeight: '400'
+    lineHeight: 20px
+    letterSpacing: 0.01em
+  label-sm:
+    fontFamily: TWK Lausanne
+    fontSize: 12px
+    fontWeight: '400'
+    lineHeight: 16px
+    letterSpacing: 0.02em
+rounded:
+  sm: 0.25rem
+  DEFAULT: 0.5rem
+  md: 0.75rem
+  lg: 1rem
+  xl: 1.5rem
+  full: 9999px
+spacing:
+  unit: 8px
+  xs: 4px
+  sm: 12px
+  md: 24px
+  lg: 40px
+  xl: 64px
+  gutter: 24px
+  container-max: 1440px
+elevation:
+  sm: 0 1px 2px rgba(0, 0, 0, 0.06)
+  md: 0 4px 12px rgba(0, 0, 0, 0.08)
+  lg: 0 16px 40px rgba(0, 0, 0, 0.12)
+layout:
+  containerMaxWidth: 1440px
+  gridColumns: 12
+components:
+  button-primary:
+    backgroundColor: '{colors.primary}'
+    textColor: '{colors.on-primary}'
+    typography: '{typography.label-md}'
+    rounded: '{rounded.md}'
+    padding: 12px 20px
+    height: 44px
+    fontWeight: '400'
+    transition: background-color 200ms ease-out
+  button-primary-hover:
+    backgroundColor: '{colors.primary-container}'
+    textColor: '{colors.on-primary-container}'
+  button-primary-active:
+    backgroundColor: '{colors.primary-fixed-dim}'
+    textColor: '{colors.on-primary}'
+  button-secondary:
+    backgroundColor: transparent
+    textColor: '{colors.on-surface}'
+    typography: '{typography.label-md}'
+    rounded: '{rounded.md}'
+    padding: 12px 20px
+    height: 44px
+    border: 1px solid {colors.outline-variant}
+    transition: background-color 200ms ease-out, border-color 200ms ease-out
+  button-secondary-hover:
+    backgroundColor: '{colors.surface-container-high}'
+    borderColor: '{colors.outline}'
+  card:
+    backgroundColor: '{colors.surface}'
+    rounded: '{rounded.lg}'
+    padding: '{spacing.md}'
+    border: 1px solid {colors.outline-variant}
+    boxShadow: '{elevation.sm}'
+  card-hover:
+    backgroundColor: '{colors.surface-container-low}'
+    boxShadow: '{elevation.md}'
+  input-field:
+    backgroundColor: '{colors.surface-container-low}'
+    textColor: '{colors.on-surface}'
+    typography: '{typography.body-md}'
+    rounded: '{rounded.md}'
+    padding: 12px 16px
+    border: 1px solid {colors.outline-variant}
+    height: 44px
+  input-field-focus:
+    borderColor: '{colors.primary}'
+    boxShadow: 0 0 0 3px rgba(231, 240, 86, 0.1)
+  badge-success:
+    backgroundColor: '#f0f9f8'
+    textColor: '#1b5e5e'
+    typography: '{typography.label-sm}'
+    rounded: '{rounded.full}'
+    padding: 4px 12px
+    border: '1px solid #c8e6e5'
+  badge-info:
+    backgroundColor: '#f0f7ff'
+    textColor: '#0052cc'
+    typography: '{typography.label-sm}'
+    rounded: '{rounded.full}'
+    padding: 4px 12px
+    border: '1px solid #d0e2ff'
+  badge-warning:
+    backgroundColor: '#fffbf0'
+    textColor: '#7f4e00'
+    typography: '{typography.label-sm}'
+    rounded: '{rounded.full}'
+    padding: 4px 12px
+    border: '1px solid #ffe8b6'
+  list-item:
+    backgroundColor: transparent
+    rounded: '{rounded.md}'
+    padding: '{spacing.sm}'
+    transition: background-color 150ms ease-out
+  list-item-hover:
+    backgroundColor: '{colors.surface-container-high}'
+    textColor: '{colors.on-surface}'
+---
+
+## Overview
+
+Ramp is a unified spend management platform designed for modern finance teams who demand both operational efficiency and strategic control. The brand serves mid-market to enterprise companies seeking to consolidate corporate cards, expenses, bill payments, and banking into a single intelligent system. The aesthetic is "Minimalist Clarity"—a design philosophy that prioritizes information hierarchy, precision typography, and purposeful use of accent color to guide user attention. The interface evokes confidence and control through clean layouts, generous whitespace (surface backgrounds at #ffffff with container layers stepping down to #ede8e5), and a signature neon-lime primary accent (#e7f056) that commands attention on CTAs without overwhelming the interface. The emotional response is one of calm efficiency: users feel they've regained control over chaotic spend workflows.
+
+Ramp's voice is direct, pragmatic, and slightly irreverent—it speaks to finance leaders as peers, not subordinates. The vocabulary favors concrete outcomes ("automate 80% of bill approvals", "recover $2.3M in duplicate payments") over abstract benefits. Tone is confident but never breathless; sentences are short and active. Example: "Your finance team focuses on strategy. AI agents handle the rest."
+
+## Colors
+
+The color system is anchored in a neutral, light foundation with a single high-contrast accent. The primary color—#e7f056, a vivid yellow-green—is reserved exclusively for interactive elements: primary CTAs ("Get started for free", "See a demo"), focus states, and brand moments. This accent appears sparingly but decisively, ensuring every instance carries weight. The surface stack progresses from pure white (#ffffff) through carefully calibrated grays: surface-container-low (#f4f2f0) for subtle backgrounds, surface-container (#ede8e5) for card containers, and outline-variant (#d8d7d7) for borders. The on-surface text color is a near-black (#0c0a08), providing 15:1 contrast for accessibility and legibility at all sizes. Secondary colors—grays like #6e6a68 and #777776—serve as supporting tex
+
+## Typography
+
+The type system uses TWK Lausanne exclusively—a geometric sans-serif that conveys precision and modernity without sacrificing warmth. The hierarchy spans from display (60px, 400 weight, -0.02em tracking) for hero statements down to label-sm (12px, 400 weight, 0.02em tracking) for metadata. All weights are 400 (regular) or 700 (bold in rare cases), maintaining visual simplicity; the font's proportions carry hierarchy, not weight variation. Body text (16px, 24px line-height) is set at a generous 1.5 line-height ratio to support scanning and reduce cognitive load. Headlines (48px for headline-lg, 32px for headline-md) use tighter line-heights (56px and 40px respectively) to create visual impact. Negative letter-spacing (-0.015em to -0.02em) on larger sizes tightens the visual color, while bod
+
+## Layout
+
+The layout system uses a 12-column grid with a max-width of 1440px, allowing for flexible content arrangements from mobile (single column) to desktop (multi-column sections). The gutter is consistently 24px, creating rhythm and breathing room. White-space is treated as a first-class design element: sections are separated by 40px (lg spacing) vertically, while internal component spacing uses 24px (md) for related elements and 12px (sm) for tightly grouped items. Container padding follows the same scale—24px for standard cards, 12px for compact inputs. The spacing scale (unit: 8px, xs: 4px, sm: 12px, md: 24px, lg: 40px, xl: 64px) is derived from an 8px base, ensuring all measurements align to a consistent grid. Hero sections use xl spacing (64px) for top/bottom margins to create visual separ
+
+## Elevation & Depth
+
+Depth is conveyed through subtle shadows and layering rather than dramatic drop-shadows. The elevation system uses three tiers: sm (0 1px 2px rgba(0, 0, 0, 0.06)) for minor UI elements like badges and small cards, md (0 4px 12px rgba(0, 0, 0, 0.08)) for primary cards and modals, and lg (0 16px 40px rgba(0, 0, 0, 0.12)) for full-screen overlays and hero imagery. Shadows are soft and diffuse, never sharp; the blur radius (2px, 12px, 40px) increases with elevation to create atmospheric perspective. Focus states on interactive elements use a 3px outline in primary color (rgba(231, 240, 86, 0.1)) r
+
+## Shapes
+
+The shape philosophy is "Soft-Technical"—rounded corners are present but restrained, reflecting the brand's balance between approachability and precision. The rounded scale progresses from sm (4px) for small UI elements like close buttons and minor controls, DEFAULT (8px) for standard inputs and small cards, md (12px) for medium containers, lg (16px) for primary cards and modals, xl (24px) for hero sections and large containers, and full (9999px) for pills and badges. Buttons use md (12px) to feel modern without appearing overly soft; inputs use DEFAULT (8px) to maintain a compact, functional
+
+## Components
+
+### Action Elements
+Buttons are the primary interaction mechanism. Primary buttons use the signature #e7f056 background with #0c0a08 text, 12px padding (horizontal) and 44px height, rounded to 12px. The label-md typography (14px, 400 weight) ensures readability at a glance. On hover, the background shifts to primary-container (#d4e844), maintaining the accent family while signaling state change. The transition is 200ms ease-out, fast enough to feel responsive without appearing jarring. Focus states add a 3px outline in rgba(231, 240, 86, 0.1) to support keyboard navigation. Secondary buttons are transparent with a 1px border in outline-variant (#d8d7d7) and on-surface text (#0c0a08). On hover, the background fills with surface-container-high (#e7e4e1) and the border darkens to outline (#77

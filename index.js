@@ -3847,52 +3847,6 @@ async function fetchWebResultsViaDuckDuckGo(query, maxResults = 10) {
 	return { results: [], searchUrl: null, markdown: "" };
 }
 
-/** Official Google Custom Search JSON API (same family as Maps/Places APIs). */
-async function fetchGoogleCustomSearchApi({
-	query,
-	num = 10,
-	language = "en",
-	country = "us",
-}) {
-	const apiKey = process.env.GOOGLE_CSE_API_KEY || process.env.GOOGLE_API_KEY;
-	const cx = process.env.GOOGLE_CSE_ID;
-	if (!apiKey || !cx) {
-		return null;
-	}
-	const capped = Math.min(Math.max(Number(num) || 10, 1), 10);
-	const params = new URLSearchParams({
-		key: apiKey,
-		cx,
-		q: query,
-		num: String(capped),
-		hl: language,
-		gl: country,
-	});
-	const url = `https://www.googleapis.com/customsearch/v1?${params}`;
-	const res = await fetch(url);
-	const data = await res.json().catch(() => ({}));
-	if (!res.ok) {
-		const msg =
-			data?.error?.message ||
-			`Custom Search API ${res.status}: ${JSON.stringify(data).slice(0, 200)}`;
-		throw new Error(msg);
-	}
-	const items = Array.isArray(data.items) ? data.items : [];
-	const results = items.map((it) => ({
-		title: it.title || "",
-		link: it.link || "",
-		description: it.snippet || "",
-	}));
-	const markdown = results
-		.map((r) => `## ${r.title}\n${r.description}\n\n${r.link}`)
-		.join("\n\n---\n\n");
-	return {
-		results,
-		markdown,
-		searchUrl: url.replace(apiKey, "REDACTED"),
-		source: "google-custom-search-api",
-	};
-}
 
 app.post("/google-search", async (c) => {
 	const {
@@ -3903,8 +3857,6 @@ app.post("/google-search", async (c) => {
 		timeout = 30000,
 		/** When true, route Chrome through rotating proxies (Bright Data). Default false — direct connection, same idea as /scrape-google-maps. */
 		useProxy = false,
-		/** When true, skip Custom Search API and use headless browser only. */
-		forceBrowser = false,
 		/** When true, do not use DuckDuckGo HTML if Google shows CAPTCHA / empty SERP. */
 		skipDdgFallback = false,
 	} = await c.req.json();
@@ -3914,20 +3866,6 @@ app.post("/google-search", async (c) => {
 	}
 
 	try {
-		if (!forceBrowser) {
-			const apiResult = await fetchGoogleCustomSearchApi({
-				query,
-				num,
-				language,
-				country,
-			});
-			if (apiResult) {
-				return c.json({
-					query,
-					...apiResult,
-				});
-			}
-		}
 
 		const puppeteer = (await import("puppeteer-core")).default;
 		const ARGS = [
@@ -7529,64 +7467,6 @@ async function uploadScreenshotBuffer(buffer) {
 	return response.data.ufsUrl;
 }
 
-async function uploadVideoBufferToUploadThing(buffer, originalName) {
-	const ext = path.extname(originalName || "").toLowerCase() || ".mp4";
-	const allowed = [".mp4", ".mov", ".webm", ".mkv"];
-	const useExt = allowed.includes(ext) ? ext : ".mp4";
-	const fileName = `video-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}${useExt}`;
-	const mimeByExt = {
-		".mp4": "video/mp4",
-		".mov": "video/quicktime",
-		".webm": "video/webm",
-		".mkv": "video/x-matroska",
-	};
-	const mime = mimeByExt[useExt] || "application/octet-stream";
-	const utFile = new UTFile([buffer], fileName, { type: mime });
-	const [response] = await utapi.uploadFiles([utFile]);
-	if (response.error) {
-		throw new Error(`UploadThing upload failed: ${response.error.message}`);
-	}
-	return response.data.ufsUrl;
-}
-
-async function uploadAudioBufferToUploadThing(buffer, originalName) {
-	const ext = path.extname(originalName || "").toLowerCase() || ".mp3";
-	const allowed = [
-		".mp3",
-		".wav",
-		".m4a",
-		".aac",
-		".ogg",
-		".oga",
-		".webm",
-		".flac",
-		".aiff",
-		".aif",
-		".mp4",
-	];
-	const useExt = allowed.includes(ext) ? ext : ".mp3";
-	const fileName = `audio-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}${useExt}`;
-	const mimeByExt = {
-		".mp3": "audio/mpeg",
-		".wav": "audio/wav",
-		".m4a": "audio/mp4",
-		".aac": "audio/aac",
-		".ogg": "audio/ogg",
-		".oga": "audio/ogg",
-		".webm": "audio/webm",
-		".flac": "audio/flac",
-		".aiff": "audio/aiff",
-		".aif": "audio/aiff",
-		".mp4": "audio/mp4",
-	};
-	const mime = mimeByExt[useExt] || "application/octet-stream";
-	const utFile = new UTFile([buffer], fileName, { type: mime });
-	const [response] = await utapi.uploadFiles([utFile]);
-	if (response.error) {
-		throw new Error(`UploadThing audio upload failed: ${response.error.message}`);
-	}
-	return response.data.ufsUrl;
-}
 
 async function smartCaptureScreenshot(url, options = {}) {
 	const {
@@ -13087,6 +12967,334 @@ async function runSkillAsset(
 
 	return attachOpenRouterMeta({ content: content.trim() });
 }
+
+// ─── POST /generate/translate — Markdown → target language (OpenRouter) ─────
+// Body: { markdown: string, language?: string, targetLanguage?: string, lang?: string }
+// Auth: Bearer token (same as POST /generate/*). Non-streaming JSON response.
+const INKGEST_TRANSLATE_MODEL =
+	process.env.INKGEST_TRANSLATE_MODEL ||
+	process.env.OPENROUTER_TRANSLATE_MODEL ||
+	"meta-llama/llama-3.2-3b-instruct:free";
+
+const INKGEST_TRANSLATE_MAX_INPUT_CHARS = Math.min(
+	100_000,
+	Math.max(
+		500,
+		Number.parseInt(
+			process.env.INKGEST_TRANSLATE_MAX_INPUT_CHARS || "32000",
+			10,
+		) || 32_000,
+	),
+);
+
+/** ISO 639-1 / common names → display name for the LLM prompt */
+const TRANSLATE_LANGUAGE_ALIASES = {
+	en: "English",
+	english: "English",
+	fr: "French",
+	french: "French",
+	es: "Spanish",
+	spanish: "Spanish",
+	de: "German",
+	german: "German",
+	it: "Italian",
+	italian: "Italian",
+	pt: "Portuguese",
+	portuguese: "Portuguese",
+	"pt-br": "Brazilian Portuguese",
+	"pt-pt": "European Portuguese",
+	nl: "Dutch",
+	dutch: "Dutch",
+	ru: "Russian",
+	russian: "Russian",
+	zh: "Chinese (Simplified)",
+	"zh-cn": "Chinese (Simplified)",
+	"zh-tw": "Chinese (Traditional)",
+	chinese: "Chinese (Simplified)",
+	ja: "Japanese",
+	japanese: "Japanese",
+	ko: "Korean",
+	korean: "Korean",
+	ar: "Arabic",
+	arabic: "Arabic",
+	hi: "Hindi",
+	hindi: "Hindi",
+	tr: "Turkish",
+	turkish: "Turkish",
+	pl: "Polish",
+	polish: "Polish",
+	uk: "Ukrainian",
+	ukrainian: "Ukrainian",
+	vi: "Vietnamese",
+	vietnamese: "Vietnamese",
+	th: "Thai",
+	thai: "Thai",
+	id: "Indonesian",
+	indonesian: "Indonesian",
+	ms: "Malay",
+	malay: "Malay",
+	sv: "Swedish",
+	swedish: "Swedish",
+	no: "Norwegian",
+	norwegian: "Norwegian",
+	da: "Danish",
+	danish: "Danish",
+	fi: "Finnish",
+	finnish: "Finnish",
+	cs: "Czech",
+	czech: "Czech",
+	ro: "Romanian",
+	romanian: "Romanian",
+	hu: "Hungarian",
+	hungarian: "Hungarian",
+	el: "Greek",
+	greek: "Greek",
+	he: "Hebrew",
+	hebrew: "Hebrew",
+	fa: "Persian",
+	persian: "Persian",
+	farsi: "Persian",
+	bn: "Bengali",
+	bengali: "Bengali",
+	ta: "Tamil",
+	tamil: "Tamil",
+	te: "Telugu",
+	telugu: "Telugu",
+	mr: "Marathi",
+	marathi: "Marathi",
+	ur: "Urdu",
+	urdu: "Urdu",
+	tl: "Filipino",
+	filipino: "Filipino",
+	tagalog: "Filipino",
+	sw: "Swahili",
+	swahili: "Swahili",
+	sk: "Slovak",
+	slovak: "Slovak",
+	hr: "Croatian",
+	croatian: "Croatian",
+	sr: "Serbian",
+	serbian: "Serbian",
+	bg: "Bulgarian",
+	bulgarian: "Bulgarian",
+	lt: "Lithuanian",
+	lithuanian: "Lithuanian",
+	lv: "Latvian",
+	latvian: "Latvian",
+	et: "Estonian",
+	estonian: "Estonian",
+	sl: "Slovenian",
+	slovenian: "Slovenian",
+	ca: "Catalan",
+	catalan: "Catalan",
+	eu: "Basque",
+	basque: "Basque",
+	gl: "Galician",
+	galician: "Galician",
+	is: "Icelandic",
+	icelandic: "Icelandic",
+	ga: "Irish",
+	irish: "Irish",
+	cy: "Welsh",
+	welsh: "Welsh",
+	af: "Afrikaans",
+	afrikaans: "Afrikaans",
+	ne: "Nepali",
+	nepali: "Nepali",
+	si: "Sinhala",
+	sinhala: "Sinhala",
+	km: "Khmer",
+	khmer: "Khmer",
+	lo: "Lao",
+	lao: "Lao",
+	my: "Burmese",
+	burmese: "Burmese",
+	am: "Amharic",
+	amharic: "Amharic",
+	zu: "Zulu",
+	zulu: "Zulu",
+};
+
+function resolveTranslateTargetLanguage(input) {
+	const raw = String(input ?? "").trim();
+	if (!raw) return null;
+	const key = raw.toLowerCase().replace(/_/g, "-");
+	if (TRANSLATE_LANGUAGE_ALIASES[key]) return TRANSLATE_LANGUAGE_ALIASES[key];
+	if (/^[a-z]{2,3}(-[a-z]{2})?$/i.test(raw)) {
+		return raw
+			.split("-")
+			.map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+			.join("-");
+	}
+	if (raw.length >= 2 && raw.length <= 64) {
+		return raw.charAt(0).toUpperCase() + raw.slice(1);
+	}
+	return null;
+}
+
+function stripTranslationMarkdownFences(text) {
+	let t = String(text || "").trim();
+	if (t.startsWith("```")) {
+		t = t
+			.replace(/^```(?:markdown|md)?\s*/i, "")
+			.replace(/\s*```$/, "")
+			.trim();
+	}
+	return t;
+}
+
+// POST /generate/translate
+// Body: { markdown: string, language | targetLanguage | lang: string }
+app.post("/generate/translate", async (c) => {
+	const trAuthHdr =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const trAuthToken = trAuthHdr?.startsWith("Bearer ")
+		? trAuthHdr.slice(7).trim()
+		: trAuthHdr?.trim();
+	if (!trAuthToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details: "Provide a Bearer token in the Authorization header",
+			},
+			401,
+		);
+	}
+
+	const TR_RATE_LIMIT = 30;
+	const TR_RATE_WINDOW_MS = 10 * 60 * 1000;
+	const trIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const trRl = rateLimit(trIp, TR_RATE_LIMIT, TR_RATE_WINDOW_MS);
+	if (!trRl.allowed) {
+		c.header("Retry-After", String(trRl.retryAfter));
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: trRl.retryAfter,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(TR_RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(trRl.remaining));
+
+	if (!process.env.OPENROUTER_API_KEY) {
+		return c.json(
+			{ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" },
+			503,
+		);
+	}
+
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	const markdownRaw = body.markdown ?? body.content ?? body.text;
+	if (markdownRaw == null || String(markdownRaw).trim() === "") {
+		return c.json(
+			{
+				error: "markdown (or content) is required",
+				code: "MISSING_MARKDOWN",
+			},
+			400,
+		);
+	}
+
+	const languageInput =
+		body.language ?? body.targetLanguage ?? body.lang ?? body.to;
+	const targetLanguage = resolveTranslateTargetLanguage(languageInput);
+	if (!targetLanguage) {
+		return c.json(
+			{
+				error:
+					"language is required (e.g. english, french, es, de, ja, arabic, hindi)",
+				code: "MISSING_LANGUAGE",
+				supportedExamples: [
+					"english",
+					"french",
+					"spanish",
+					"german",
+					"japanese",
+					"arabic",
+					"hindi",
+					"pt-br",
+					"zh-tw",
+				],
+			},
+			400,
+		);
+	}
+
+	const markdown = String(markdownRaw);
+	const truncated = markdown.length > INKGEST_TRANSLATE_MAX_INPUT_CHARS;
+	const markdownForModel = truncated
+		? markdown.slice(0, INKGEST_TRANSLATE_MAX_INPUT_CHARS)
+		: markdown;
+
+	const maxOut = Math.min(
+		8192,
+		Math.max(512, Math.ceil(markdownForModel.length / 3) + 256),
+	);
+
+	try {
+		const or = await openRouterChatMessages(
+			process.env.OPENROUTER_API_KEY,
+			[
+				{
+					role: "system",
+					content: `You are a professional translator. Translate the user's Markdown into ${targetLanguage}.
+Rules:
+- Preserve Markdown structure exactly (headings, lists, links, images, tables, code fences).
+- Keep URLs, code blocks, and inline code unchanged unless they contain natural language to translate.
+- Do not add explanations, preambles, or markdown code fences around the output.
+- Output only the translated Markdown.`,
+				},
+				{ role: "user", content: markdownForModel },
+			],
+			maxOut,
+			{ temperature: 0.2, model: "google/gemini-2.0-flash-001" },
+		);
+
+		const translated = stripTranslationMarkdownFences(or.content);
+		
+		if (!translated) {
+			return c.json(
+				{ success: false, error: "Translation returned empty content" },
+				502,
+			);
+		}
+
+		return c.json({
+			success: true,
+			language: targetLanguage,
+			markdown: translated,
+			truncatedInput: truncated,
+			inputChars: markdown.length,
+			model: or.model || INKGEST_TRANSLATE_MODEL,
+			usage: or.usage,
+			tokenUsage: or.tokenUsage,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (err) {
+		console.error("[/generate/translate]", err?.message);
+		return c.json(
+			{
+				success: false,
+				error: err?.message || "Translation failed",
+			},
+			500,
+		);
+	}
+});
 
 // ─── POST /generate/:type ─────────────────────────────────────────────────────
 // Supported :type values (see ASSET_SKILL_MAP):
