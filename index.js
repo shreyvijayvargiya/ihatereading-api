@@ -8567,9 +8567,12 @@ const BROWSER_HEADERS = {
 	Referer: "https://www.youtube.com/",
 };
 
-function browserLikeFetchOptions(dispatcher) {
+function browserLikeFetchOptions(dispatcher, signal) {
 	const headers = { ...BROWSER_HEADERS };
-	const fetchOpts = (opts) => (dispatcher ? { ...opts, dispatcher } : opts);
+	const fetchOpts = (opts) => {
+		const base = dispatcher ? { ...opts, dispatcher } : opts;
+		return signal ? { ...base, signal } : base;
+	};
 	return {
 		userAgent: YOUTUBE_BROWSER_UA,
 		videoFetch: (params) =>
@@ -8606,15 +8609,66 @@ function browserLikeFetchOptions(dispatcher) {
 	};
 }
 
-function getScrapeYoutubeFetchOptions() {
-	if (process.env.VERCEL !== "1") return {};
+const SCRAPE_YOUTUBE_FETCH_TIMEOUT_MS = Math.min(
+	55_000,
+	Math.max(
+		5_000,
+		Number.parseInt(process.env.SCRAPE_YOUTUBE_FETCH_TIMEOUT_MS || "25000", 10) ||
+			25_000,
+	),
+);
+
+function isScrapeYoutubeProxyEnabled() {
+	const v = process.env.SCRAPE_YOUTUBE_USE_PROXY?.trim();
+	return v === "1" || v === "true" || v === "yes";
+}
+
+/** Direct fetch by default. Bright Data proxy only when SCRAPE_YOUTUBE_USE_PROXY=1 and not on Vercel (proxy tunnel 403s in serverless). */
+function getScrapeYoutubeFetchOptions({ useProxy = false } = {}) {
+	const signal = AbortSignal.timeout(SCRAPE_YOUTUBE_FETCH_TIMEOUT_MS);
+	const onVercel = process.env.VERCEL === "1";
+	const tryProxy = useProxy && isScrapeYoutubeProxyEnabled() && !onVercel;
+
+	if (tryProxy) {
+		try {
+			const proxy = proxyManager.getNextProxy();
+			const proxyUrl = `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`;
+			const dispatcher = new ProxyAgent(proxyUrl);
+			return browserLikeFetchOptions(dispatcher, signal);
+		} catch (proxyErr) {
+			console.warn(
+				"[scrape-youtube] proxy setup failed, using direct fetch:",
+				proxyErr?.message,
+			);
+		}
+	}
+	return browserLikeFetchOptions(null, signal);
+}
+
+async function fetchYoutubeTranscript(id) {
+	const run = async (useProxy) => {
+		const baseOpts = getScrapeYoutubeFetchOptions({ useProxy });
+		try {
+			return await fetchTranscript(id, { lang: "en", ...baseOpts });
+		} catch (langError) {
+			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
+				return await fetchTranscript(id, baseOpts);
+			}
+			throw langError;
+		}
+	};
+
 	try {
-		const proxy = proxyManager.getNextProxy();
-		const proxyUrl = `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`;
-		const dispatcher = new ProxyAgent(proxyUrl);
-		return browserLikeFetchOptions(dispatcher);
-	} catch {
-		return browserLikeFetchOptions();
+		return await run(false);
+	} catch (directErr) {
+		if (!isScrapeYoutubeProxyEnabled() || process.env.VERCEL === "1") {
+			throw directErr;
+		}
+		console.warn(
+			"[scrape-youtube] direct fetch failed, retrying via proxy:",
+			directErr?.message,
+		);
+		return await run(true);
 	}
 }
 
@@ -8626,18 +8680,8 @@ app.post("/scrape-youtube", async (c) => {
 			400,
 		);
 	}
-	const baseOpts = getScrapeYoutubeFetchOptions();
 	try {
-		let transcript = [];
-		try {
-			transcript = await fetchTranscript(id, { lang: "en", ...baseOpts });
-		} catch (langError) {
-			if (langError instanceof YoutubeTranscriptNotAvailableLanguageError) {
-				transcript = await fetchTranscript(id, baseOpts);
-			} else {
-				throw langError;
-			}
-		}
+		const transcript = await fetchYoutubeTranscript(id);
 		return c.json({
 			success: true,
 			data: {
@@ -13261,7 +13305,7 @@ Rules:
 				{ role: "user", content: markdownForModel },
 			],
 			maxOut,
-			{ temperature: 0.2, model: "google/gemini-2.0-flash-001" },
+			{ temperature: 0.2, model: "google/gemini-2.5-flash" },
 		);
 
 		const translated = stripTranslationMarkdownFences(or.content);
@@ -13306,6 +13350,7 @@ Rules:
 //   scrape: format defaults to "markdown"; use markdown | html | plain | text | json (output shape follows format)
 //   invoice: format defaults to "json"; use json | markdown | react | html (structured invoice + optional scraped URLs)
 // Response: { success, type, skillType, urls, content|infographics|columns/rows|images|markdown, timestamp }
+
 app.post("/generate/:type", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
 	const genAuthHdr =
