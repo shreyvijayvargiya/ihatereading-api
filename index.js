@@ -36,6 +36,8 @@ import {
 	ROUTER_SYSTEM_PROMPT,
 	parseAgentResponse,
 	fastRouter,
+	expandMultiBlogInSuggestedTasks,
+	buildAssetsFromExecuted,
 	SKILLS,
 	TASK_TYPES,
 	CREDITS,
@@ -6020,6 +6022,11 @@ app.post("/inkgest-agent", async (c) => {
 							return { ...t, params: { ...t.params, urls: taskUrls } };
 						});
 
+						tasksToRun = expandMultiBlogInSuggestedTasks(
+							tasksToRun,
+							userPrompt,
+						);
+
 						if (hasImages) {
 							tasksToRun = tasksToRun.map((t) =>
 								t.type === "image-reading" &&
@@ -6185,6 +6192,8 @@ app.post("/inkgest-agent", async (c) => {
 										type: "end",
 										error: errPayload.error,
 										executed: [],
+										assets: [],
+										multiBlog: false,
 										references: allSourceReferences,
 										scrapeErrors: errPayload.scrapeErrors,
 										creditsUsed: errPayload.creditsUsed,
@@ -6722,7 +6731,19 @@ app.post("/inkgest-agent", async (c) => {
 										title: s.title,
 									})),
 									...(usedCondensedBrief ? { condensedSources: true } : {}),
-									params: { urls, prompt: params.prompt, format, style },
+									params: {
+										urls,
+										prompt: params.prompt,
+										format,
+										style,
+										...(params.multiBlog
+											? {
+													multiBlog: true,
+													multiBlogIndex: params.multiBlogIndex,
+													multiBlogTotal: params.multiBlogTotal,
+												}
+											: {}),
+									},
 								};
 								// So client can render: landing page HTML, raw content (flat + nested for task.html / task.result?.html)
 								if (task.type === "landing-page-generator") {
@@ -6769,6 +6790,8 @@ app.post("/inkgest-agent", async (c) => {
 									send({
 										type: "end",
 										executed: [],
+										assets: [],
+										multiBlog: false,
 										errors: undefined,
 										scrapeErrors:
 											scrapeErrors.length > 0 ? scrapeErrors : undefined,
@@ -6993,11 +7016,15 @@ app.post("/inkgest-agent", async (c) => {
 							});
 						}
 
+						const assets = buildAssetsFromExecuted(executed);
 						controller.enqueue(
 							encoder.encode(
 								send({
 									type: "end",
 									executed,
+									assets,
+									multiBlog:
+										assets.filter((a) => a.type === "blog").length > 1,
 									// Top-level list of all source references (empty when no URLs)
 									references: state.references || [],
 									errors: errors.length > 0 ? errors : undefined,
