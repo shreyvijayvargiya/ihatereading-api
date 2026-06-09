@@ -36,7 +36,7 @@ import {
 	ROUTER_SYSTEM_PROMPT,
 	parseAgentResponse,
 	fastRouter,
-	expandMultiBlogInSuggestedTasks,
+	fanOutMultipleAssetTasks,
 	buildAssetsFromExecuted,
 	SKILLS,
 	TASK_TYPES,
@@ -4272,6 +4272,18 @@ const scrapHtml = async (url) => {
 	return html;
 };
 
+/** Brief scroll so non-G2 SPAs (Next.js, etc.) can hydrate before extraction. */
+async function runLightPostLoadActions(page) {
+	await page.evaluate(async () => {
+		const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+		await sleep(500);
+		window.scrollBy(0, window.innerHeight * 0.85);
+		await sleep(350);
+		window.scrollBy(0, window.innerHeight * 0.85);
+		await sleep(350);
+	});
+}
+
 /**
  * G2 pages are React SPAs; networkidle can settle on the empty shell before
  * listings hydrate. Cookie banners also block innerText. Scroll + consent + wait for product links.
@@ -4398,6 +4410,15 @@ async function scrapeSingleUrlWithPuppeteer(
 			if (useProxy) selectedProxy = proxyManager.getNextProxy();
 
 			const poolResult = await browserPool.withPage(async (page) => {
+				const protocolCap =
+					parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS, 10) || 180_000;
+				const pageOpTimeout = Math.min(
+					protocolCap,
+					Math.max(timeout + 45_000, 90_000),
+				);
+				page.setDefaultTimeout(pageOpTimeout);
+				page.setDefaultNavigationTimeout(Math.min(timeout, 120_000));
+
 				await page.setViewport(viewport);
 				await page.setUserAgent(userAgent);
 				await page.setExtraHTTPHeaders(extraHTTPHeaders);
@@ -4599,6 +4620,7 @@ async function scrapeSingleUrlWithPuppeteer(
 						waitUntil: "domcontentloaded",
 						timeout,
 					});
+					await runLightPostLoadActions(page);
 				}
 				const navLatency = Date.now() - navStart;
 
@@ -4608,10 +4630,22 @@ async function scrapeSingleUrlWithPuppeteer(
 					} catch {}
 				}
 
+				const evaluateOpts = {
+					extractMetadata,
+					includeImages,
+					includeLinks,
+					includeSemanticContent,
+					selectors,
+					isG2Host,
+				};
+
 				let scrapedData = {};
 				if (includeSemanticContent) {
-					scrapedData = await page.evaluate(
-						async (opts) => {
+					try {
+						scrapedData = await page.evaluate((opts) => {
+							const MAX_TEXT_NODES = 400;
+							const MAX_LINKS = 300;
+							const MAX_IMAGES = 50;
 							const data = {
 								url: window.location.href,
 								title: document.title,
@@ -4622,6 +4656,14 @@ async function scrapeSingleUrlWithPuppeteer(
 								screenshot: null,
 								orderedContent: null,
 							};
+							const contentRoot =
+								document.querySelector("main") ||
+								document.querySelector('[role="main"]') ||
+								document.querySelector("article") ||
+								document.querySelector("#content") ||
+								document.body;
+							if (!contentRoot) return data;
+
 							const remove = [
 								"header",
 								"footer",
@@ -4669,12 +4711,17 @@ async function scrapeSingleUrlWithPuppeteer(
 								"noscript",
 							];
 							remove.forEach((sel) =>
-								document.querySelectorAll(sel).forEach((el) => el.remove()),
+								contentRoot
+									.querySelectorAll(sel)
+									.forEach((el) => el.remove()),
 							);
 							["h1", "h2", "h3", "h4", "h5", "h6"].forEach((tag) => {
 								data.content[tag] = Array.from(
-									document.querySelectorAll(tag),
-								).map((h) => h.textContent.trim());
+									contentRoot.querySelectorAll(tag),
+								)
+									.map((h) => h.textContent.trim())
+									.filter(Boolean)
+									.slice(0, MAX_TEXT_NODES);
 							});
 							if (opts.extractMetadata) {
 								document.querySelectorAll("meta").forEach((meta) => {
@@ -4683,26 +4730,12 @@ async function scrapeSingleUrlWithPuppeteer(
 									const content = meta.getAttribute("content");
 									if (name && content) data.metadata[name] = content;
 								});
-								document
-									.querySelectorAll('meta[property^="og:"]')
-									.forEach((meta) => {
-										const p = meta.getAttribute("property");
-										const c = meta.getAttribute("content");
-										if (p && c) data.metadata[p] = c;
-									});
-								document
-									.querySelectorAll('meta[name^="twitter:"]')
-									.forEach((meta) => {
-										const n = meta.getAttribute("name");
-										const c = meta.getAttribute("content");
-										if (n && c) data.metadata[n] = c;
-									});
 							}
 							if (opts.includeLinks) {
 								const currentUrl = new URL(window.location.href);
 								const seedDomain = currentUrl.hostname;
 								const seen = new Set();
-								data.links = Array.from(document.querySelectorAll("a[href]"))
+								data.links = Array.from(contentRoot.querySelectorAll("a[href]"))
 									.map((link) => ({
 										text: link.textContent.trim(),
 										href: link.href,
@@ -4735,11 +4768,15 @@ async function scrapeSingleUrlWithPuppeteer(
 										if (seen.has(key)) return false;
 										seen.add(key);
 										return true;
-									});
+									})
+									.slice(0, MAX_LINKS);
 							}
 							if (opts.includeSemanticContent) {
 								const ext = (sel, proc = (el) => el.textContent.trim()) =>
-									Array.from(document.querySelectorAll(sel)).map(proc);
+									Array.from(contentRoot.querySelectorAll(sel))
+										.map(proc)
+										.filter(Boolean)
+										.slice(0, MAX_TEXT_NODES);
 								const extTable = (t) =>
 									Array.from(t.querySelectorAll("tr"))
 										.map((r) =>
@@ -4752,21 +4789,24 @@ async function scrapeSingleUrlWithPuppeteer(
 									Array.from(l.querySelectorAll("li"))
 										.map((li) => li.textContent.trim())
 										.filter(Boolean);
+								const innerText = String(contentRoot.innerText || "")
+									.replace(/\n{3,}/g, "\n\n")
+									.trim()
+									.slice(0, 80_000);
 								data.content.semanticContent = {
 									articleContent: ext("article"),
-									divs: ext("div"),
 									paragraphs: ext("p"),
-									span: ext("span"),
 									blockquotes: ext("blockquote"),
 									codeBlocks: ext("code"),
 									preformatted: ext("pre"),
 									tables: ext("table", extTable),
 									unorderedLists: ext("ul", extList),
 									orderedLists: ext("ol", extList),
+									innerText,
 								};
 							}
 							if (opts.includeImages) {
-								data.images = Array.from(document.querySelectorAll("img[src]"))
+								data.images = Array.from(contentRoot.querySelectorAll("img[src]"))
 									.filter(
 										(img) =>
 											!["data:image/", "blob:", "image:", "data:"].some((p) =>
@@ -4779,13 +4819,14 @@ async function scrapeSingleUrlWithPuppeteer(
 										title: img.title || "",
 										width: img.naturalWidth || img.width,
 										height: img.naturalHeight || img.height,
-									}));
+									}))
+									.slice(0, MAX_IMAGES);
 							}
 							if (opts.selectors && Object.keys(opts.selectors).length > 0) {
 								data.customSelectors = {};
 								for (const [key, selector] of Object.entries(opts.selectors)) {
 									try {
-										const els = document.querySelectorAll(selector);
+										const els = contentRoot.querySelectorAll(selector);
 										data.customSelectors[key] =
 											els.length === 1
 												? els[0].textContent.trim()
@@ -4796,73 +4837,104 @@ async function scrapeSingleUrlWithPuppeteer(
 								}
 							}
 							return data;
-						},
-						{
-							extractMetadata,
-							includeImages,
-							includeLinks,
-							includeSemanticContent,
-							selectors,
-							isG2Host,
-						},
+						}, evaluateOpts);
+					} catch (evalErr) {
+						console.warn(
+							`[scrape] Heavy evaluate failed for ${targetUrl}, using innerText fallback:`,
+							evalErr?.message,
+						);
+						scrapedData = await page.evaluate(() => {
+							const root =
+								document.querySelector("main") ||
+								document.querySelector('[role="main"]') ||
+								document.querySelector("article") ||
+								document.body;
+							const innerText = root
+								? String(root.innerText || "")
+										.replace(/\n{3,}/g, "\n\n")
+										.trim()
+										.slice(0, 80_000)
+								: "";
+							return {
+								url: window.location.href,
+								title: document.title,
+								content: {
+									semanticContent: { innerText, paragraphs: [] },
+								},
+								metadata: {},
+								links: [],
+								images: [],
+							};
+						});
+					}
+				}
+
+				let markdown = "";
+				try {
+					const pageHtml = await page.content();
+					const dom = new JSDOM(pageHtml);
+					const doc = dom.window.document;
+					const remove = [
+						"header",
+						"footer",
+						"nav",
+						"aside",
+						".header",
+						".top",
+						".navbar",
+						"#header",
+						".footer",
+						".bottom",
+						"#footer",
+						".sidebar",
+						".side",
+						".aside",
+						"#sidebar",
+						".modal",
+						".popup",
+						"#modal",
+						".overlay",
+						".ad",
+						".ads",
+						".advert",
+						"#ad",
+						".lang-selector",
+						".language",
+						"#language-selector",
+						".social",
+						".social-media",
+						".social-links",
+						"#social",
+						".menu",
+						".navigation",
+						"#nav",
+						".breadcrumbs",
+						"#breadcrumbs",
+						".share",
+						"#share",
+						".widget",
+						"#widget",
+						".cookie",
+						"#cookie",
+						"script",
+						"style",
+						"noscript",
+					];
+					remove.forEach((sel) =>
+						doc.querySelectorAll(sel).forEach((el) => el.remove()),
+					);
+					({ markdown } = extractSemanticContentWithFormattedMarkdown(doc.body));
+				} catch (mdErr) {
+					console.warn(
+						`[scrape] Markdown extraction failed for ${targetUrl}:`,
+						mdErr?.message,
 					);
 				}
 
-				const pageHtml = await page.content();
-				const dom = new JSDOM(pageHtml);
-				const doc = dom.window.document;
-				const remove = [
-					"header",
-					"footer",
-					"nav",
-					"aside",
-					".header",
-					".top",
-					".navbar",
-					"#header",
-					".footer",
-					".bottom",
-					"#footer",
-					".sidebar",
-					".side",
-					".aside",
-					"#sidebar",
-					".modal",
-					".popup",
-					"#modal",
-					".overlay",
-					".ad",
-					".ads",
-					".advert",
-					"#ad",
-					".lang-selector",
-					".language",
-					"#language-selector",
-					".social",
-					".social-media",
-					".social-links",
-					"#social",
-					".menu",
-					".navigation",
-					"#nav",
-					".breadcrumbs",
-					"#breadcrumbs",
-					".share",
-					"#share",
-					".widget",
-					"#widget",
-					".cookie",
-					"#cookie",
-					"script",
-					"style",
-					"noscript",
-				];
-				remove.forEach((sel) =>
-					doc.querySelectorAll(sel).forEach((el) => el.remove()),
-				);
-				let { markdown } = extractSemanticContentWithFormattedMarkdown(
-					doc.body,
-				);
+				if (!markdown?.trim()) {
+					markdown =
+						scrapedData?.content?.semanticContent?.innerText?.trim() || "";
+				}
 
 				if (isG2Host && (!markdown || String(markdown).trim().length < 80)) {
 					try {
@@ -5083,7 +5155,7 @@ app.post("/scrape", async (c) => {
 		url,
 		selectors = {},
 		waitForSelector = null,
-		timeout = 30000,
+		timeout = 60000,
 		includeSemanticContent = true,
 		includeImages = true,
 		includeLinks = true,
@@ -5132,7 +5204,69 @@ app.post("/scrape", async (c) => {
 	}
 });
 
-// Batch Puppeteer scraping: multiple URLs in parallel, never fails entire request
+/** Run scrape jobs with concurrency capped to browser pool size (avoids pool starvation). */
+async function scrapeMultipleUrlsWithPoolLimit(urls, options, scrapeFn) {
+	const poolLimit = Math.max(
+		1,
+		Number.parseInt(process.env.BROWSER_POOL_SIZE, 10) || 3,
+	);
+	const results = new Array(urls.length);
+	let nextIndex = 0;
+
+	async function worker() {
+		while (nextIndex < urls.length) {
+			const idx = nextIndex++;
+			const inputUrl =
+				typeof urls[idx] === "string" ? urls[idx] : (urls[idx]?.url ?? urls[idx]);
+			if (!inputUrl || !isValidURL(inputUrl)) {
+				results[idx] = {
+					url: inputUrl || "invalid",
+					success: false,
+					error: "Invalid or missing URL",
+					data: {},
+					markdown: null,
+					summary: null,
+					screenshot: null,
+				};
+				continue;
+			}
+			try {
+				const result = await scrapeFn(inputUrl, options);
+				results[idx] = {
+					url: inputUrl,
+					success: true,
+					data: result.data,
+					markdown: result.markdown,
+					summary: result.summary,
+					screenshot: result.screenshot,
+					...(result.openRouterSummary && {
+						openRouterSummary: result.openRouterSummary,
+					}),
+					error: null,
+				};
+			} catch (err) {
+				const msg = err?.message || "Scraping failed";
+				console.warn(`⚠️ Scrape failed for ${inputUrl}:`, msg);
+				results[idx] = {
+					url: inputUrl,
+					success: false,
+					error: msg,
+					data: {},
+					markdown: null,
+					summary: null,
+					screenshot: null,
+				};
+			}
+		}
+	}
+
+	await Promise.all(
+		Array.from({ length: Math.min(poolLimit, urls.length) }, () => worker()),
+	);
+	return results;
+}
+
+// Batch Puppeteer scraping: multiple URLs with pool-limited concurrency, never fails entire request
 app.post("/scrape-multiple", async (c) => {
 	customLogger("Scraping URLs (batch) with Puppeteer", await c.req.header());
 
@@ -5166,7 +5300,7 @@ app.post("/scrape-multiple", async (c) => {
 		urls,
 		selectors = {},
 		waitForSelector = null,
-		timeout = 30000,
+		timeout = 60000,
 		includeSemanticContent = true,
 		includeImages = true,
 		includeLinks = true,
@@ -5208,53 +5342,18 @@ app.post("/scrape-multiple", async (c) => {
 		takeScreenshot,
 	};
 
-	const results = await Promise.all(
-		urls.map(async (url) => {
-			const inputUrl = typeof url === "string" ? url : (url?.url ?? url);
-			if (!inputUrl || !isValidURL(inputUrl)) {
-				return {
-					url: inputUrl || "invalid",
-					success: false,
-					error: "Invalid or missing URL",
-					data: {},
-					markdown: null,
-					summary: null,
-					screenshot: null,
-				};
-			}
-			try {
-				const result = await scrapeSingleUrlWithPuppeteer(inputUrl, options);
-				return {
-					url: inputUrl,
-					success: true,
-					data: result.data,
-					markdown: result.markdown,
-					summary: result.summary,
-					screenshot: result.screenshot,
-					...(result.openRouterSummary && {
-						openRouterSummary: result.openRouterSummary,
-					}),
-					error: null,
-				};
-			} catch (err) {
-				const msg = err?.message || "Scraping failed";
-				console.warn(`⚠️ Scrape failed for ${inputUrl}:`, msg);
-				return {
-					url: inputUrl,
-					success: false,
-					error: msg,
-					data: {},
-					markdown: null,
-					summary: null,
-					screenshot: null,
-				};
-			}
-		}),
+	const results = await scrapeMultipleUrlsWithPoolLimit(
+		urls,
+		options,
+		scrapeSingleUrlWithPuppeteer,
 	);
 
+	const succeeded = results.filter((r) => r.success).length;
 	return c.json({
-		success: true,
+		success: succeeded > 0,
 		results,
+		succeeded,
+		failed: results.length - succeeded,
 		timestamp: new Date().toISOString(),
 	});
 });
@@ -5610,8 +5709,18 @@ app.post("/inkgest-agent", async (c) => {
 								: apiBase;
 						let scrapedSources = [];
 						let scrapeErrors = [];
+						/** URLs already sent to scrape this request — avoids duplicate /scrape-multiple after timeouts. */
+						const scrapeAttemptedUrls = new Set();
 						let parsed = {};
 						let suggestedTasks = [];
+
+						function safeStreamSend(obj) {
+							try {
+								controller.enqueue(encoder.encode(send(obj)));
+							} catch (err) {
+								if (err?.code !== "ERR_INVALID_STATE") throw err;
+							}
+						}
 
 						function addTokenUsage(usage) {
 							if (usage && typeof usage === "object") {
@@ -5644,6 +5753,8 @@ app.post("/inkgest-agent", async (c) => {
 							// Scrape helper: explicit URL lists so it can be re-used for
 							// prompt URLs (parallel with router) and router-inferred URLs.
 							async function scrapeClassifiedUrls(regular, youtube, reddit) {
+								for (const u of [...regular, ...youtube, ...reddit])
+									scrapeAttemptedUrls.add(u);
 								const [regularScraped, youtubeScraped, redditScraped] =
 									await Promise.all([
 										regular.length > 0
@@ -5867,9 +5978,10 @@ app.post("/inkgest-agent", async (c) => {
 								scrapedSources.map((s) => s.url),
 							);
 							const newUrls = urlsToScrape.filter(
-								(u) => !alreadyScrapedSet.has(u),
+								(u) => !alreadyScrapedSet.has(u) && !scrapeAttemptedUrls.has(u),
 							);
 							if (newUrls.length > 0) {
+								for (const u of newUrls) scrapeAttemptedUrls.add(u);
 								const newReddit = newUrls.filter(isRedditUrl);
 								const newYoutube = newUrls.filter(isYoutubeUrl);
 								const newRegular = newUrls.filter(
@@ -5894,6 +6006,7 @@ app.post("/inkgest-agent", async (c) => {
 							}
 						} else {
 							if (urlsToScrape.length > 0) {
+								for (const u of urlsToScrape) scrapeAttemptedUrls.add(u);
 								const [regularScraped, youtubeScraped, redditScraped] =
 									await Promise.all([
 										regularUrls.length > 0
@@ -5960,27 +6073,23 @@ app.post("/inkgest-agent", async (c) => {
 						}
 
 						// Stream scrape outcome — client shows per-URL success/failure before tasks start.
-						controller.enqueue(
-							encoder.encode(
-								send({
-									type: "scrape_status",
-									urlsToScrape,
-									scraped: scrapedSources.map((s) => ({
-										url: s.url,
-										title: s.title || "",
-										success: true,
-									})),
-									failed: scrapeErrors.map((e) =>
-										typeof e === "string"
-											? { url: "unknown", error: e }
-											: {
-													url: e?.url || "unknown",
-													error: e?.error || String(e),
-												},
-									),
-								}),
+						safeStreamSend({
+							type: "scrape_status",
+							urlsToScrape,
+							scraped: scrapedSources.map((s) => ({
+								url: s.url,
+								title: s.title || "",
+								success: true,
+							})),
+							failed: scrapeErrors.map((e) =>
+								typeof e === "string"
+									? { url: "unknown", error: e }
+									: {
+											url: e?.url || "unknown",
+											error: e?.error || String(e),
+										},
 							),
-						);
+						});
 
 						let tasksToRun = hasExecuteTasks
 							? executeTasks
@@ -6022,7 +6131,7 @@ app.post("/inkgest-agent", async (c) => {
 							return { ...t, params: { ...t.params, urls: taskUrls } };
 						});
 
-						tasksToRun = expandMultiBlogInSuggestedTasks(
+						tasksToRun = fanOutMultipleAssetTasks(
 							tasksToRun,
 							userPrompt,
 						);
@@ -6163,9 +6272,12 @@ app.post("/inkgest-agent", async (c) => {
 								CONTENT_TYPES_NEEDING_SOURCES.includes(t.type) &&
 								!t.params?.useCrawlResult,
 						);
+						const scrapedWithContent = scrapedSources.filter(
+							(s) => s?.markdown?.trim() || s?.title?.trim(),
+						);
 						if (
 							urlsToScrape.length > 0 &&
-							scrapedSources.length === 0 &&
+							scrapedWithContent.length === 0 &&
 							contentTasksNeedingScrape.length > 0
 						) {
 							const errPayload = {
@@ -6193,7 +6305,7 @@ app.post("/inkgest-agent", async (c) => {
 										error: errPayload.error,
 										executed: [],
 										assets: [],
-										multiBlog: false,
+										multiAsset: false,
 										references: allSourceReferences,
 										scrapeErrors: errPayload.scrapeErrors,
 										creditsUsed: errPayload.creditsUsed,
@@ -6736,11 +6848,10 @@ app.post("/inkgest-agent", async (c) => {
 										prompt: params.prompt,
 										format,
 										style,
-										...(params.multiBlog
+										...(params.assetIndex
 											? {
-													multiBlog: true,
-													multiBlogIndex: params.multiBlogIndex,
-													multiBlogTotal: params.multiBlogTotal,
+													assetIndex: params.assetIndex,
+													assetTotal: params.assetTotal,
 												}
 											: {}),
 									},
@@ -6791,7 +6902,7 @@ app.post("/inkgest-agent", async (c) => {
 										type: "end",
 										executed: [],
 										assets: [],
-										multiBlog: false,
+										multiAsset: false,
 										errors: undefined,
 										scrapeErrors:
 											scrapeErrors.length > 0 ? scrapeErrors : undefined,
@@ -7023,8 +7134,7 @@ app.post("/inkgest-agent", async (c) => {
 									type: "end",
 									executed,
 									assets,
-									multiBlog:
-										assets.filter((a) => a.type === "blog").length > 1,
+									multiAsset: assets.length > 1,
 									// Top-level list of all source references (empty when no URLs)
 									references: state.references || [],
 									errors: errors.length > 0 ? errors : undefined,

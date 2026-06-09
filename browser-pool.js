@@ -13,6 +13,9 @@
 const POOL_SIZE = parseInt(process.env.BROWSER_POOL_SIZE) || 3;
 const BROWSER_IDLE_TIMEOUT_MS =
 	parseInt(process.env.BROWSER_IDLE_TIMEOUT_MS) || 5 * 60 * 1000; // 5 min
+/** CDP protocol timeout — page.evaluate on heavy SPAs needs headroom (default puppeteer ~180s). */
+const PROTOCOL_TIMEOUT_MS =
+	parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS, 10) || 180_000;
 
 const CHROME_LAUNCH_ARGS = [
 	"--no-sandbox",
@@ -111,7 +114,10 @@ class BrowserPool {
 
 		const tryLaunch = async (label, launchOptions) => {
 			try {
-				const browser = await this._puppeteer.launch(launchOptions);
+				const browser = await this._puppeteer.launch({
+					protocolTimeout: PROTOCOL_TIMEOUT_MS,
+					...launchOptions,
+				});
 				console.log(`[BrowserPool] Launched browser via ${label}`);
 				return browser;
 			} catch (err) {
@@ -262,6 +268,10 @@ class BrowserPool {
 		let page;
 		try {
 			page = await entry.browser.newPage();
+			page.setDefaultTimeout(PROTOCOL_TIMEOUT_MS);
+			page.setDefaultNavigationTimeout(
+				Math.min(PROTOCOL_TIMEOUT_MS, 120_000),
+			);
 			const result = await task(page);
 			return result;
 		} finally {
