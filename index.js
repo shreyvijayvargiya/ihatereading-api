@@ -66,6 +66,16 @@ import {
 	YoutubeTranscriptNotAvailableLanguageError,
 } from "youtube-transcript-plus";
 import { openRouterTranslateAuthMiddleware } from "./lib/translateFirebaseAuth.js";
+import {
+	ttsSynthesizeToBuffer,
+	pcm16ToWavBuffer,
+	OPENROUTER_TTS_VOICES,
+	normalizeOpenRouterTtsVoice,
+} from "./lib/openRouterTts.js";
+import {
+	runVoiceTranslateText,
+	uploadVoiceTranslateTtsToUploadThing,
+} from "./lib/voiceTranslateText.js";
 import { GoogleGenAI } from "@google/genai";
 
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
@@ -80,6 +90,55 @@ function universoCacheDocId(url) {
 }
 
 const utapi = new UTApi({ token: process.env.UPLOADTHING_TOKEN });
+
+const BLOG_TO_AUDIO_MAX_CHARS = 50_000;
+
+/** Strip HTML / markdown noise so TTS speaks readable prose, not tags. */
+function prepareBlogContentForTts(raw) {
+	let text = String(raw ?? "").trim();
+	if (!text) return "";
+
+	if (/<[a-z][\s\S]*>/i.test(text)) {
+		try {
+			const dom = new JSDOM(text);
+			text = dom.window.document.body?.textContent || text;
+		} catch {
+			text = text.replace(/<[^>]+>/g, " ");
+		}
+	}
+
+	text = text
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+		.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+		.replace(/^#{1,6}\s+/gm, "")
+		.replace(/[*_~]+/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+
+	return text;
+}
+
+/** Peak sample magnitude — 0 means the WAV is silent. */
+function measureWavPeak(wavBuffer) {
+	if (wavBuffer.length < 44) return 0;
+	const bitsPerSample = wavBuffer.readUInt16LE(34);
+	const dataSize = wavBuffer.readUInt32LE(40);
+	const audio = wavBuffer.slice(44, 44 + dataSize);
+	if (bitsPerSample === 16) {
+		let peak = 0;
+		for (let i = 0; i < audio.length - 1; i += 2) {
+			peak = Math.max(peak, Math.abs(audio.readInt16LE(i)));
+		}
+		return peak;
+	}
+	let peak = 0;
+	for (let i = 0; i < audio.length; i++) {
+		peak = Math.max(peak, Math.abs(audio[i] - 128));
+	}
+	return peak;
+}
 
 // Safely parse JSON from an AI response that may include markdown fences or trailing text
 function parseAIJson(raw) {
@@ -7494,6 +7553,18 @@ async function uploadScreenshotBuffer(buffer) {
 	return response.data.ufsUrl;
 }
 
+async function uploadWavBuffer(buffer, fileName) {
+	const name =
+		fileName ||
+		`blog-audio-${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.wav`;
+	const utFile = new UTFile([buffer], name, { type: "audio/wav" });
+	const [response] = await utapi.uploadFiles([utFile]);
+	if (response.error) {
+		throw new Error(`UploadThing upload failed: ${response.error.message}`);
+	}
+	return response.data.ufsUrl;
+}
+
 
 async function smartCaptureScreenshot(url, options = {}) {
 	const {
@@ -10766,7 +10837,7 @@ async function agentBrowserScreenshot(
 // ─── API Token Layer ──────────────────────────────────────────────────────────
 //
 // Step 1 — Token creation:   POST /api-token/create   { userId }
-// Step 2 — JWT middleware:   apiTokenMiddleware  (applied to 4 agent routes below)
+// Step 2 — JWT middleware:   apiTokenMiddleware  (applied to agent + blog-to-audio routes below)
 // Step 3 — Credit check:     verifyApiToken checks users/{userId}.credits > 0
 // Step 4 — Credit deduction: middleware deducts 1 credit after each successful call
 
@@ -11174,6 +11245,226 @@ app.post("/agent-screenshot-multiple", async (c) => {
 		results,
 		timestamp: new Date().toISOString(),
 	});
+});
+
+// ─── blog-to-audio — voice-translate pipeline (OpenRouter LLM + TTS) ──────────
+//
+// Auth: Bearer API token (same as /agent-scrape). Create via POST /api-token/create.
+// GET  /blog-to-audio/voices — languages + OpenRouter TTS voices
+// POST /blog-to-audio — { content, language?, sourceLanguage?, translate?, voice? | voiceOver? }
+
+function listBlogAudioLanguages() {
+	const byName = new Map();
+	for (const [code, name] of Object.entries(TRANSLATE_LANGUAGE_ALIASES)) {
+		if (!/^[a-z]{2}(-[a-z]{2})?$/i.test(code)) continue;
+		if (!byName.has(name)) byName.set(name, code.toLowerCase());
+	}
+	return [...byName.entries()]
+		.map(([name, code]) => ({ code, name }))
+		.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+app.get("/blog-to-audio/voices", (c) => {
+	return c.json({
+		success: true,
+		defaultLanguage: "en",
+		languages: listBlogAudioLanguages(),
+		voices: OPENROUTER_TTS_VOICES,
+		defaultVoice: "alloy",
+		usage:
+			"POST /blog-to-audio with content, language (e.g. hi, en), optional sourceLanguage, translate (auto when languages differ), and voice or voiceOver (alloy, nova, …).",
+	});
+});
+
+app.post("/blog-to-audio", async (c) => {
+	if (!process.env.OPENROUTER_API_KEY?.trim()) {
+		return c.json(
+			{
+				success: false,
+				error: "OPENROUTER_API_KEY not configured",
+				code: "MISSING_API_KEY",
+			},
+			503,
+		);
+	}
+
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ success: false, error: "Invalid JSON body" }, 400);
+	}
+
+	const rawContent = String(body.content ?? "").trim();
+	if (!rawContent) {
+		return c.json({ success: false, error: "content is required" }, 400);
+	}
+	const content = prepareBlogContentForTts(rawContent);
+	if (!content) {
+		return c.json(
+			{
+				success: false,
+				error: "content has no speakable text after stripping markup",
+			},
+			400,
+		);
+	}
+	if (content.length > BLOG_TO_AUDIO_MAX_CHARS) {
+		return c.json(
+			{
+				success: false,
+				error: `content exceeds ${BLOG_TO_AUDIO_MAX_CHARS} characters`,
+			},
+			400,
+		);
+	}
+
+	const targetLanguage = resolveTranslateTargetLanguage(
+		body.language ?? body.targetLanguage ?? body.lang ?? "en",
+	);
+	if (!targetLanguage) {
+		return c.json(
+			{
+				success: false,
+				error: "Invalid or missing language (e.g. en, hi, hindi, french)",
+			},
+			400,
+		);
+	}
+
+	const sourceLanguage = resolveTranslateTargetLanguage(
+		body.sourceLanguage ?? body.source_language ?? "en",
+	);
+	if (!sourceLanguage) {
+		return c.json(
+			{ success: false, error: "Invalid sourceLanguage" },
+			400,
+		);
+	}
+
+	const voiceRaw = body.voice ?? body.voiceOver ?? "alloy";
+	const voice = normalizeOpenRouterTtsVoice(voiceRaw);
+	if (!voice) {
+		return c.json(
+			{
+				success: false,
+				error: `Unsupported voice "${voiceRaw}"`,
+				supportedVoices: OPENROUTER_TTS_VOICES,
+			},
+			400,
+		);
+	}
+
+	const translateFlag = body.translate;
+	const shouldTranslate =
+		translateFlag === true ||
+		(translateFlag !== false &&
+			sourceLanguage.toLowerCase() !== targetLanguage.toLowerCase());
+
+	const ttsSignal = AbortSignal.timeout(
+		Math.max(OPENROUTER_TIMEOUT_MS, 600_000),
+	);
+
+	try {
+		if (shouldTranslate) {
+			const vtReqId = uuidv4();
+			const vt = await runVoiceTranslateText({
+				text: content,
+				languages: [targetLanguage],
+				includeAudio: true,
+				voice,
+				source_language: body.sourceLanguage ?? body.source_language ?? "en",
+				signal: ttsSignal,
+			});
+			if (vt.error) {
+				return c.json(
+					{
+						success: false,
+						error: vt.error,
+						code: vt.code,
+						details: vt.details,
+					},
+					vt.httpStatus || 502,
+				);
+			}
+
+			const results = vt.data?.results || [];
+			await uploadVoiceTranslateTtsToUploadThing(
+				results,
+				(buffer, name) => uploadWavBuffer(buffer, name),
+				vtReqId,
+			);
+			const row = results[0];
+			if (!row?.audioUrl) {
+				return c.json(
+					{ success: false, error: "TTS upload did not return an audio URL" },
+					500,
+				);
+			}
+
+			return c.json({
+				success: true,
+				audioUrl: row.audioUrl,
+				voice,
+				language: targetLanguage,
+				sourceLanguage,
+				translated: true,
+				speechText: row.transcript,
+				pipeline: vt.data?.pipeline,
+				usage: vt.usage,
+				tokenUsage: vt.tokenUsage,
+				timestamp: new Date().toISOString(),
+			});
+		}
+
+		const { buffer: pcmBuf, usage: ttsUsage } = await ttsSynthesizeToBuffer({
+			text: content,
+			voice,
+			signal: ttsSignal,
+		});
+		const wavBuffer = pcm16ToWavBuffer(pcmBuf);
+		if (wavBuffer.length < 48) {
+			return c.json(
+				{ success: false, error: "TTS produced an empty audio file" },
+				500,
+			);
+		}
+		const peak = measureWavPeak(wavBuffer);
+		if (peak === 0) {
+			return c.json(
+				{ success: false, error: "TTS produced silent audio" },
+				500,
+			);
+		}
+		const audioUrl = await uploadWavBuffer(wavBuffer);
+		return c.json({
+			success: true,
+			audioUrl,
+			voice,
+			language: targetLanguage,
+			sourceLanguage,
+			translated: false,
+			ttsUsage,
+			bytes: wavBuffer.length,
+			speechTextLength: content.length,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (err) {
+		const msg = err?.message || String(err);
+		console.error("[blog-to-audio]", msg);
+		const is402 = /402|"code":402|requires at least.*balance/i.test(msg);
+		return c.json(
+			{
+				success: false,
+				error: is402
+					? "OpenRouter TTS requires sufficient account balance for audio output"
+					: "Failed to convert text to audio",
+				details: msg,
+				...(is402 && { code: "OPENROUTER_INSUFFICIENT_BALANCE" }),
+			},
+			is402 ? 402 : 500,
+		);
+	}
 });
 
 // ─── /api/codegen — URL → React / Tailwind HTML streamed codegen ─────────────
