@@ -77,6 +77,11 @@ import {
 	uploadVoiceTranslateTtsToUploadThing,
 } from "./lib/voiceTranslateText.js";
 import { GoogleGenAI } from "@google/genai";
+import {
+	buildDesignThemePromptSection,
+	listDesignThemes,
+	resolveImageToCodeDesignTheme,
+} from "./lib/imageToCodeDesignThemes.js";
 
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2531,7 +2536,7 @@ Return ONLY the JSON object matching the schema above, with no additional text o
 async function callOpenRouter(
 	messages,
 	{
-		model = "google/gemini-2.0-flash-001",
+		model = "google/gemini-2.5-flash",
 		jsonMode = false,
 		maxTokens = null,
 	} = {},
@@ -9035,6 +9040,11 @@ app.post("/scrape-git", async (c) => {
 
 export default app;
 
+/** GET /image-to-code/design-themes — keys match ai-examples/simba-ui-ux/prompts/prompts.js for frontend dropdowns */
+app.get("/image-to-code/design-themes", (c) => {
+	return c.json({ themes: listDesignThemes() });
+});
+
 app.post("/image-to-code", async (c) => {
 	// ── Auth ──────────────────────────────────────────────────────────────────
 	const imgAuthHeader =
@@ -9088,6 +9098,7 @@ app.post("/image-to-code", async (c) => {
 	const contentType = c.req.header("content-type") || "";
 	let imageUrl;
 	let prompt;
+	let designTheme;
 	let base64Data;
 	let mimeType;
 
@@ -9095,6 +9106,7 @@ app.post("/image-to-code", async (c) => {
 		const body = await c.req.json();
 		imageUrl = body.imageUrl;
 		prompt = body.prompt;
+		designTheme = body.designTheme;
 	} else if (contentType.includes("multipart/form-data")) {
 		try {
 			const formData = await c.req.formData();
@@ -9110,6 +9122,7 @@ app.post("/image-to-code", async (c) => {
 			}
 			imageUrl = formData.get("imageUrl");
 			prompt = formData.get("prompt");
+			designTheme = formData.get("designTheme");
 		} catch {
 			return c.json(
 				{
@@ -9124,6 +9137,7 @@ app.post("/image-to-code", async (c) => {
 		const params = new URLSearchParams(bodyText);
 		imageUrl = params.get("imageUrl");
 		prompt = params.get("prompt");
+		designTheme = params.get("designTheme");
 	} else {
 		return c.json(
 			{ error: "Unsupported Content-Type. Use JSON or multipart/form-data." },
@@ -9133,6 +9147,24 @@ app.post("/image-to-code", async (c) => {
 
 	if (!prompt) {
 		return c.json({ error: "prompt is required" }, 400);
+	}
+
+	let designThemeMeta = null;
+	const designThemeRaw =
+		designTheme != null ? String(designTheme).trim() : "";
+	if (designThemeRaw) {
+		const resolved = resolveImageToCodeDesignTheme(designThemeRaw);
+		if (!resolved.ok) {
+			return c.json(
+				{
+					error: resolved.error,
+					code: "UNKNOWN_DESIGN_THEME",
+					validThemes: resolved.validThemes || listDesignThemes(),
+				},
+				400,
+			);
+		}
+		designThemeMeta = resolved;
 	}
 
 	// ── Resolve image → base64 ────────────────────────────────────────────────
@@ -9164,21 +9196,187 @@ app.post("/image-to-code", async (c) => {
 		);
 	}
 
-	const imgToCodeModel = "google/gemini-2.0-flash-001";
+	const imgToCodeModel = "google/gemini-3.5-flash";
+	const IMAGE_TO_CODE_SYSTEM_PROMPT = `You are an expert frontend engineer specialising in pixel-accurate UI reproduction from screenshots.
+Generate ONE default-exported React functional component that visually matches the provided image as closely as possible.
+
+OUTPUT FORMAT (strict):
+- Output ONLY raw JSX/TS-free React code — no markdown fences, no explanations, no comments.
+- Import React and hooks as needed. Default-export the component.
+- Tailwind CSS utility classes only — no inline styles, no separate CSS files, no Tailwind import.
+- Icons: lucide-react and react-icons only. Pick icons that match the screenshot shape (e.g. Sparkles not Pencil if the image shows a sparkle).
+- Implement interactive elements (tabs, inputs, buttons) with useState where visible in the image.
+
+VISUAL FIDELITY (critical — read the image before writing any className):
+1. COLOURS — Copy colours FROM THE IMAGE. Do NOT default to generic purple/blue/indigo accents unless they appear in the screenshot.
+   - If the design is monochrome (black/white/gray only), keep it monochrome — no invented brand colours.
+   - When Tailwind palette tokens are imprecise, use arbitrary values: bg-[#F5F5F5], text-[#171717], border-[#E5E5E5].
+   - Match button, link, tab-active, and CTA colours exactly (e.g. a gray disabled Generate button is NOT purple).
+2. BORDER RADIUS — Observe each element separately; never blanket-apply rounded-lg everywhere.
+   - Cards/panels: often rounded-2xl or rounded-3xl (not rounded-lg).
+   - Pill buttons and segmented tabs: rounded-full.
+   - Inputs/textareas: match the image — often rounded-xl or rounded-2xl; use rounded-md only if corners are visibly subtle.
+   - Sharp/square corners in the image → rounded-sm or rounded-none.
+3. TYPOGRAPHY — Match font weight and size hierarchy: page title vs labels vs body vs placeholders.
+   - Use font-sans. Bold titles (font-bold/font-semibold), medium labels, lighter placeholders (text-gray-400/500).
+   - Do not upscale or downscale headings relative to the screenshot.
+4. LAYOUT & SPACING — Reproduce padding, gaps, max-width, centering, and section order from the image.
+   - Segmented tab bars (pill container + white active segment) are NOT the same as underline/border-bottom tabs — match the pattern shown.
+   - Header/nav: reproduce left/right groups, pill buttons, credit chips, and avatar placement.
+5. ASSETS & IMAGES IN THE SCREENSHOT — Never use <img src="https://via.placeholder.com/...">, picsum, unsplash, or any invented external image URL.
+   - If the input image shows photos, avatars, thumbnails, or logos: represent them with lucide-react or react-icons (e.g. User in a rounded-full bg-gray-200 container for profile avatars; Image or FileImage for content thumbnails) — NOT placeholder <img> tags.
+   - Decorative or functional icons in the design → lucide-react / react-icons imports matching the visual.
+   - Gray circular avatar placeholders → <div className="rounded-full bg-gray-200 flex items-center justify-center"><User className="h-4 w-4 text-gray-500" /></div> (or equivalent), never via.placeholder.com.
+6. COPY — Use exact visible text from the image (labels, placeholders, button labels, tab names).
+
+DESIGN RULES & GUIDELINES:
+- Hierarchy: one clear page title (h1), section labels as text-sm font-medium/font-semibold, body and placeholders visually subordinate.
+- Spacing rhythm: use consistent scale (p-4/p-6/p-8, gap-2/gap-4, mb-4/mb-6) — match the screenshot’s density; prefer generous card padding over cramped layouts.
+- Surfaces: page bg slightly off-white (bg-[#F5F5F5] or bg-gray-50); cards bg-white with subtle shadow (shadow-sm/shadow-md); borders border-gray-200/300 at low contrast.
+- Interactive states: buttons and tabs need hover/focus-visible styles (focus-visible:ring-2 focus-visible:ring-offset-2); disabled CTAs use muted gray, not saturated accent colours unless shown in the image.
+- Semantics: use header, main, nav, section, label, button type="button" — not div-onClick for controls.
+- Accessibility: every input/textarea has htmlFor/id pairing; icon-only controls get aria-label; min ~44px tap targets on primary actions (py-2.5+ or min-h-11).
+- Responsive: min-h-screen, max-w-* centered content, w-full inputs; avoid fixed widths that break on small screens.
+- Consistency: repeat the same radius, border, and text colour patterns across inputs, tabs, and buttons within one screen.
+- Polish: align items in toolbars (flex items-center justify-between); use tracking-tight on large headings; keep icon size proportional (h-4 w-4 with text-sm).
+
+CODE QUALITY & BUILD SAFETY (must pass a clean compile — treat this like automated tests):
+- JavaScript only: plain .jsx React — NO TypeScript (no types, interfaces, generics, \`: Type\`, \`as const\`, or .tsx syntax).
+- Output ONE complete, self-contained file: balanced \`{\`, \`}\`, \`(\`, \`)\`, all JSX tags properly closed, all strings terminated — never truncate mid-component or mid-tag.
+- Every symbol must be defined: import every component, hook, and icon you use; no undefined variables, handlers, or components.
+- Consolidate imports (one import line per package where possible); only import from "react", "lucide-react", and "react-icons/*" — no missing or hallucinated packages.
+- Valid React/JSX only: \`className\` not \`class\`; \`htmlFor\` not \`for\`; boolean/number props as expressions (e.g. rows={5} not rows="5" unless required); keys on mapped lists.
+- Handlers referenced in onClick/onChange must exist on the component; state variables used in JSX must be declared with useState.
+- Default export exactly one component at the end; component name must match the export.
+- No syntax errors, no incomplete ternaries, no dangling commas in invalid positions, no markdown fences wrapping the output.
+- Before finishing, mentally verify the file would build with Vite/CRA without errors.
+
+<examples_code>
+Reference only — do NOT output these tags or copy examples verbatim. Use them to learn correct vs incorrect patterns for screenshot-to-React conversion.
+
+WRONG — typical failures (never produce code like this):
+\`\`\`jsx
+// BAD: invented purple/blue palette, placeholder img, wrong tab pattern, rounded-lg everywhere, TS types, undefined handler
+import React, { useState } from 'react';
+import { Pencil } from 'lucide-react';
+
+const Page = (): JSX.Element => {
+  const [tab, setTab] = useState('Blog');
+  return (
+    <div className="bg-gray-100">
+      <img src="https://via.placeholder.com/32" alt="avatar" className="rounded-full" />
+      <div className="bg-white rounded-lg p-4">
+        <Pencil className="text-purple-600" />
+        <h1 className="text-3xl">Create Blog</h1>
+        <div className="border-b">
+          <button className={tab === 'Blog' ? 'bg-blue-100 text-blue-700' : ''} onClick={() => setTab('Blog')}>Blog</button>
+        </div>
+        <input className="rounded-lg border" placeholder="https://..." />
+        <button className="bg-purple-600 rounded-lg" onClick={handleGenerate}>Generate</button>
+      </div>
+    </div>
+  );
+};
+// Problems: TypeScript syntax; Pencil icon wrong for sparkle UI; via.placeholder.com; underline tabs not segmented pills;
+// purple/blue on monochrome design; rounded-lg on card/inputs; handleGenerate undefined; no label htmlFor; incomplete layout.
+\`\`\`
+
+GOOD — emulate this quality (adapt colours/radii/copy to YOUR screenshot):
+\`\`\`jsx
+import React, { useState } from 'react';
+import { Sparkles, FileText, Mail, Bot, Square, User, Plus } from 'lucide-react';
+
+export default function CreateBlogPage() {
+  const [activeTab, setActiveTab] = useState('Blog');
+  const [sourceUrl, setSourceUrl] = useState('');
+  const [prompt, setPrompt] = useState('');
+
+  const tabs = [
+    { id: 'Blog', icon: FileText, label: 'Blog' },
+    { id: 'Newsletter', icon: Mail, label: 'Newsletter' },
+    { id: 'AI', icon: Bot, label: 'AI' },
+    { id: 'Blank', icon: Square, label: 'Blank' },
+  ];
+
+  return (
+    <div className="min-h-screen bg-[#F5F5F5] font-sans">
+      <header className="flex items-center justify-between px-6 py-4">
+        <span className="text-lg font-semibold text-gray-900">inkgest</span>
+        <div className="flex items-center gap-3">
+          <button type="button" className="flex items-center gap-2 rounded-full bg-black px-4 py-2 text-sm font-medium text-white">
+            <Plus className="h-4 w-4" /> New draft
+          </button>
+          <span className="text-sm text-gray-600">Credits 27.75/30</span>
+          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gray-200">
+            <User className="h-4 w-4 text-gray-500" aria-hidden="true" />
+          </div>
+        </div>
+      </header>
+      <main className="mx-auto flex max-w-2xl justify-center px-4 py-8">
+        <section className="w-full rounded-3xl bg-white p-8 shadow-sm">
+          <div className="mb-2 flex items-center gap-2">
+            <Sparkles className="h-5 w-5 text-gray-900" />
+            <h1 className="text-2xl font-bold text-gray-900">Create Blog</h1>
+          </div>
+          <p className="mb-6 text-sm text-gray-500">Paste links, add a short brief to create your Blog post</p>
+          <div className="mb-6 flex rounded-full bg-gray-100 p-1">
+            {tabs.map(({ id, icon: Icon, label }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActiveTab(id)}
+                className={\`flex flex-1 items-center justify-center gap-2 rounded-full px-3 py-2 text-sm font-medium \${activeTab === id ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500'}\`}
+              >
+                <Icon className="h-4 w-4" /> {label}
+              </button>
+            ))}
+          </div>
+          <label htmlFor="source-url" className="mb-2 block text-sm font-medium text-gray-900">Source URLs</label>
+          <input
+            id="source-url"
+            type="url"
+            value={sourceUrl}
+            onChange={(e) => setSourceUrl(e.target.value)}
+            placeholder="https://..."
+            className="mb-2 w-full rounded-xl border border-gray-200 px-4 py-3 text-gray-900 placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300"
+          />
+          <button type="button" className="mb-6 text-sm font-medium text-gray-900">+ Add URL</button>
+          <label htmlFor="prompt" className="mb-2 block text-sm font-medium text-gray-900">Prompt</label>
+          <textarea
+            id="prompt"
+            rows={5}
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Describe tone, audience, and what you want (optional if URLs are enough)."
+            className="mb-8 w-full rounded-xl border border-gray-200 px-4 py-3 text-gray-900 placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300"
+          />
+          <button type="button" className="w-full rounded-full bg-gray-200 py-3 text-sm font-semibold text-gray-600">
+            Generate
+          </button>
+        </section>
+      </main>
+    </div>
+  );
+}
+// Good: JS only; complete file; monochrome palette from design; segmented pill tabs; rounded-3xl card + rounded-xl inputs;
+// rounded-full pills; Sparkles icon; User icon instead of placeholder img; labels with htmlFor; all handlers defined; default export.
+\`\`\`
+</examples_code>
+
+Forbidden shortcuts:
+- Do not substitute a "typical SaaS" palette (purple CTAs, blue links) when the screenshot uses neutral/gray styling.
+- Do not use rounded-lg as a default for every box — inspect each border radius in the image.
+- Do not use <img> with placeholder or stock URLs — swap image slots for lucide-react / react-icons.
+- Do not add UI elements absent from the image.
+
+Output the component code only.`;
+	const imageToCodeSystemPrompt = designThemeMeta
+		? `${IMAGE_TO_CODE_SYSTEM_PROMPT}\n\n${buildDesignThemePromptSection(designThemeMeta)}`
+		: IMAGE_TO_CODE_SYSTEM_PROMPT;
 	const imgToCodeMessages = [
 		{
 			role: "system",
-			content: `You are an expert React developer. Your task is to generate a single, complete React component based on the provided image and user prompt.
-
-Strict requirements:
-- Output only a single React component as raw JSX — no markdown fences, no explanations.
-- Use **Tailwind CSS** for all styling.
-- Use **lucide-react** and **react-icons** for any icons (import from these libraries as needed).
-- Do not use any other CSS frameworks or icon libraries.
-- The component must be self-contained, default-exported, and ready to render.
-- If the image contains interactive elements, implement them as functional React code.
-- Do not include any import for Tailwind CSS (assume it is globally available).
-- Only output the raw JSX component code, nothing else.`,
+			content: imageToCodeSystemPrompt,
 		},
 		{
 			role: "user",
@@ -9210,6 +9408,7 @@ Strict requirements:
 					stream: true,
 					messages: imgToCodeMessages,
 					temperature: 0.2,
+					max_tokens: 16_384,
 				}),
 			},
 		);
@@ -9325,6 +9524,12 @@ Strict requirements:
 			"Cache-Control": "no-cache",
 			Connection: "keep-alive",
 			"X-Accel-Buffering": "no",
+			...(designThemeMeta
+				? {
+						"X-Design-Theme-Key": designThemeMeta.key,
+						"X-Design-Theme-Name": designThemeMeta.name,
+					}
+				: {}),
 		},
 	});
 });
@@ -12235,7 +12440,7 @@ app.post("/api/codegen", async (c) => {
 	const systemPrompt = buildCodegenSystemPrompt(format, outputType);
 
 	const model =
-		modelOverride || process.env.CODEGEN_MODEL || "google/gemini-2.0-flash-001";
+		modelOverride || process.env.CODEGEN_MODEL || "google/gemini-2.5-flash-lite";
 
 	const codegenMessages = [
 		{ role: "system", content: systemPrompt },
@@ -12472,7 +12677,7 @@ app.post("/kixi/codegen", async (c) => {
 		c.req.query("model")?.trim() ||
 		process.env.KIXI_CODEGEN_MODEL ||
 		process.env.CODEGEN_MODEL ||
-		"google/gemini-2.0-flash-001";
+		"google/gemini-2.5-flash-lite";
 
 	const userMessage = await buildCodegenUserMessageFromUrl({
 		url,
@@ -12623,7 +12828,7 @@ app.post("/kixi/edit-codegen", async (c) => {
 		c.req.query("model")?.trim() ||
 		process.env.KIXI_EDIT_MODEL ||
 		process.env.CODEGEN_MODEL ||
-		"google/gemini-2.0-flash-001";
+		"google/gemini-2.5-flash-lite";
 
 	return streamOpenRouterCodegenSse(c, {
 		messages,
@@ -12637,6 +12842,11 @@ app.post("/kixi/edit-codegen", async (c) => {
 	});
 });
 
+// add create react component API
+// create variant of react component API using designs and system prompts
+// frontend stores and renders the component saved ones as well 
+// add auth layer to each API
+// frontend puts pricing layer on API usage-based credits
 
 // ─── G2 product search — multi-page scrape + chunked LLM extraction ───────────
 // POST /g2-product-search-research
@@ -13803,476 +14013,6 @@ app.post("/generate/:type", async (c) => {
 	}
 });
 
-// ─── /ai-resume-builder — LinkedIn + GitHub + projects → streamed resume code ──
-//
-// POST /ai-resume-builder
-// Body: {
-//   linkedinUrl?:  string,        // LinkedIn profile page
-//   githubUrl?:    string,        // GitHub profile (github.com/user) OR repo URL
-//   projectUrls?:  string[],      // portfolio / project pages (up to 5)
-//   prompt?:       string,        // extra style/colour/layout instructions
-//   format?:       "react"|"html" // default "react"
-// }
-//
-// Streams generated resume code as SSE:
-//   data: {"delta":"..."}   — incremental code chunk
-//   data: [DONE]            — stream complete
-//   data: {"error":"..."}   — on failure
-
-const RESUME_SYSTEM_PROMPT = `You are an elite frontend engineer specialising in beautiful, modern personal resumes and portfolio websites.
-You receive structured data scraped from a person's LinkedIn profile, GitHub account, and portfolio/project pages.
-Your task is to generate a stunning, fully self-contained personal resume page that showcases the person's real background.
-
-Output rules:
-- Output ONLY the raw code — no markdown fences, no explanations, no comments.
-- For "react" format: a single default-exported React functional component.
-  • Use Tailwind CSS utility classes for ALL styling — no inline styles, no separate CSS files.
-  • Import React at the top. The component must be renderable without any props.
-  • Add a Google Fonts <style> tag inside the component for any custom fonts used.
-- For "html" format: a complete HTML5 document with <script src="https://cdn.tailwindcss.com"></script>.
-  All styling must use Tailwind utility classes only.
-
-Design requirements:
-- Create a premium, visually distinctive layout — NOT a generic white paper resume.
-- Use a bold typographic hierarchy, generous spacing, and a coherent colour palette.
-- Sections to include (only if data is available): Hero/header with name + title,
-  About/Summary, Work Experience (company, role, dates, description), Education,
-  Skills (as visual tags or a grid), Projects (with links if available), GitHub stats
-  (repos, stars, top languages), and Contact links.
-- Use the person's ACTUAL data from the sources — do not invent or placeholder anything.
-- Make links (<a> tags) functional using the real URLs provided.
-- Do NOT output anything except the code itself.`;
-
-/** Detect whether a GitHub URL is a user profile or a repo, returning structured info. */
-function parseGitHubUrl(url) {
-	try {
-		const u = new URL(url);
-		if (u.hostname !== "github.com") return null;
-		const parts = u.pathname.replace(/^\//, "").split("/").filter(Boolean);
-		if (parts.length === 1) return { type: "user", username: parts[0] };
-		if (parts.length >= 2)
-			return { type: "repo", owner: parts[0], repo: parts[1] };
-		return null;
-	} catch {
-		return null;
-	}
-}
-
-app.post("/ai-resume-builder", async (c) => {
-	// ── Auth ──────────────────────────────────────────────────────────────────
-	const resumeAuthHdr =
-		c.req.header("Authorization") || c.req.header("authorization");
-	const resumeAuthToken = resumeAuthHdr?.startsWith("Bearer ")
-		? resumeAuthHdr.slice(7).trim()
-		: resumeAuthHdr?.trim();
-	if (!resumeAuthToken) {
-		return c.json(
-			{
-				error: "Authentication required",
-				code: "MISSING_AUTH_TOKEN",
-				details: "Provide a Bearer token in the Authorization header",
-			},
-			401,
-		);
-	}
-
-	// ── Rate limit (10 req / 10 min per IP) ──────────────────────────────────
-	const RESUME_RATE_LIMIT = 10;
-	const RESUME_RATE_WINDOW_MS = 10 * 60 * 1000;
-	const resumeIp =
-		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
-		c.req.header("x-real-ip") ||
-		c.req.header("cf-connecting-ip") ||
-		"unknown";
-	const resumeRl = rateLimit(
-		resumeIp,
-		RESUME_RATE_LIMIT,
-		RESUME_RATE_WINDOW_MS,
-	);
-	if (!resumeRl.allowed) {
-		c.header("Retry-After", String(resumeRl.retryAfter));
-		c.header("X-RateLimit-Limit", String(RESUME_RATE_LIMIT));
-		c.header("X-RateLimit-Remaining", "0");
-		c.header("X-RateLimit-Window", "10 minutes");
-		return c.json(
-			{
-				success: false,
-				error: "Rate limit exceeded",
-				retryAfter: resumeRl.retryAfter,
-			},
-			429,
-		);
-	}
-	c.header("X-RateLimit-Limit", String(RESUME_RATE_LIMIT));
-	c.header("X-RateLimit-Remaining", String(resumeRl.remaining));
-	c.header("X-RateLimit-Window", "10 minutes");
-
-	if (!process.env.OPENROUTER_API_KEY) {
-		return c.json(
-			{ error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" },
-			503,
-		);
-	}
-
-	let body;
-	try {
-		body = await c.req.json();
-	} catch {
-		return c.json({ error: "Invalid JSON body" }, 400);
-	}
-
-	const {
-		linkedinUrl = "",
-		githubUrl = "",
-		projectUrls = [],
-		prompt: extraPrompt = "",
-		format: rawFormat = "react",
-	} = body;
-
-	const format = rawFormat === "html" ? "html" : "react";
-
-	const isValidUrl = (u) => typeof u === "string" && /^https?:\/\//i.test(u);
-
-	if (
-		!isValidUrl(linkedinUrl) &&
-		!isValidUrl(githubUrl) &&
-		!projectUrls.some(isValidUrl)
-	) {
-		return c.json(
-			{
-				error: "Provide at least one of linkedinUrl, githubUrl, or projectUrls",
-			},
-			400,
-		);
-	}
-
-	// ── 1. Scrape all sources in parallel ────────────────────────────────────
-	const scrapeOpts = {
-		includeSemanticContent: true,
-		extractMetadata: true,
-		includeImages: true,
-		includeLinks: true,
-		timeout: 35_000,
-	};
-
-	const contextSections = [];
-
-	/** Scrape a URL with Puppeteer and return a formatted context block. */
-	async function scrapeToContext(url, label) {
-		try {
-			const result = await scrapeSingleUrlWithPuppeteer(url, scrapeOpts);
-			const d = result.data ?? {};
-			const md = result.markdown ?? "";
-			const sc = d.content?.semanticContent ?? {};
-
-			const headings = ["h1", "h2", "h3", "h4"]
-				.flatMap((t) =>
-					(d.content?.[t] ?? []).map((v) => `${t.toUpperCase()}: ${v}`),
-				)
-				.join("\n");
-
-			const paragraphs = (sc.paragraphs ?? [])
-				.filter(Boolean)
-				.slice(0, 60)
-				.join("\n");
-			const listItems = [
-				...(sc.unorderedLists ?? []).flat(),
-				...(sc.orderedLists ?? []).flat(),
-			]
-				.filter(Boolean)
-				.slice(0, 40)
-				.join("\n");
-
-			return [
-				`## ${label} — ${url}`,
-				d.title && `Title: ${d.title}`,
-				headings && `### Headings\n${headings}`,
-				paragraphs && `### Paragraphs\n${paragraphs}`,
-				listItems && `### List items\n${listItems}`,
-				md && `### Full markdown (truncated)\n${md.slice(0, 5_000)}`,
-			]
-				.filter(Boolean)
-				.join("\n\n");
-		} catch (err) {
-			console.warn(`[resume-builder] scrape failed for ${url}:`, err?.message);
-			return `## ${label} — ${url}\n(scrape failed: ${err?.message})`;
-		}
-	}
-
-	/** Fetch GitHub user data + top repos via GitHub API. */
-	async function fetchGitHubUserContext(username) {
-		const ghHeaders = {
-			Accept: "application/vnd.github.v3+json",
-			"User-Agent": "ai-resume-builder/1.0",
-			...(process.env.GITHUB_TOKEN
-				? { Authorization: `token ${process.env.GITHUB_TOKEN}` }
-				: {}),
-		};
-		const lines = [`## GitHub Profile — https://github.com/${username}`];
-		try {
-			const userRes = await fetch(`https://api.github.com/users/${username}`, {
-				headers: ghHeaders,
-				signal: AbortSignal.timeout(10_000),
-			});
-			if (userRes.ok) {
-				const u = await userRes.json();
-				if (u.name) lines.push(`Name: ${u.name}`);
-				if (u.bio) lines.push(`Bio: ${u.bio}`);
-				if (u.company) lines.push(`Company: ${u.company}`);
-				if (u.location) lines.push(`Location: ${u.location}`);
-				if (u.blog) lines.push(`Website: ${u.blog}`);
-				if (u.email) lines.push(`Email: ${u.email}`);
-				lines.push(
-					`Followers: ${u.followers ?? 0} | Following: ${u.following ?? 0} | Public repos: ${u.public_repos ?? 0}`,
-				);
-			}
-		} catch (e) {
-			lines.push(`(GitHub user API unavailable: ${e?.message})`);
-		}
-		try {
-			const reposRes = await fetch(
-				`https://api.github.com/users/${username}/repos?sort=stargazers&per_page=10&type=owner`,
-				{ headers: ghHeaders, signal: AbortSignal.timeout(10_000) },
-			);
-			if (reposRes.ok) {
-				const repos = await reposRes.json();
-				if (Array.isArray(repos) && repos.length > 0) {
-					lines.push("\n### Top Repositories");
-					for (const r of repos.slice(0, 8)) {
-						const desc = r.description ? ` — ${r.description}` : "";
-						const lang = r.language ? ` [${r.language}]` : "";
-						lines.push(
-							`- **${r.name}**${lang}${desc} | ⭐ ${r.stargazers_count ?? 0} | ${r.html_url}`,
-						);
-					}
-					// Collect unique languages
-					const langs = [
-						...new Set(repos.map((r) => r.language).filter(Boolean)),
-					];
-					if (langs.length > 0)
-						lines.push(`\n### Languages: ${langs.join(", ")}`);
-				}
-			}
-		} catch (e) {
-			lines.push(`(GitHub repos API unavailable: ${e?.message})`);
-		}
-		return lines.join("\n");
-	}
-
-	/** Fetch a GitHub repo and build context via analyzeRepo. */
-	async function fetchGitHubRepoContext(owner, repo) {
-		const lines = [`## GitHub Repo — https://github.com/${owner}/${repo}`];
-		try {
-			const ast = await analyzeRepo(owner, repo, undefined, {
-				maxFiles: 20,
-				maxDepth: 2,
-			});
-			if (ast) {
-				if (ast.description) lines.push(`Description: ${ast.description}`);
-				if (ast.language) lines.push(`Primary language: ${ast.language}`);
-				if (ast.stars) lines.push(`Stars: ${ast.stars}`);
-				if (ast.topics?.length) lines.push(`Topics: ${ast.topics.join(", ")}`);
-				if (ast.readme)
-					lines.push(
-						`\n### README (truncated)\n${String(ast.readme).slice(0, 3_000)}`,
-					);
-			}
-		} catch (e) {
-			lines.push(`(repo analysis failed: ${e?.message})`);
-		}
-		return lines.join("\n");
-	}
-
-	// Gather all async scrape tasks
-	const tasks = [];
-
-	if (isValidUrl(linkedinUrl)) {
-		tasks.push(scrapeToContext(linkedinUrl, "LinkedIn Profile"));
-	}
-
-	if (isValidUrl(githubUrl)) {
-		const parsed = parseGitHubUrl(githubUrl);
-		if (parsed?.type === "user") {
-			tasks.push(fetchGitHubUserContext(parsed.username));
-		} else if (parsed?.type === "repo") {
-			tasks.push(fetchGitHubRepoContext(parsed.owner, parsed.repo));
-		} else {
-			tasks.push(scrapeToContext(githubUrl, "GitHub"));
-		}
-	}
-
-	const validProjects = projectUrls.filter(isValidUrl).slice(0, 5);
-	for (const [i, pUrl] of validProjects.entries()) {
-		tasks.push(scrapeToContext(pUrl, `Project ${i + 1}`));
-	}
-
-	const settled = await Promise.allSettled(tasks);
-	for (const r of settled) {
-		if (r.status === "fulfilled" && r.value) contextSections.push(r.value);
-	}
-
-	if (contextSections.length === 0) {
-		return c.json(
-			{
-				error:
-					"All scraping attempts failed — no source data to build a resume from.",
-			},
-			422,
-		);
-	}
-
-	// ── 2. Build the full user message ───────────────────────────────────────
-	const userMessage = [
-		`Generate a ${format === "react" ? "React + Tailwind CSS component" : "complete Tailwind CSS HTML page"} for a personal resume/portfolio website.`,
-		"Use ALL the real data provided below. Do not use placeholder or lorem-ipsum text.",
-		"",
-		...contextSections,
-		extraPrompt && `\nExtra instructions from user: ${extraPrompt}`,
-	]
-		.filter((x) => x !== false && x !== undefined)
-		.join("\n\n");
-
-	const model =
-		process.env.RESUME_MODEL ||
-		process.env.CODEGEN_MODEL ||
-		"google/gemini-2.0-flash-001";
-
-	const resumeMessages = [
-		{ role: "system", content: RESUME_SYSTEM_PROMPT },
-		{ role: "user", content: userMessage },
-	];
-
-	// ── 3. Stream from OpenRouter ────────────────────────────────────────────
-	let openRouterRes;
-	try {
-		openRouterRes = await fetch(
-			"https://openrouter.ai/api/v1/chat/completions",
-			{
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-					"HTTP-Referer": "https://ihatereading.in",
-					"X-Title": "IHateReading AI Resume Builder",
-				},
-				body: JSON.stringify({
-					model,
-					stream: true,
-					messages: resumeMessages,
-					temperature: 0.25,
-					max_tokens: 8000,
-				}),
-			},
-		);
-	} catch (fetchErr) {
-		return c.json(
-			{ error: `Failed to reach OpenRouter: ${fetchErr.message}` },
-			502,
-		);
-	}
-
-	if (!openRouterRes.ok) {
-		let detail = `OpenRouter ${openRouterRes.status}`;
-		try {
-			const e = await openRouterRes.json();
-			detail = e?.error?.message || detail;
-		} catch {}
-		return c.json({ error: detail }, openRouterRes.status);
-	}
-
-	// ── 4. Pipe SSE stream back to client ────────────────────────────────────
-	const encoder = new TextEncoder();
-	const upstreamReader = openRouterRes.body.getReader();
-	const upstreamDecoder = new TextDecoder();
-
-	const outputStream = new ReadableStream({
-		async start(controller) {
-			let sseBuffer = "";
-			let streamUsageRaw = null;
-			let streamModel = model;
-			const sendMetaAndDone = () => {
-				controller.enqueue(
-					encoder.encode(
-						`data: ${JSON.stringify(
-							buildOpenRouterStreamClientMeta(
-								resumeMessages,
-								streamUsageRaw,
-								streamModel,
-							),
-						)}\n\n`,
-					),
-				);
-				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-				controller.close();
-			};
-			try {
-				while (true) {
-					const { done, value } = await upstreamReader.read();
-					if (done) break;
-
-					sseBuffer += upstreamDecoder.decode(value, { stream: true });
-					const lines = sseBuffer.split("\n");
-					sseBuffer = lines.pop();
-
-					for (const line of lines) {
-						const trimmed = line.trim();
-						if (!trimmed.startsWith("data: ")) continue;
-						const payload = trimmed.slice(6);
-						if (payload === "[DONE]") {
-							sendMetaAndDone();
-							return;
-						}
-						let parsed;
-						try {
-							parsed = JSON.parse(payload);
-						} catch {
-							continue;
-						}
-						if (parsed?.error) {
-							controller.enqueue(
-								encoder.encode(
-									`data: ${JSON.stringify({ error: parsed.error.message || "OpenRouter error" })}\n\n`,
-								),
-							);
-							controller.close();
-							return;
-						}
-						if (parsed?.usage) streamUsageRaw = parsed.usage;
-						if (parsed?.model) streamModel = parsed.model;
-						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
-						if (delta) {
-							controller.enqueue(
-								encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`),
-							);
-						}
-					}
-				}
-				sendMetaAndDone();
-			} catch (err) {
-				try {
-					controller.enqueue(
-						encoder.encode(
-							`data: ${JSON.stringify({ error: err?.message || "Stream error" })}\n\n`,
-						),
-					);
-					controller.close();
-				} catch {}
-			} finally {
-				try {
-					upstreamReader.releaseLock();
-				} catch {}
-			}
-		},
-	});
-
-	return new Response(outputStream, {
-		headers: {
-			"Content-Type": "text/event-stream",
-			"Cache-Control": "no-cache",
-			Connection: "keep-alive",
-		},
-	});
-});
 
 const port = 3002;
 console.log(`Server is running on port ${port}`);

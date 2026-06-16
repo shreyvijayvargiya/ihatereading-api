@@ -15,7 +15,7 @@ import { lightpanda } from "@lightpanda/browser";
 import puppeteer from "puppeteer-core";
 
 const LP_OPTS = { host: "127.0.0.1", port: 9222 };
-const MODEL = "google/gemini-2.0-flash-001";
+const MODEL = "google/gemini-2.5-flash-lite";
 
 // ── OpenRouter helper ──────────────────────────────────────────────────────────
 

@@ -491,7 +491,7 @@ app.post("/codegen-design", async (c) => {
 	const model =
 		c.req.query("model") ||
 		process.env.CODEGEN_MODEL ||
-		"google/gemini-2.0-flash-001";
+		"google/gemini-2.5-flash-lite";
 
 	const systemPrompt = buildDesignAwareSystemPrompt(format, outputType, {
 		siblingPage: hasReference,
@@ -620,7 +620,7 @@ app.post("/codegen-design/update", async (c) => {
 	const model =
 		c.req.query("model") ||
 		process.env.CODEGEN_MODEL ||
-		"google/gemini-2.0-flash-001";
+		"google/gemini-2.5-flash-lite";
 
 	const systemPrompt = buildDesignUpdateSystemPrompt(format, outputType);
 	const codeClipped = clipCodeForPrompt(existingCode, "existing code truncated");
