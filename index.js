@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import { firestore, storage } from "./config/firebase.js";
+import { firestore } from "./config/firebase.js";
 import { FieldValue } from "firebase-admin/firestore";
 import { createHash } from "node:crypto";
 import jwt from "jsonwebtoken";
@@ -79,9 +79,46 @@ import {
 import { GoogleGenAI } from "@google/genai";
 import {
 	buildDesignThemePromptSection,
+	buildImageToCodeRedesignMessages,
+	EXISTING_CODE_MIN_CHARS,
 	listDesignThemes,
+	listDesignThemesWithPreviews,
 	resolveImageToCodeDesignTheme,
 } from "./lib/imageToCodeDesignThemes.js";
+import {
+	IMAGE_TO_CODE_LUCIDE_POLICY,
+	sanitizeGeneratedReactCode,
+} from "./lib/sanitizeGeneratedReactCode.js";
+import {
+	buildDesignMdMessagesForApplyTheme,
+	buildDesignMdMessagesFromImage,
+	buildImageToCodeCombinedMeta,
+	buildImageToCodeCombinedMetaWithSource,
+	parseDesignMdFlag,
+	pipeDesignMdSseToClient,
+	runDeferredDesignMdStream,
+} from "./lib/imageToCodeDesignMd.js";
+import {
+	DEFAULT_IMAGE_TO_CODE_PROMPT,
+	parseFullPageFlag,
+	parseUrlCaptureFlag,
+	resolvePageUrlFromRequest,
+	validateHttpUrl,
+} from "./lib/imageToCodeUrlCapture.js";
+import {
+	capturePageScreenshot,
+	normalizeScreenshotViewport,
+} from "./lib/pageScreenshot.js";
+import {
+	applyStealthToPage,
+	extractNextDataMarkdown,
+	generateScreenshotHeaders,
+	recoverBlankSpaPage,
+	settlePageBeforeScreenshot,
+	waitForPaint,
+	waitForSpaHydration,
+	waitForVisiblePageContent,
+} from "./lib/prepareScreenshotPage.js";
 
 // Load .env from project root (same dir as this file) so it works regardless of cwd or platform
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -291,6 +328,312 @@ function buildOpenRouterStreamClientMeta(messages, usageRaw, modelId) {
 		model: modelId || openRouterResolvedModel({}),
 		aiPrompt: truncateMessagesForApiResponse(messages),
 	};
+}
+
+const CODEGEN_OPENING_FENCE_RE =
+	/^\s*```(?:jsx|javascript|js|react|tsx)?\s*\r?\n?/;
+const CODEGEN_CLOSING_FENCE_RE = /\r?\n?```\s*$/;
+/** Max suffix held to detect a closing ``` split across the last chunk(s). */
+const CODEGEN_CLOSING_FENCE_HOLD = 5;
+
+/** Remove markdown fences from a complete codegen string. */
+function stripCodegenMarkdownFences(text) {
+	let t = String(text ?? "");
+	t = t.replace(CODEGEN_OPENING_FENCE_RE, "");
+	t = t.replace(CODEGEN_CLOSING_FENCE_RE, "");
+	return t;
+}
+
+/**
+ * Stateful filter for SSE deltas — strips leading ```jsx / trailing ``` even when split across chunks.
+ */
+function createCodegenFenceStripper() {
+	let prefixBuf = "";
+	let prefixDone = false;
+	let suffixHold = "";
+
+	const emitWithSuffixHold = (chunk) => {
+		const combined = suffixHold + chunk;
+		if (combined.length <= CODEGEN_CLOSING_FENCE_HOLD) {
+			suffixHold = combined;
+			return "";
+		}
+		const emit = combined.slice(0, combined.length - CODEGEN_CLOSING_FENCE_HOLD);
+		suffixHold = combined.slice(combined.length - CODEGEN_CLOSING_FENCE_HOLD);
+		return emit;
+	};
+
+	const resolvePrefix = () => {
+		if (prefixDone) return "";
+		if (CODEGEN_OPENING_FENCE_RE.test(prefixBuf)) {
+			const rest = prefixBuf.replace(CODEGEN_OPENING_FENCE_RE, "");
+			prefixBuf = "";
+			prefixDone = true;
+			return emitWithSuffixHold(rest);
+		}
+		if (/^\s*```/.test(prefixBuf) && prefixBuf.length < 20) return "";
+		const out = prefixBuf;
+		prefixBuf = "";
+		prefixDone = true;
+		return emitWithSuffixHold(out);
+	};
+
+	return {
+		push(delta) {
+			if (!delta) return "";
+			if (!prefixDone) {
+				prefixBuf += delta;
+				return resolvePrefix();
+			}
+			return emitWithSuffixHold(delta);
+		},
+		flush() {
+			let tail = suffixHold;
+			suffixHold = "";
+			if (!prefixDone) {
+				tail = stripCodegenMarkdownFences(prefixBuf + tail);
+				prefixBuf = "";
+				prefixDone = true;
+			} else {
+				tail = tail.replace(CODEGEN_CLOSING_FENCE_RE, "");
+			}
+			return tail;
+		},
+	};
+}
+
+/** Emit any buffered codegen tail before closing the SSE stream. */
+function enqueueCodegenFenceTail(controller, encoder, fenceStripper) {
+	const tail = fenceStripper.flush();
+	if (tail) {
+		controller.enqueue(
+			encoder.encode(`data: ${JSON.stringify({ delta: tail })}\n\n`),
+		);
+	}
+}
+
+/** Stream OpenRouter chat completions as SSE { delta } chunks (image-to-code family). */
+async function streamOpenRouterChatAsSse(c, {
+	messages,
+	model,
+	temperature = 0.2,
+	max_tokens = 16_384,
+	session_id,
+	xTitle = "IHateReading Image-to-Code",
+	extraResponseHeaders = {},
+	designMd,
+}) {
+	const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+	if (!openRouterApiKey) {
+		return c.json(
+			{
+				error: "OpenRouter API key not configured",
+				code: "MISSING_API_KEY",
+			},
+			503,
+		);
+	}
+
+	let upstreamRes;
+	try {
+		upstreamRes = await fetch(
+			"https://openrouter.ai/api/v1/chat/completions",
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${openRouterApiKey}`,
+					"HTTP-Referer": "https://ihatereading.in",
+					"X-Title": xTitle,
+				},
+				body: JSON.stringify({
+					model,
+					stream: true,
+					messages,
+					temperature,
+					max_tokens,
+					...(session_id ? { session_id } : {}),
+				}),
+			},
+		);
+	} catch (fetchErr) {
+		return c.json(
+			{ error: `Failed to reach OpenRouter: ${fetchErr.message}` },
+			502,
+		);
+	}
+
+	if (!upstreamRes.ok) {
+		let detail = `OpenRouter ${upstreamRes.status}`;
+		try {
+			const errJson = await upstreamRes.json();
+			detail = errJson?.error?.message || detail;
+		} catch {}
+		return c.json({ error: detail }, upstreamRes.status);
+	}
+
+	const encoder = new TextEncoder();
+	const upstreamReader = upstreamRes.body.getReader();
+	const upstreamDecoder = new TextDecoder();
+
+	const outputStream = new ReadableStream({
+		async start(controller) {
+			let sseBuffer = "";
+			let streamUsageRaw = null;
+			let streamModel = model;
+			let assembledCode = "";
+			const fenceStripper = createCodegenFenceStripper();
+			const sendMetaAndDone = async () => {
+				const tail = fenceStripper.flush();
+				if (tail) {
+					assembledCode += tail;
+					controller.enqueue(
+						encoder.encode(`data: ${JSON.stringify({ delta: tail })}\n\n`),
+					);
+				}
+
+				let designMdResult = null;
+				let designMdMessagesUsed = designMd?.messages;
+
+				if (designMd?.deferred && designMd.buildMessages) {
+					const openRouterApiKey =
+						designMd.apiKey || process.env.OPENROUTER_API_KEY;
+					if (openRouterApiKey && assembledCode.trim()) {
+						try {
+							designMdMessagesUsed = designMd.buildMessages(assembledCode);
+							const deferred = await runDeferredDesignMdStream({
+								controller,
+								encoder,
+								apiKey: openRouterApiKey,
+								messages: designMdMessagesUsed,
+								model: designMd.model || model,
+								sessionId: designMd.sessionId,
+								xTitle: designMd.xTitle,
+							});
+							designMdResult = deferred.result;
+						} catch (deferredErr) {
+							console.warn(
+								"[apply-theme] deferred design MD failed:",
+								deferredErr?.message,
+							);
+							controller.enqueue(
+								encoder.encode(
+									`data: ${JSON.stringify({
+										type: "design_md_error",
+										error: deferredErr?.message || "Design MD generation failed",
+									})}\n\n`,
+								),
+							);
+						}
+					}
+				} else if (designMd?.upstreamRes || designMd?.upstreamResPromise) {
+					const mdUpstream =
+						designMd.upstreamRes ??
+						(await designMd.upstreamResPromise);
+					designMdResult = await pipeDesignMdSseToClient(
+						controller,
+						encoder,
+						mdUpstream,
+					);
+				}
+
+				controller.enqueue(
+					encoder.encode(
+						`data: ${JSON.stringify(
+							buildImageToCodeCombinedMeta({
+								codeMessages: messages,
+								codeUsageRaw: streamUsageRaw,
+								codeModel: streamModel,
+								designMdMessages: designMdMessagesUsed,
+								designMdResult,
+								normalizeUsage: normalizeOpenRouterUsageFromApi,
+								toTokenUsageCamel,
+								truncateMessages: truncateMessagesForApiResponse,
+							}),
+						)}\n\n`,
+					),
+				);
+				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+				controller.close();
+			};
+			try {
+				while (true) {
+					const { done, value } = await upstreamReader.read();
+					if (done) break;
+
+					sseBuffer += upstreamDecoder.decode(value, { stream: true });
+					const lines = sseBuffer.split("\n");
+					sseBuffer = lines.pop();
+
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed.startsWith("data: ")) continue;
+
+						const payload = trimmed.slice(6);
+						if (payload === "[DONE]") {
+							sendMetaAndDone();
+							return;
+						}
+
+						let parsed;
+						try {
+							parsed = JSON.parse(payload);
+						} catch {
+							continue;
+						}
+
+						if (parsed?.error) {
+							controller.enqueue(
+								encoder.encode(
+									`data: ${JSON.stringify({ error: parsed.error.message || "OpenRouter error" })}\n\n`,
+								),
+							);
+							controller.close();
+							return;
+						}
+
+						if (parsed?.usage) streamUsageRaw = parsed.usage;
+						if (parsed?.model) streamModel = parsed.model;
+
+						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
+						if (delta) {
+							const cleaned = fenceStripper.push(delta);
+							if (cleaned) {
+								assembledCode += cleaned;
+								controller.enqueue(
+									encoder.encode(`data: ${JSON.stringify({ delta: cleaned })}\n\n`),
+								);
+							}
+						}
+					}
+				}
+
+				sendMetaAndDone();
+			} catch (err) {
+				try {
+					controller.enqueue(
+						encoder.encode(
+							`data: ${JSON.stringify({ error: err.message })}\n\n`,
+						),
+					);
+					controller.close();
+				} catch {}
+			} finally {
+				upstreamReader.releaseLock();
+			}
+		},
+	});
+
+	return new Response(outputStream, {
+		status: 200,
+		headers: {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache",
+			Connection: "keep-alive",
+			"X-Accel-Buffering": "no",
+			...extraResponseHeaders,
+		},
+	});
 }
 
 /** Append to inkgest-agent state for observability. */
@@ -7182,9 +7525,9 @@ app.post("/inkgest-agent", async (c) => {
 // give me simple git repo
 
 const SCREENSHOT_VIEWPORT_MAP = {
-	desktop: { width: 1920, height: 1080, scale: 1 },
-	tablet: { width: 1024, height: 768, scale: 1 },
-	mobile: { width: 375, height: 667, scale: 1 },
+	desktop: normalizeScreenshotViewport("desktop"),
+	tablet: normalizeScreenshotViewport("tablet"),
+	mobile: normalizeScreenshotViewport("mobile"),
 };
 
 /**
@@ -7196,141 +7539,166 @@ async function captureOneScreenshotWithPage(page, options) {
 	const {
 		url,
 		device = "desktop",
-		waitUntil = "domcontentloaded",
+		waitUntil = "load",
 		waitForSelector,
 		timeout = 50000,
-		contentReadyTimeout = 12000,
-		postLoadWaitMs = 1200,
+		contentReadyTimeout = 20000,
+		postLoadWaitMs = 2500,
 		fullPage = false,
 		coords,
 		blockDistractions = true,
+		fastCapture = false,
+		skipMarkdown = false,
 	} = options;
 
 	const viewport =
 		SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop;
-	await page.setViewport(viewport);
-	await page.setUserAgent(userAgents.random().toString());
-	await page.setExtraHTTPHeaders({
-		dnt: "1",
-		"upgrade-insecure-requests": "1",
-		accept:
-			"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-		"sec-fetch-site": "none",
-		"sec-fetch-mode": "navigate",
-		"sec-fetch-user": "?1",
-		"sec-fetch-dest": "document",
-		"accept-language": "en-US,en;q=0.9",
-	});
-	await page.setRequestInterception(true);
-	await page.setJavaScriptEnabled(true);
-	page.on("request", (req) => req.continue());
+	const navTimeout = fastCapture ? Math.min(timeout, 30_000) : timeout;
+	const readyTimeout = fastCapture
+		? Math.min(contentReadyTimeout, 8_000)
+		: Math.min(contentReadyTimeout, timeout);
+	const settleMs = fastCapture ? Math.min(postLoadWaitMs, 800) : postLoadWaitMs;
 
-	await page.goto(url, { waitUntil, timeout });
+	const { userAgent, extraHTTPHeaders } = generateScreenshotHeaders();
+
+	await applyStealthToPage(page);
+	await page.setViewport({
+		width: viewport.width,
+		height: viewport.height,
+		deviceScaleFactor: viewport.deviceScaleFactor ?? 1,
+	});
+	await page.setUserAgent(userAgent);
+	await page.setExtraHTTPHeaders(extraHTTPHeaders);
+	await page.setJavaScriptEnabled(true);
+
+	const navWaitUntil =
+		waitUntil === "domcontentloaded" && !fastCapture ? "load" : waitUntil;
+
+	await page.goto(url, { waitUntil: navWaitUntil, timeout: navTimeout });
+
+	await waitForSpaHydration(page, {
+		timeout: fastCapture ? 20_000 : 45_000,
+	});
 
 	if (waitForSelector) {
 		try {
-			await page.waitForSelector(waitForSelector, { timeout: 10000 });
+			await page.waitForSelector(waitForSelector, {
+				timeout: fastCapture ? 8_000 : 12_000,
+			});
 		} catch {}
 	}
 
-	// Guard against blank screenshots: wait until DOM has meaningful content.
-	try {
-		await page.waitForFunction(
-			() => {
-				const rs = document.readyState;
-				const body = document.body;
-				if (!body) return false;
-				const rect = body.getBoundingClientRect();
-				const textLen = (body.innerText || "").trim().length;
-				const hasMedia =
-					document.images.length > 0 || document.querySelector("video, canvas");
-				return (
-					(rs === "interactive" || rs === "complete") &&
-					rect.width > 0 &&
-					rect.height > 0 &&
-					(textLen > 80 || hasMedia)
-				);
-			},
-			{ timeout: Math.min(contentReadyTimeout, timeout) },
-		);
-	} catch {}
+	let contentStats = await waitForVisiblePageContent(page, {
+		timeout: readyTimeout,
+		minTextLength: fastCapture ? 20 : 40,
+	});
 
-	// Give SPAs/lazy sections one extra beat to render.
-	if (postLoadWaitMs > 0) {
-		await new Promise((r) => setTimeout(r, postLoadWaitMs));
+	if (
+		contentStats.textLen < 20 &&
+		!contentStats.hasMedia &&
+		contentStats.visibleNodes < 5
+	) {
+		console.warn(
+			`[screenshot] sparse content (${contentStats.textLen} chars) for ${url}, reloading…`,
+		);
+		contentStats = await recoverBlankSpaPage(page, {
+			timeout: fastCapture ? 25_000 : 45_000,
+		});
 	}
+
+	if (settleMs > 0) {
+		await new Promise((r) => setTimeout(r, settleMs));
+	}
+
+	await settlePageBeforeScreenshot(page);
 
 	if (blockDistractions && BLOCK_DISTRACTIONS_CSS) {
 		await page.addStyleTag({ content: BLOCK_DISTRACTIONS_CSS }).catch(() => {});
-		await new Promise((r) => setTimeout(r, 200));
+		await new Promise((r) => setTimeout(r, fastCapture ? 100 : 250));
 	}
 
-	let screenshotOptions = { optimizeForSpeed: true, encoding: "binary" };
-	if (fullPage) {
-		screenshotOptions.fullPage = true;
-	} else if (
+	await waitForPaint(page);
+
+	const clip =
 		coords &&
 		typeof coords.x === "number" &&
 		typeof coords.y === "number" &&
 		typeof coords.width === "number" &&
-		typeof coords.height === "number"
-	) {
-		screenshotOptions.clip = {
-			x: coords.x,
-			y: coords.y,
-			width: coords.width,
-			height: coords.height,
-		};
-	} else {
-		screenshotOptions.clip = {
-			x: 0,
-			y: 0,
-			width: viewport.width,
-			height: viewport.height,
-		};
-	}
-	const buffer = await page.screenshot(screenshotOptions);
+		typeof coords.height === "number" &&
+		coords.width > 0 &&
+		coords.height > 0
+			? {
+					x: coords.x,
+					y: coords.y,
+					width: coords.width,
+					height: coords.height,
+				}
+			: null;
 
-	const pageHtml = await page.content();
-	const dom = new JSDOM(pageHtml);
-	const doc = dom.window.document;
-	const remove = [
-		"script",
-		"style",
-		"noscript",
-		".ad",
-		".ads",
-		"#ad",
-		".cookie",
-		"#cookie",
-		"[class*='consent']",
-		"[id*='consent']",
-		"[class*='intercom']",
-		"[class*='chat-widget']",
-	];
-	remove.forEach((sel) =>
-		doc.querySelectorAll(sel).forEach((el) => el.remove()),
-	);
-	const { markdown } = extractSemanticContentWithFormattedMarkdown(doc.body);
+	let buffer;
+	try {
+		buffer = await capturePageScreenshot(page, { fullPage, clip });
+	} catch (captureErr) {
+		if (options._captureRetried) throw captureErr;
+		console.warn(
+			"[screenshot] capture failed, retrying with minimal viewport:",
+			captureErr?.message,
+		);
+		await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
+		await new Promise((r) => setTimeout(r, 300));
+		buffer = await capturePageScreenshot(page, { fullPage: false });
+	}
+
+	let markdown = "";
+	if (!skipMarkdown) {
+		const pageHtml = await page.content();
+		const dom = new JSDOM(pageHtml);
+		const doc = dom.window.document;
+		const remove = [
+			"script",
+			"style",
+			"noscript",
+			".ad",
+			".ads",
+			"#ad",
+			".cookie",
+			"#cookie",
+			"[class*='consent']",
+			"[id*='consent']",
+			"[class*='intercom']",
+			"[class*='chat-widget']",
+		];
+		remove.forEach((sel) =>
+			doc.querySelectorAll(sel).forEach((el) => el.remove()),
+		);
+		({ markdown } = extractSemanticContentWithFormattedMarkdown(doc.body));
+		if (!markdown?.trim()) {
+			const fallback = await extractNextDataMarkdown(page);
+			if (fallback) markdown = fallback;
+		}
+	}
 
 	let metadata = {};
-	try {
-		metadata = await page.evaluate(() => {
-			const data = {};
-			document.querySelectorAll("meta").forEach((meta) => {
-				const n = meta.getAttribute("name") || meta.getAttribute("property");
-				const c = meta.getAttribute("content");
-				if (n && c) data[n] = c;
+	if (!skipMarkdown) {
+		try {
+			metadata = await page.evaluate(() => {
+				const data = {};
+				document.querySelectorAll("meta").forEach((meta) => {
+					const n = meta.getAttribute("name") || meta.getAttribute("property");
+					const c = meta.getAttribute("content");
+					if (n && c) data[n] = c;
+				});
+				return data;
 			});
-			return data;
-		});
-	} catch {}
+		} catch {}
+	}
 
 	return {
 		buffer,
 		metadata,
 		markdown,
 		dimensions: { width: viewport.width, height: viewport.height },
+		contentStats,
 	};
 }
 
@@ -7339,12 +7707,12 @@ app.post("/take-screenshot", async (c) => {
 	try {
 		const {
 			url,
-			fullPage,
+			fullPage = false,
 			coords,
 			waitForSelector,
 			timeout = 50000,
 			device = "desktop",
-			waitUntil = "domcontentloaded",
+			waitUntil = "load",
 			blockDistractions = true,
 		} = await c.req.json();
 
@@ -7371,7 +7739,7 @@ app.post("/take-screenshot", async (c) => {
 			);
 		}
 
-		const { buffer, metadata, markdown, dimensions } =
+		const { buffer, metadata, markdown, dimensions, contentStats } =
 			await browserPool.withPage((page) =>
 				captureOneScreenshotWithPage(page, {
 					url,
@@ -7379,23 +7747,13 @@ app.post("/take-screenshot", async (c) => {
 					waitUntil,
 					waitForSelector,
 					timeout,
-					fullPage,
+					fullPage: parseFullPageFlag(fullPage),
 					coords,
 					blockDistractions,
 				}),
 			);
 
-		const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
-		const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-		const file = bucket.file(`ihr-website-screenshot/${uniqueFileName}`);
-		await file.save(buffer, {
-			metadata: {
-				contentType: "image/png",
-				cacheControl: "public, max-age=3600",
-			},
-		});
-		await file.makePublic();
-		const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+		const screenshotUrl = await uploadScreenshotBuffer(buffer);
 
 		return c.json({
 			success: true,
@@ -7404,6 +7762,17 @@ app.post("/take-screenshot", async (c) => {
 			metadata,
 			screenshot: screenshotUrl,
 			dimensions,
+			contentReady: contentStats
+				? {
+						textLength: contentStats.textLen,
+						visibleNodes: contentStats.visibleNodes,
+						hasMedia: contentStats.hasMedia,
+						likelyBlank:
+							contentStats.textLen < 20 &&
+							!contentStats.hasMedia &&
+							contentStats.visibleNodes < 5,
+					}
+				: undefined,
 			timestamp: new Date().toISOString(),
 		});
 	} catch (error) {
@@ -7427,8 +7796,9 @@ app.post("/take-screenshot-multiple", async (c) => {
 			device = "desktop",
 			waitForSelector,
 			timeout = 45000,
-			waitUntil = "domcontentloaded",
+			waitUntil = "load",
 			blockDistractions = true,
+			fullPage = false,
 		} = await c.req.json();
 
 		if (!Array.isArray(urls) || urls.length === 0) {
@@ -7451,6 +7821,7 @@ app.post("/take-screenshot-multiple", async (c) => {
 			timeout,
 			waitUntil,
 			blockDistractions,
+			fullPage: parseFullPageFlag(fullPage),
 		};
 		const results = await Promise.all(
 			list.map((url) =>
@@ -7459,19 +7830,7 @@ app.post("/take-screenshot-multiple", async (c) => {
 						captureOneScreenshotWithPage(page, { ...opts, url }),
 					)
 					.then(async ({ buffer, metadata, markdown, dimensions }) => {
-						const uniqueFileName = `screenshots/${Date.now()}-${uuidv4().replace(/[^a-zA-Z0-9]/g, "")}.png`;
-						const bucket = storage.bucket(process.env.FIREBASE_BUCKET);
-						const file = bucket.file(
-							`ihr-website-screenshot/${uniqueFileName}`,
-						);
-						await file.save(buffer, {
-							metadata: {
-								contentType: "image/png",
-								cacheControl: "public, max-age=3600",
-							},
-						});
-						await file.makePublic();
-						const screenshotUrl = `https://storage.googleapis.com/${process.env.FIREBASE_BUCKET}/${file.name}`;
+						const screenshotUrl = await uploadScreenshotBuffer(buffer);
 						return {
 							url,
 							screenshot: screenshotUrl,
@@ -7558,6 +7917,43 @@ async function uploadScreenshotBuffer(buffer) {
 	return response.data.ufsUrl;
 }
 
+/** Screenshot a live page for image-to-code (viewport capture + public URL). */
+async function captureUrlScreenshotForImageToCode(pageUrl, options = {}) {
+	const {
+		device = "desktop",
+		fullPage = false,
+		timeout = fullPage ? 50_000 : 40_000,
+		waitForSelector,
+		waitUntil = "load",
+	} = options;
+
+	const { buffer } = await browserPool.withPage((page) =>
+		captureOneScreenshotWithPage(page, {
+			url: pageUrl,
+			device,
+			waitUntil,
+			waitForSelector,
+			timeout,
+			fullPage,
+			fastCapture: false,
+			skipMarkdown: true,
+			blockDistractions: true,
+			contentReadyTimeout: 25_000,
+			postLoadWaitMs: 2_000,
+		}),
+	);
+
+	const base64 = Buffer.from(buffer).toString("base64");
+	const screenshotUrl = await uploadScreenshotBuffer(buffer);
+
+	return {
+		base64,
+		mimeType: "image/png",
+		screenshotUrl,
+		pageUrl,
+	};
+}
+
 async function uploadWavBuffer(buffer, fileName) {
 	const name =
 		fileName ||
@@ -7580,7 +7976,7 @@ async function smartCaptureScreenshot(url, options = {}) {
 		contentReadyTimeout = 12000,
 		postLoadWaitMs = 1200,
 		blockDistractions = true,
-		fullPage = true,
+		fullPage = false,
 		coords,
 		forceMode,
 		useProxy = true,
@@ -7686,7 +8082,7 @@ app.post("/screenshot", async (c) => {
 			contentReadyTimeout = 12000,
 			postLoadWaitMs = 1200,
 			blockDistractions = true,
-			fullPage = true,
+			fullPage = false,
 			coords,
 			forceMode,
 			useProxy = true,
@@ -7705,7 +8101,7 @@ app.post("/screenshot", async (c) => {
 			contentReadyTimeout,
 			postLoadWaitMs,
 			blockDistractions,
-			fullPage,
+			fullPage: parseFullPageFlag(fullPage),
 			coords,
 			forceMode,
 			useProxy,
@@ -7740,7 +8136,7 @@ app.post("/screenshot-multiple", async (c) => {
 			contentReadyTimeout = 12000,
 			postLoadWaitMs = 1200,
 			blockDistractions = true,
-			fullPage = true,
+			fullPage = false,
 			coords,
 			forceMode,
 			useProxy = true,
@@ -7772,7 +8168,7 @@ app.post("/screenshot-multiple", async (c) => {
 					contentReadyTimeout,
 					postLoadWaitMs,
 					blockDistractions,
-					fullPage,
+					fullPage: parseFullPageFlag(fullPage),
 					coords,
 					forceMode,
 					useProxy,
@@ -9040,9 +9436,30 @@ app.post("/scrape-git", async (c) => {
 
 export default app;
 
+const THEME_HTML_DIR = path.join(
+	__dirname,
+	"ai-examples/htmlTemplates",
+);
+
+/** GET /image-to-code/theme-preview/:filename — static themed landing previews for frontend iframes */
+app.get("/image-to-code/theme-preview/:filename", async (c) => {
+	const filename = c.req.param("filename");
+	if (!/^[\w-]+\.html$/.test(filename)) {
+		return c.text("Not found", 404);
+	}
+	const filePath = path.join(THEME_HTML_DIR, filename);
+	try {
+		const html = await fsp.readFile(filePath, "utf-8");
+		return c.html(html);
+	} catch {
+		return c.text("Preview not found. Run npm run generate:theme-landings.", 404);
+	}
+});
+
 /** GET /image-to-code/design-themes — keys match ai-examples/simba-ui-ux/prompts/prompts.js for frontend dropdowns */
-app.get("/image-to-code/design-themes", (c) => {
-	return c.json({ themes: listDesignThemes() });
+app.get("/image-to-code/design-themes", async (c) => {
+	const themes = await listDesignThemesWithPreviews(THEME_HTML_DIR);
+	return c.json({ themes });
 });
 
 app.post("/image-to-code", async (c) => {
@@ -9099,14 +9516,26 @@ app.post("/image-to-code", async (c) => {
 	let imageUrl;
 	let prompt;
 	let designTheme;
+	let generateDesignMd;
+	let captureFromUrl;
+	let pageUrl;
+	let screenshotDevice;
+	let screenshotFullPage = false;
 	let base64Data;
 	let mimeType;
+	let requestFields = {};
 
 	if (contentType.includes("application/json")) {
 		const body = await c.req.json();
+		requestFields = body;
 		imageUrl = body.imageUrl;
 		prompt = body.prompt;
 		designTheme = body.designTheme;
+		generateDesignMd = parseDesignMdFlag(body.designMd, body.generateDesignMd);
+		captureFromUrl = parseUrlCaptureFlag(body.url, body.captureFromUrl, body.fromUrl);
+		pageUrl = resolvePageUrlFromRequest(body);
+		screenshotDevice = body.device || body.screenshotDevice;
+		screenshotFullPage = parseFullPageFlag(body.fullPage, body.full_page);
 	} else if (contentType.includes("multipart/form-data")) {
 		try {
 			const formData = await c.req.formData();
@@ -9123,6 +9552,30 @@ app.post("/image-to-code", async (c) => {
 			imageUrl = formData.get("imageUrl");
 			prompt = formData.get("prompt");
 			designTheme = formData.get("designTheme");
+			generateDesignMd = parseDesignMdFlag(
+				formData.get("designMd"),
+				formData.get("generateDesignMd"),
+			);
+			requestFields = {
+				url: formData.get("url"),
+				pageUrl: formData.get("pageUrl"),
+				websiteUrl: formData.get("websiteUrl"),
+				targetUrl: formData.get("targetUrl"),
+				siteUrl: formData.get("siteUrl"),
+				captureFromUrl: formData.get("captureFromUrl"),
+				fromUrl: formData.get("fromUrl"),
+			};
+			captureFromUrl = parseUrlCaptureFlag(
+				formData.get("url"),
+				formData.get("captureFromUrl"),
+				formData.get("fromUrl"),
+			);
+			pageUrl = resolvePageUrlFromRequest(requestFields);
+			screenshotDevice = formData.get("device") || formData.get("screenshotDevice");
+			screenshotFullPage = parseFullPageFlag(
+				formData.get("fullPage"),
+				formData.get("full_page"),
+			);
 		} catch {
 			return c.json(
 				{
@@ -9138,6 +9591,30 @@ app.post("/image-to-code", async (c) => {
 		imageUrl = params.get("imageUrl");
 		prompt = params.get("prompt");
 		designTheme = params.get("designTheme");
+		generateDesignMd = parseDesignMdFlag(
+			params.get("designMd"),
+			params.get("generateDesignMd"),
+		);
+		requestFields = {
+			url: params.get("url"),
+			pageUrl: params.get("pageUrl"),
+			websiteUrl: params.get("websiteUrl"),
+			targetUrl: params.get("targetUrl"),
+			siteUrl: params.get("siteUrl"),
+			captureFromUrl: params.get("captureFromUrl"),
+			fromUrl: params.get("fromUrl"),
+		};
+		captureFromUrl = parseUrlCaptureFlag(
+			params.get("url"),
+			params.get("captureFromUrl"),
+			params.get("fromUrl"),
+		);
+		pageUrl = resolvePageUrlFromRequest(requestFields);
+		screenshotDevice = params.get("device") || params.get("screenshotDevice");
+		screenshotFullPage = parseFullPageFlag(
+			params.get("fullPage"),
+			params.get("full_page"),
+		);
 	} else {
 		return c.json(
 			{ error: "Unsupported Content-Type. Use JSON or multipart/form-data." },
@@ -9145,8 +9622,10 @@ app.post("/image-to-code", async (c) => {
 		);
 	}
 
-	if (!prompt) {
-		return c.json({ error: "prompt is required" }, 400);
+	if (!prompt || !String(prompt).trim()) {
+		prompt = DEFAULT_IMAGE_TO_CODE_PROMPT;
+	} else {
+		prompt = String(prompt).trim();
 	}
 
 	let designThemeMeta = null;
@@ -9167,11 +9646,61 @@ app.post("/image-to-code", async (c) => {
 		designThemeMeta = resolved;
 	}
 
-	// ── Resolve image → base64 ────────────────────────────────────────────────
-	if (!base64Data) {
+	// ── Resolve image: file | page URL screenshot | imageUrl fetch ───────────
+	let sourceCapture = null;
+	const shouldCapturePage =
+		!base64Data &&
+		(captureFromUrl || (pageUrl && !imageUrl));
+
+	if (shouldCapturePage) {
+		if (!pageUrl) {
+			return c.json(
+				{
+					error:
+						"When url/captureFromUrl is true, provide a page URL via pageUrl, websiteUrl, targetUrl, or url (https://...).",
+					code: "MISSING_PAGE_URL",
+				},
+				400,
+			);
+		}
+		const urlCheck = validateHttpUrl(pageUrl);
+		if (!urlCheck.ok) {
+			return c.json({ error: urlCheck.error, code: "INVALID_PAGE_URL" }, 400);
+		}
+		try {
+			const captured = await captureUrlScreenshotForImageToCode(urlCheck.href, {
+				device:
+					typeof screenshotDevice === "string" && screenshotDevice.trim()
+						? screenshotDevice.trim()
+						: "desktop",
+				fullPage: screenshotFullPage,
+			});
+			base64Data = captured.base64;
+			mimeType = captured.mimeType;
+			sourceCapture = {
+				pageUrl: captured.pageUrl,
+				screenshotUrl: captured.screenshotUrl,
+			};
+			imageUrl = captured.screenshotUrl;
+		} catch (captureErr) {
+			console.error("[image-to-code] URL screenshot failed:", captureErr);
+			return c.json(
+				{
+					error: "Failed to capture screenshot from URL",
+					code: "SCREENSHOT_CAPTURE_FAILED",
+					details: captureErr?.message,
+				},
+				502,
+			);
+		}
+	} else if (!base64Data) {
 		if (!imageUrl) {
 			return c.json(
-				{ error: "Provide either an image file (field: image) or imageUrl" },
+				{
+					error:
+						"Provide an image file (image), imageUrl, or set url: true with a page URL (pageUrl / websiteUrl).",
+					code: "MISSING_IMAGE_INPUT",
+				},
 				400,
 			);
 		}
@@ -9196,15 +9725,17 @@ app.post("/image-to-code", async (c) => {
 		);
 	}
 
-	const imgToCodeModel = "google/gemini-3.5-flash";
+	const imgToCodeModel = "google/gemini-2.5-flash";
 	const IMAGE_TO_CODE_SYSTEM_PROMPT = `You are an expert frontend engineer specialising in pixel-accurate UI reproduction from screenshots.
 Generate ONE default-exported React functional component that visually matches the provided image as closely as possible.
 
 OUTPUT FORMAT (strict):
 - Output ONLY raw JSX/TS-free React code — no markdown fences, no explanations, no comments.
+- NEVER wrap output in markdown code fences. Forbidden: \`\`\`jsx, \`\`\`javascript, \`\`\`js, \`\`\`react, or any \`\`\` line. Do NOT start with \`\`\` or end with \`\`\`.
+- First line MUST be valid code (import, const, or function). Last line MUST be export default — never a closing fence.
 - Import React and hooks as needed. Default-export the component.
 - Tailwind CSS utility classes only — no inline styles, no separate CSS files, no Tailwind import.
-- Icons: lucide-react and react-icons only. Pick icons that match the screenshot shape (e.g. Sparkles not Pencil if the image shows a sparkle).
+- ${IMAGE_TO_CODE_LUCIDE_POLICY}
 - Implement interactive elements (tabs, inputs, buttons) with useState where visible in the image.
 
 VISUAL FIDELITY (critical — read the image before writing any className):
@@ -9224,8 +9755,8 @@ VISUAL FIDELITY (critical — read the image before writing any className):
    - Segmented tab bars (pill container + white active segment) are NOT the same as underline/border-bottom tabs — match the pattern shown.
    - Header/nav: reproduce left/right groups, pill buttons, credit chips, and avatar placement.
 5. ASSETS & IMAGES IN THE SCREENSHOT — Never use <img src="https://via.placeholder.com/...">, picsum, unsplash, or any invented external image URL.
-   - If the input image shows photos, avatars, thumbnails, or logos: represent them with lucide-react or react-icons (e.g. User in a rounded-full bg-gray-200 container for profile avatars; Image or FileImage for content thumbnails) — NOT placeholder <img> tags.
-   - Decorative or functional icons in the design → lucide-react / react-icons imports matching the visual.
+   - If the input image shows photos, avatars, thumbnails, or logos: represent them with lucide-react icons (e.g. User in a rounded-full bg-gray-200 container for profile avatars; Image or FileImage for content thumbnails) — NOT placeholder <img> tags.
+   - Decorative or functional icons in the design → lucide-react imports only.
    - Gray circular avatar placeholders → <div className="rounded-full bg-gray-200 flex items-center justify-center"><User className="h-4 w-4 text-gray-500" /></div> (or equivalent), never via.placeholder.com.
 6. COPY — Use exact visible text from the image (labels, placeholders, button labels, tab names).
 
@@ -9244,7 +9775,7 @@ CODE QUALITY & BUILD SAFETY (must pass a clean compile — treat this like autom
 - JavaScript only: plain .jsx React — NO TypeScript (no types, interfaces, generics, \`: Type\`, \`as const\`, or .tsx syntax).
 - Output ONE complete, self-contained file: balanced \`{\`, \`}\`, \`(\`, \`)\`, all JSX tags properly closed, all strings terminated — never truncate mid-component or mid-tag.
 - Every symbol must be defined: import every component, hook, and icon you use; no undefined variables, handlers, or components.
-- Consolidate imports (one import line per package where possible); only import from "react", "lucide-react", and "react-icons/*" — no missing or hallucinated packages.
+- Consolidate imports (one import line per package where possible); only import from "react" and "lucide-react" — no react-icons, no missing or hallucinated packages.
 - Valid React/JSX only: \`className\` not \`class\`; \`htmlFor\` not \`for\`; boolean/number props as expressions (e.g. rows={5} not rows="5" unless required); keys on mapped lists.
 - Handlers referenced in onClick/onChange must exist on the component; state variables used in JSX must be declared with useState.
 - Default export exactly one component at the end; component name must match the export.
@@ -9366,31 +9897,54 @@ export default function CreateBlogPage() {
 Forbidden shortcuts:
 - Do not substitute a "typical SaaS" palette (purple CTAs, blue links) when the screenshot uses neutral/gray styling.
 - Do not use rounded-lg as a default for every box — inspect each border radius in the image.
-- Do not use <img> with placeholder or stock URLs — swap image slots for lucide-react / react-icons.
+- Do not use <img> with placeholder or stock URLs — swap image slots for lucide-react icons.
 - Do not add UI elements absent from the image.
 
-Output the component code only.`;
-	const imageToCodeSystemPrompt = designThemeMeta
-		? `${IMAGE_TO_CODE_SYSTEM_PROMPT}\n\n${buildDesignThemePromptSection(designThemeMeta)}`
-		: IMAGE_TO_CODE_SYSTEM_PROMPT;
-	const imgToCodeMessages = [
-		{
-			role: "system",
-			content: imageToCodeSystemPrompt,
-		},
-		{
-			role: "user",
-			content: [
-				{ type: "text", text: prompt },
+Output the component code only — raw React source, never wrapped in \`\`\`jsx or any markdown fence.`;
+	const imgToCodeMessages = designThemeMeta
+		? [
 				{
-					type: "image_url",
-					image_url: { url: `data:${mimeType};base64,${base64Data}` },
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: `${IMAGE_TO_CODE_SYSTEM_PROMPT}\n\n${buildDesignThemePromptSection(designThemeMeta)}`,
+							cache_control: { type: "ephemeral" },
+						},
+						{ type: "text", text: prompt },
+						{
+							type: "image_url",
+							image_url: { url: `data:${mimeType};base64,${base64Data}` },
+						},
+					],
 				},
-			],
-		},
-	];
+			]
+		: [
+				{
+					role: "system",
+					content: IMAGE_TO_CODE_SYSTEM_PROMPT,
+				},
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: prompt },
+						{
+							type: "image_url",
+							image_url: { url: `data:${mimeType};base64,${base64Data}` },
+						},
+					],
+				},
+			];
 
-	// ── Stream from OpenRouter ────────────────────────────────────────────────
+	// ── Stream from OpenRouter (code first, then optional DESIGN.md) ─────────
+	const designMdMessages = generateDesignMd
+		? buildDesignMdMessagesFromImage({
+				mimeType,
+				base64Data,
+				userHint: prompt,
+			})
+		: null;
+
 	let imgCodeUpstreamRes;
 	try {
 		imgCodeUpstreamRes = await fetch(
@@ -9409,6 +9963,9 @@ Output the component code only.`;
 					messages: imgToCodeMessages,
 					temperature: 0.2,
 					max_tokens: 16_384,
+					...(designThemeMeta
+						? { session_id: `img2code:theme:${designThemeMeta.key}` }
+						: {}),
 				}),
 			},
 		);
@@ -9435,17 +9992,128 @@ Output the component code only.`;
 
 	const imgOutputStream = new ReadableStream({
 		async start(controller) {
+			if (sourceCapture?.screenshotUrl) {
+				controller.enqueue(
+					imgEncoder.encode(
+						`data: ${JSON.stringify({
+							type: "screenshot_captured",
+							pageUrl: sourceCapture.pageUrl,
+							screenshotUrl: sourceCapture.screenshotUrl,
+							imageUrl: sourceCapture.screenshotUrl,
+						})}\n\n`,
+					),
+				);
+			}
+
 			let sseBuffer = "";
 			let streamUsageRaw = null;
 			let streamModel = imgToCodeModel;
-			const sendMetaAndDone = () => {
+			let assembledCode = "";
+			const fenceStripper = createCodegenFenceStripper();
+			const emitCodeDelta = (chunk) => {
+				controller.enqueue(
+					imgEncoder.encode(
+						`data: ${JSON.stringify({ type: "code_delta", delta: chunk })}\n\n`,
+					),
+				);
+			};
+			const sendMetaAndDone = async () => {
+				const tail = fenceStripper.flush();
+				if (tail) {
+					assembledCode += tail;
+					emitCodeDelta(tail);
+				}
+
+				let finalCode = assembledCode;
+				let sanitizeFixes = [];
+				try {
+					const { code: sanitizedCode, fixes, changed } =
+						await sanitizeGeneratedReactCode(assembledCode);
+					finalCode = sanitizedCode;
+					sanitizeFixes = fixes;
+					controller.enqueue(
+						imgEncoder.encode(
+							`data: ${JSON.stringify({
+								type: "code_complete",
+								code: sanitizedCode,
+								fixes,
+								sanitized: changed,
+							})}\n\n`,
+						),
+					);
+					if (changed && sanitizedCode) {
+						controller.enqueue(
+							imgEncoder.encode(
+								`data: ${JSON.stringify({
+									type: "code_sanitized",
+									code: sanitizedCode,
+									fixes,
+								})}\n\n`,
+							),
+						);
+					}
+				} catch (sanitizeErr) {
+					console.warn(
+						"[image-to-code] sanitizeGeneratedReactCode failed:",
+						sanitizeErr?.message,
+					);
+					controller.enqueue(
+						imgEncoder.encode(
+							`data: ${JSON.stringify({
+								type: "code_complete",
+								code: finalCode,
+								fixes: sanitizeFixes,
+								sanitized: false,
+							})}\n\n`,
+						),
+					);
+				}
+
+				let designMdResult = null;
+				if (designMdMessages && openRouterApiKey && finalCode.trim()) {
+					try {
+						const deferred = await runDeferredDesignMdStream({
+							controller,
+							encoder: imgEncoder,
+							apiKey: openRouterApiKey,
+							messages: designMdMessages,
+							model: imgToCodeModel,
+							sessionId: "img2code:design-md",
+						});
+						designMdResult = deferred.result;
+					} catch (deferredErr) {
+						console.warn(
+							"[image-to-code] deferred design MD failed:",
+							deferredErr?.message,
+						);
+						controller.enqueue(
+							imgEncoder.encode(
+								`data: ${JSON.stringify({
+									type: "design_md_error",
+									error:
+										deferredErr?.message ||
+										"Design MD generation failed",
+								})}\n\n`,
+							),
+						);
+					}
+				}
+
 				controller.enqueue(
 					imgEncoder.encode(
 						`data: ${JSON.stringify(
-							buildOpenRouterStreamClientMeta(
-								imgToCodeMessages,
-								streamUsageRaw,
-								streamModel,
+							buildImageToCodeCombinedMetaWithSource(
+								{
+									codeMessages: imgToCodeMessages,
+									codeUsageRaw: streamUsageRaw,
+									codeModel: streamModel,
+									designMdMessages,
+									designMdResult,
+									normalizeUsage: normalizeOpenRouterUsageFromApi,
+									toTokenUsageCamel,
+									truncateMessages: truncateMessagesForApiResponse,
+								},
+								sourceCapture,
 							),
 						)}\n\n`,
 					),
@@ -9468,7 +10136,7 @@ Output the component code only.`;
 
 						const payload = trimmed.slice(6);
 						if (payload === "[DONE]") {
-							sendMetaAndDone();
+							await sendMetaAndDone();
 							return;
 						}
 
@@ -9494,14 +10162,16 @@ Output the component code only.`;
 
 						const delta = parsed?.choices?.[0]?.delta?.content ?? null;
 						if (delta) {
-							controller.enqueue(
-								imgEncoder.encode(`data: ${JSON.stringify({ delta })}\n\n`),
-							);
+							const cleaned = fenceStripper.push(delta);
+							if (cleaned) {
+								assembledCode += cleaned;
+								emitCodeDelta(cleaned);
+							}
 						}
 					}
 				}
 
-				sendMetaAndDone();
+				await sendMetaAndDone();
 			} catch (err) {
 				try {
 					controller.enqueue(
@@ -9530,6 +10200,170 @@ Output the component code only.`;
 						"X-Design-Theme-Name": designThemeMeta.name,
 					}
 				: {}),
+			...(generateDesignMd ? { "X-Design-Md": "true" } : {}),
+			...(sourceCapture?.screenshotUrl
+				? {
+						"X-Source-Page-Url": sourceCapture.pageUrl,
+						"X-Source-Screenshot-Url": sourceCapture.screenshotUrl,
+					}
+				: {}),
+		},
+	});
+});
+
+/**
+ * POST /image-to-code/apply-theme
+ * Restyle existing React code with a selected design theme (same SSE stream as /image-to-code).
+ * Body: { code | existingCode | reactCode, designTheme, prompt?, designMd?: boolean, imageUrl?: string }
+ * When designMd is true, DESIGN.md is generated after themed code completes, documenting the applied theme.
+ */
+app.post("/image-to-code/apply-theme", async (c) => {
+	const imgAuthHeader =
+		c.req.header("Authorization") || c.req.header("authorization");
+	const imgAuthToken = imgAuthHeader?.startsWith("Bearer ")
+		? imgAuthHeader.slice(7).trim()
+		: imgAuthHeader?.trim();
+	if (!imgAuthToken) {
+		return c.json(
+			{
+				error: "Authentication required",
+				code: "MISSING_AUTH_TOKEN",
+				details:
+					"Provide a Bearer token in the Authorization header: Authorization: Bearer <token>",
+			},
+			401,
+		);
+	}
+
+	const IMG_RATE_LIMIT = 20;
+	const IMG_RATE_WINDOW_MS = 10 * 60 * 1000;
+	const imgClientIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+
+	const imgRl = rateLimit(imgClientIp, IMG_RATE_LIMIT, IMG_RATE_WINDOW_MS);
+	if (!imgRl.allowed) {
+		c.header("Retry-After", String(imgRl.retryAfter));
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: imgRl.retryAfter,
+			},
+			429,
+		);
+	}
+
+	let body;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	const existingCode =
+		typeof body.code === "string"
+			? body.code
+			: typeof body.existingCode === "string"
+				? body.existingCode
+				: typeof body.reactCode === "string"
+					? body.reactCode
+					: "";
+	if (existingCode.trim().length < EXISTING_CODE_MIN_CHARS) {
+		return c.json(
+			{
+				error: `code (or existingCode / reactCode) must be at least ${EXISTING_CODE_MIN_CHARS} characters`,
+				code: "INVALID_CODE",
+			},
+			400,
+		);
+	}
+
+	const designThemeRaw =
+		body.designTheme != null ? String(body.designTheme).trim() : "";
+	if (!designThemeRaw) {
+		return c.json(
+			{
+				error: "designTheme is required",
+				code: "MISSING_DESIGN_THEME",
+				validThemes: listDesignThemes(),
+			},
+			400,
+		);
+	}
+
+	const resolved = resolveImageToCodeDesignTheme(designThemeRaw);
+	if (!resolved.ok) {
+		return c.json(
+			{
+				error: resolved.error,
+				code: "UNKNOWN_DESIGN_THEME",
+				validThemes: resolved.validThemes || listDesignThemes(),
+			},
+			400,
+		);
+	}
+
+	const extraPrompt =
+		typeof body.prompt === "string" ? body.prompt.trim() : "";
+	const generateDesignMd = parseDesignMdFlag(body.designMd, body.generateDesignMd);
+
+	const messages = buildImageToCodeRedesignMessages({
+		existingCode,
+		designThemeMeta: resolved,
+		prompt: extraPrompt,
+	});
+
+	const imgToCodeModel = "google/gemini-2.5-flash";
+
+	let applyThemeImage = null;
+	if (generateDesignMd) {
+		try {
+			applyThemeImage = body.imageUrl
+				? await normalizeImageInput({ url: String(body.imageUrl) })
+				: body.image
+					? await normalizeImageInput(body.image)
+					: null;
+		} catch (imgErr) {
+			console.warn("[apply-theme] optional image for design MD:", imgErr?.message);
+		}
+	}
+
+	return streamOpenRouterChatAsSse(c, {
+		messages,
+		model: imgToCodeModel,
+		temperature: 0.25,
+		max_tokens: 16_384,
+		session_id: `apply-theme:theme:${resolved.key}`,
+		xTitle: "IHateReading Image-to-Code Apply Theme",
+		designMd: generateDesignMd
+			? {
+					deferred: true,
+					apiKey: process.env.OPENROUTER_API_KEY,
+					model: imgToCodeModel,
+					sessionId: `apply-theme:design-md:${resolved.key}`,
+					xTitle: "IHateReading Image-to-Code Apply Theme Design MD",
+					buildMessages: (themedCode) =>
+						buildDesignMdMessagesForApplyTheme({
+							designThemeMeta: resolved,
+							themedCode,
+							userHint: extraPrompt,
+							image: applyThemeImage
+								? {
+										mimeType: applyThemeImage.mimeType,
+										base64Data: applyThemeImage.base64,
+									}
+								: undefined,
+						}),
+				}
+			: undefined,
+		extraResponseHeaders: {
+			"X-Design-Theme-Key": resolved.key,
+			"X-Design-Theme-Name": resolved.name,
+			"X-Image-To-Code-Mode": "apply-theme",
+			...(generateDesignMd ? { "X-Design-Md": "true" } : {}),
 		},
 	});
 });

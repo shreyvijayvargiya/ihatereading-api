@@ -18,11 +18,14 @@ const CHROME_LAUNCH_ARGS = [
 	"--no-sandbox",
 	"--disable-setuid-sandbox",
 	"--disable-dev-shm-usage",
-	"--disable-gpu",
+	// --disable-gpu breaks Page.captureScreenshot on macOS Chrome (CDP Internal error).
+	...(process.platform === "linux" ? ["--disable-gpu"] : []),
 	"--disable-web-security",
 	"--disable-extensions",
-	"--no-zygote",
-	"--single-process",
+	// --single-process causes CDP screenshot ProtocolErrors on macOS Chrome.
+	...(process.platform === "linux"
+		? ["--no-zygote", "--single-process"]
+		: []),
 ];
 
 function localChromeCandidates() {
