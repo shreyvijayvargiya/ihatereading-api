@@ -10,7 +10,15 @@
  *  - If a browser crashes it is automatically replaced
  */
 
-const POOL_SIZE = parseInt(process.env.BROWSER_POOL_SIZE) || 3;
+const IS_SERVERLESS =
+	process.env.VERCEL === "1" ||
+	Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) ||
+	Boolean(process.env.AWS_EXECUTION_ENV);
+
+/** Lambda/Vercel: one browser avoids ETXTBSY from parallel @sparticuz/chromium spawns. */
+const DEFAULT_POOL_SIZE = IS_SERVERLESS ? 1 : 3;
+const POOL_SIZE =
+	parseInt(process.env.BROWSER_POOL_SIZE, 10) || DEFAULT_POOL_SIZE;
 const BROWSER_IDLE_TIMEOUT_MS =
 	parseInt(process.env.BROWSER_IDLE_TIMEOUT_MS) || 5 * 60 * 1000; // 5 min
 
@@ -74,6 +82,10 @@ class BrowserPool {
 		this._chromium = null;
 		/** @type {Promise<string> | null} */
 		this._sparticuzExecutablePathPromise = null;
+		/** @type {Promise<void> | null} */
+		this._initialisePromise = null;
+		/** Serialises chromium spawns — parallel launch → Linux ETXTBSY on serverless. */
+		this._launchMutex = Promise.resolve();
 	}
 
 	// ─── Lazy initialisation ───────────────────────────────────────────────────
@@ -98,13 +110,18 @@ class BrowserPool {
 		}
 		if (!this._chromium) {
 			this._chromium = (await import("@sparticuz/chromium")).default;
+			if (IS_SERVERLESS && typeof this._chromium.setGraphicsMode === "function") {
+				this._chromium.setGraphicsMode(false);
+			}
 		}
 	}
 
 	async _launchBrowser() {
-		await this._loadDeps();
+		// One spawn at a time — @sparticuz/chromium extracts to /tmp; parallel exec → ETXTBSY.
+		const run = async () => {
+			await this._loadDeps();
 
-		const launchErrors = [];
+			const launchErrors = [];
 		const envExecutablePath = (
 			process.env.PUPPETEER_EXECUTABLE_PATH ||
 			process.env.CHROME_EXECUTABLE_PATH ||
@@ -113,16 +130,27 @@ class BrowserPool {
 		).trim();
 
 		const tryLaunch = async (label, launchOptions) => {
-			try {
-				const browser = await this._puppeteer.launch(launchOptions);
-				console.log(`[BrowserPool] Launched browser via ${label}`);
-				return browser;
-			} catch (err) {
-				launchErrors.push(
-					`${label}: ${err?.message || String(err)}`,
-				);
-				return null;
+			const maxAttempts = IS_SERVERLESS ? 3 : 1;
+			for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+				try {
+					const browser = await this._puppeteer.launch(launchOptions);
+					console.log(`[BrowserPool] Launched browser via ${label}`);
+					return browser;
+				} catch (err) {
+					const msg = err?.message || String(err);
+					const retryable =
+						IS_SERVERLESS &&
+						/ETXTBSY|EBUSY/i.test(msg) &&
+						attempt < maxAttempts;
+					if (retryable) {
+						await new Promise((r) => setTimeout(r, 250 * attempt));
+						continue;
+					}
+					launchErrors.push(`${label}: ${msg}`);
+					return null;
+				}
 			}
+			return null;
 		};
 
 		if (envExecutablePath) {
@@ -158,33 +186,51 @@ class BrowserPool {
 			if (browser) return browser;
 		}
 
-		throw new Error(
-			`Browser launch failed. Tried env path, @sparticuz/chromium, and local candidates. Details: ${launchErrors.join(" | ")}`,
-		);
+			throw new Error(
+				`Browser launch failed. Tried env path, @sparticuz/chromium, and local candidates. Details: ${launchErrors.join(" | ")}`,
+			);
+		};
+
+		const launchTask = this._launchMutex.then(run, run);
+		this._launchMutex = launchTask.catch(() => {});
+		return launchTask;
 	}
 
 	async initialise() {
-		if (this._initialised || this._initialising) return;
+		if (this._initialised) return;
+		if (this._initialisePromise) return this._initialisePromise;
+
 		this._initialising = true;
-		try {
-			console.log(`🚀 BrowserPool: launching ${this._poolSize} browser(s)…`);
-			const launches = Array.from({ length: this._poolSize }, (_, i) =>
-				this._launchBrowser().then((browser) => {
-					const entry = { browser, busy: false, lastUsed: Date.now(), index: i };
+		this._initialisePromise = (async () => {
+			try {
+				console.log(
+					`🚀 BrowserPool: launching ${this._poolSize} browser(s)…${IS_SERVERLESS ? " (serverless)" : ""}`,
+				);
+				for (let i = 0; i < this._poolSize; i++) {
+					const browser = await this._launchBrowser();
+					const entry = {
+						browser,
+						busy: false,
+						lastUsed: Date.now(),
+						index: i,
+					};
 					this._pool.push(entry);
 					this._attachCrashHandler(entry);
 					console.log(`  ✅ Browser #${i} ready`);
-					return entry;
-				}),
-			);
-			await Promise.all(launches);
-			this._initialised = true;
-			console.log(
-				`🎉 BrowserPool initialised with ${this._pool.length} browser(s)`,
-			);
-		} finally {
-			this._initialising = false;
-		}
+				}
+				this._initialised = true;
+				console.log(
+					`🎉 BrowserPool initialised with ${this._pool.length} browser(s)`,
+				);
+			} catch (err) {
+				this._initialisePromise = null;
+				throw err;
+			} finally {
+				this._initialising = false;
+			}
+		})();
+
+		return this._initialisePromise;
 	}
 
 	// ─── Crash handling ────────────────────────────────────────────────────────

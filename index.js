@@ -4807,12 +4807,14 @@ async function scrapeSingleUrlWithPuppeteer(
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		let selectedProxy = null;
-		const { userAgent, extraHTTPHeaders, viewport } = generateRandomHeaders();
+		const { userAgent, extraHTTPHeaders } = generateScreenshotHeaders();
+		const viewport = { width: 1920, height: 1080 };
 
 		try {
 			if (useProxy) selectedProxy = proxyManager.getNextProxy();
 
 			const poolResult = await browserPool.withPage(async (page) => {
+				await applyStealthToPage(page);
 				await page.setViewport(viewport);
 				await page.setUserAgent(userAgent);
 				await page.setExtraHTTPHeaders(extraHTTPHeaders);
@@ -4823,23 +4825,6 @@ async function scrapeSingleUrlWithPuppeteer(
 						password: selectedProxy.password,
 					});
 				}
-
-				await page.evaluateOnNewDocument(() => {
-					Object.defineProperty(navigator, "webdriver", {
-						get: () => undefined,
-					});
-					Object.defineProperty(navigator, "plugins", {
-						get: () => [1, 2, 3, 4, 5],
-					});
-					Object.defineProperty(navigator, "languages", {
-						get: () => ["en-US", "en"],
-					});
-					const orig = window.navigator.permissions.query;
-					window.navigator.permissions.query = (p) =>
-						p.name === "notifications"
-							? Promise.resolve({ state: Notification.permission })
-							: orig(p);
-				});
 
 				let blockedResources = {
 					images: 0,
@@ -4852,8 +4837,7 @@ async function scrapeSingleUrlWithPuppeteer(
 
 				await page.setRequestInterception(true);
 				page.on("request", (request) => {
-					// G2 (and similar SPAs) need real CSS/JS/CDN — empty stylesheets leave UI
-					// display:none / invisible, so markdown + innerText stay empty.
+					// SPAs (Next.js, G2, etc.) need real CSS — stubbing empty stylesheets hides content.
 					if (isG2Host) {
 						request.continue();
 						return;
@@ -4868,6 +4852,10 @@ async function scrapeSingleUrlWithPuppeteer(
 						reqUrl.includes("challenge")
 					) {
 						request.abort();
+						return;
+					}
+					if (resourceType === "stylesheet" || resourceType === "font") {
+						request.continue();
 						return;
 					}
 					if (resourceType === "image") {
@@ -4914,16 +4902,6 @@ async function scrapeSingleUrlWithPuppeteer(
 					}
 					if (reqUrl.startsWith("data:image/")) {
 						blockedResources.images++;
-						request.abort();
-						return;
-					}
-					if (resourceType === "stylesheet") {
-						blockedResources.stylesheets++;
-						request.respond({ status: 200, contentType: "text/css", body: "" });
-						return;
-					}
-					if (resourceType === "font") {
-						blockedResources.fonts++;
 						request.abort();
 						return;
 					}
@@ -5011,9 +4989,25 @@ async function scrapeSingleUrlWithPuppeteer(
 					await new Promise((r) => setTimeout(r, 1500));
 				} else {
 					await page.goto(targetUrl, {
-						waitUntil: "domcontentloaded",
+						waitUntil: "load",
 						timeout,
 					});
+					await waitForSpaHydration(page, {
+						timeout: Math.min(Math.max(timeout, 30_000), 45_000),
+					});
+					let contentStats = await waitForVisiblePageContent(page, {
+						timeout: Math.min(timeout, 20_000),
+						minTextLength: 40,
+					});
+					if (
+						contentStats.textLen < 20 &&
+						!contentStats.hasMedia &&
+						contentStats.visibleNodes < 5
+					) {
+						contentStats = await recoverBlankSpaPage(page, {
+							timeout: Math.min(Math.max(timeout, 30_000), 45_000),
+						});
+					}
 				}
 				const navLatency = Date.now() - navStart;
 
@@ -5279,7 +5273,33 @@ async function scrapeSingleUrlWithPuppeteer(
 					doc.body,
 				);
 
-				if (isG2Host && (!markdown || String(markdown).trim().length < 80)) {
+				const markdownTooShort =
+					!markdown || String(markdown).trim().length < 80;
+
+				if (markdownTooShort) {
+					try {
+						const plain = await page.evaluate(() => {
+							const root =
+								document.getElementById("__next") ||
+								document.getElementById("root") ||
+								document.querySelector("main") ||
+								document.querySelector('[role="main"]') ||
+								document.querySelector("#content") ||
+								document.body;
+							if (!root) return "";
+							return String(root.innerText || "")
+								.replace(/\n{3,}/g, "\n\n")
+								.trim();
+						});
+						if (plain && plain.length > String(markdown || "").trim().length) {
+							markdown = plain;
+						}
+					} catch (e) {
+						console.warn("[scrape] innerText fallback failed:", e?.message);
+					}
+				}
+
+				if (isG2Host && markdownTooShort) {
 					try {
 						const linkMd = await page.evaluate(() => {
 							const seen = new Set();
@@ -5334,23 +5354,19 @@ async function scrapeSingleUrlWithPuppeteer(
 							e?.message,
 						);
 					}
+				}
+
+				if (!markdown || String(markdown).trim().length < 40) {
 					try {
-						const plain = await page.evaluate(() => {
-							const root =
-								document.querySelector("main") ||
-								document.querySelector('[role="main"]') ||
-								document.querySelector("#content") ||
-								document.body;
-							if (!root) return "";
-							return String(root.innerText || "")
-								.replace(/\n{3,}/g, "\n\n")
-								.trim();
-						});
-						if (plain && plain.length > String(markdown || "").trim().length) {
-							markdown = plain;
+						const nextMd = await extractNextDataMarkdown(page);
+						if (
+							nextMd &&
+							nextMd.length > String(markdown || "").trim().length
+						) {
+							markdown = nextMd;
 						}
 					} catch (e) {
-						console.warn("[scrape] G2 innerText fallback failed:", e?.message);
+						console.warn("[scrape] __NEXT_DATA__ fallback failed:", e?.message);
 					}
 				}
 
@@ -5460,6 +5476,76 @@ async function scrapeSingleUrlWithPuppeteer(
 	throw lastError || new Error("Scraping failed");
 }
 
+/** Accept `url` or a single-item `urls` array (same shape as /scrape-multiple). */
+function parseScrapeUrlInput(rawUrl, urls) {
+	if (typeof rawUrl === "string" && rawUrl.trim()) return rawUrl.trim();
+	if (Array.isArray(urls) && urls.length === 1) {
+		const u = urls[0];
+		if (typeof u === "string" && u.trim()) return u.trim();
+		const nested = u?.url ?? u?.href;
+		if (typeof nested === "string" && nested.trim()) return nested.trim();
+	}
+	return null;
+}
+
+function parseScrapeOptions(body = {}) {
+	const {
+		selectors = {},
+		waitForSelector = null,
+		timeout = 30000,
+		includeSemanticContent = true,
+		includeImages = true,
+		includeLinks = true,
+		extractMetadata = true,
+		includeCache = false,
+		useProxy = false,
+		aiSummary = false,
+		takeScreenshot = false,
+	} = body;
+	return {
+		selectors,
+		waitForSelector,
+		timeout,
+		includeSemanticContent,
+		includeImages,
+		includeLinks,
+		extractMetadata,
+		includeCache,
+		useProxy,
+		aiSummary,
+		takeScreenshot,
+	};
+}
+
+async function scrapeOneUrlResult(inputUrl, options) {
+	const result = await scrapeSingleUrlWithPuppeteer(inputUrl, options);
+	return {
+		url: inputUrl,
+		success: true,
+		data: result.data,
+		markdown: result.markdown,
+		summary: result.summary,
+		screenshot: result.screenshot,
+		error: null,
+		...(result.openRouterSummary && {
+			openRouterSummary: result.openRouterSummary,
+		}),
+	};
+}
+
+function scrapeOneUrlFailure(inputUrl, err) {
+	const msg = err?.message || "Scraping failed";
+	return {
+		url: inputUrl || "invalid",
+		success: false,
+		error: msg,
+		data: {},
+		markdown: null,
+		summary: null,
+		screenshot: null,
+	};
+}
+
 // New Puppeteer-based URL scraping endpoint (single URL)
 app.post("/scrape", async (c) => {
 	customLogger("Scraping URL with Puppeteer", await c.req.header());
@@ -5494,53 +5580,38 @@ app.post("/scrape", async (c) => {
 	c.header("X-RateLimit-Remaining", String(rl.remaining));
 	c.header("X-RateLimit-Window", "10 minutes");
 
-	let {
-		url,
-		selectors = {},
-		waitForSelector = null,
-		timeout = 30000,
-		includeSemanticContent = true,
-		includeImages = true,
-		includeLinks = true,
-		extractMetadata = true,
-		includeCache = false,
-		useProxy = false,
-		aiSummary = false,
-		takeScreenshot = false,
-	} = await c.req.json();
+	const body = await c.req.json().catch(() => ({}));
+	const url = parseScrapeUrlInput(body.url, body.urls);
+	const options = parseScrapeOptions(body);
 
 	if (!url || !isValidURL(url)) {
-		return c.json({ error: "URL is required or invalid" }, 400);
+		return c.json(
+			{
+				success: false,
+				error: "URL is required or invalid",
+				details:
+					"Provide `url` (string) or `urls` with exactly one entry — same as /scrape-multiple.",
+			},
+			400,
+		);
 	}
 
 	try {
-		const result = await scrapeSingleUrlWithPuppeteer(url, {
-			selectors,
-			waitForSelector,
-			timeout,
-			includeSemanticContent,
-			includeImages,
-			includeLinks,
-			extractMetadata,
-			includeCache,
-			useProxy,
-			aiSummary,
-			takeScreenshot,
-		});
+		const row = await scrapeOneUrlResult(url, options);
 		return c.json({
-			success: true,
-			...result,
-			url: url,
+			...row,
 			timestamp: new Date().toISOString(),
+			poolStats: browserPool.stats,
 		});
 	} catch (error) {
+		const msg = error?.message || String(error);
 		console.error("❌ Web scraping error (Puppeteer):", error);
 		return c.json(
 			{
 				success: false,
 				error: "Failed to scrape URL using Puppeteer",
-				details: "Unable to scrap, check URL",
-				url: url,
+				details: msg,
+				url,
 			},
 			500,
 		);
@@ -5577,20 +5648,9 @@ app.post("/scrape-multiple", async (c) => {
 	c.header("X-RateLimit-Limit", String(RATE_LIMIT));
 	c.header("X-RateLimit-Remaining", String(rl.remaining));
 
-	let {
-		urls,
-		selectors = {},
-		waitForSelector = null,
-		timeout = 30000,
-		includeSemanticContent = true,
-		includeImages = true,
-		includeLinks = true,
-		extractMetadata = true,
-		includeCache = false,
-		useProxy = false,
-		aiSummary = false,
-		takeScreenshot = false,
-	} = await c.req.json();
+	const body = await c.req.json().catch(() => ({}));
+	const { urls } = body;
+	const options = parseScrapeOptions(body);
 
 	if (!Array.isArray(urls) || urls.length === 0) {
 		return c.json(
@@ -5609,60 +5669,20 @@ app.post("/scrape-multiple", async (c) => {
 		);
 	}
 
-	const options = {
-		selectors,
-		waitForSelector,
-		timeout,
-		includeSemanticContent,
-		includeImages,
-		includeLinks,
-		extractMetadata,
-		includeCache,
-		useProxy,
-		aiSummary,
-		takeScreenshot,
-	};
-
 	const results = await Promise.all(
-		urls.map(async (url) => {
-			const inputUrl = typeof url === "string" ? url : (url?.url ?? url);
+		urls.map(async (entry) => {
+			const inputUrl =
+				typeof entry === "string"
+					? parseScrapeUrlInput(entry, null)
+					: parseScrapeUrlInput(entry?.url ?? entry?.href, null);
 			if (!inputUrl || !isValidURL(inputUrl)) {
-				return {
-					url: inputUrl || "invalid",
-					success: false,
-					error: "Invalid or missing URL",
-					data: {},
-					markdown: null,
-					summary: null,
-					screenshot: null,
-				};
+				return scrapeOneUrlFailure(inputUrl, new Error("Invalid or missing URL"));
 			}
 			try {
-				const result = await scrapeSingleUrlWithPuppeteer(inputUrl, options);
-				return {
-					url: inputUrl,
-					success: true,
-					data: result.data,
-					markdown: result.markdown,
-					summary: result.summary,
-					screenshot: result.screenshot,
-					...(result.openRouterSummary && {
-						openRouterSummary: result.openRouterSummary,
-					}),
-					error: null,
-				};
+				return await scrapeOneUrlResult(inputUrl, options);
 			} catch (err) {
-				const msg = err?.message || "Scraping failed";
-				console.warn(`⚠️ Scrape failed for ${inputUrl}:`, msg);
-				return {
-					url: inputUrl,
-					success: false,
-					error: msg,
-					data: {},
-					markdown: null,
-					summary: null,
-					screenshot: null,
-				};
+				console.warn(`⚠️ Scrape failed for ${inputUrl}:`, err?.message);
+				return scrapeOneUrlFailure(inputUrl, err);
 			}
 		}),
 	);
@@ -5671,6 +5691,7 @@ app.post("/scrape-multiple", async (c) => {
 		success: true,
 		results,
 		timestamp: new Date().toISOString(),
+		poolStats: browserPool.stats,
 	});
 });
 
@@ -8428,34 +8449,23 @@ app.post("/crawl-url", async (c) => {
 
 		// 1) Always scrape home page first for link discovery (and homePageData)
 		try {
-			const scrapeRes = await fetch(`${scrapeBase}/scrape`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				signal: AbortSignal.timeout(timeout),
-				body: JSON.stringify({
-					url: homePage,
-					timeout: Math.min(timeout, 30000),
-					includeLinks: true,
-					// NOTE: in /scrape implementation, links are extracted inside the
-					// semanticContent evaluate block. So we must enable it here even when
-					// scrapeContent is false, otherwise we only discover the homepage URL.
-					includeSemanticContent: true,
-					includeImages: false,
-					extractMetadata: false,
-					takeScreenshot: false,
-				}),
+			const row = await scrapeOneUrlResult(homePage, {
+				timeout: Math.min(timeout, 30000),
+				includeLinks: true,
+				// Links are extracted inside the semanticContent evaluate block.
+				includeSemanticContent: true,
+				includeImages: false,
+				extractMetadata: false,
+				takeScreenshot: false,
 			});
-			const scrapeData = await scrapeRes.json().catch(() => ({}));
-			if (scrapeData.success) {
-				homeResult = scrapeData;
-				if (scrapeData.data?.links) {
-					const nested = extractSameDomainLinks(
-						scrapeData.data.links,
-						origin,
-						domain,
-					);
-					nested.forEach((u) => allUrlsSet.add(u));
-				}
+			homeResult = { ...row, timestamp: new Date().toISOString() };
+			if (row.data?.links) {
+				const nested = extractSameDomainLinks(
+					row.data.links,
+					origin,
+					domain,
+				);
+				nested.forEach((u) => allUrlsSet.add(u));
 			}
 		} catch (err) {
 			console.warn("[crawl-url] Home scrape failed:", err?.message);
@@ -14874,425 +14884,6 @@ app.post("/generate/:type", async (c) => {
 		);
 	}
 });
-
-
-// ─── AI video caption generator (OpenRouter + FFmpeg + UploadThing) ─────────────
-//
-// POST /api/video-caption — { video_url | videoUrl, language?, burn_captions?, caption_style?, model? }
-// multipart: file or video + optional fields above
-// GET  /api/video-caption/:id — job status; returns captioned video URL when success
-
-function applyVideoCaptionApiHeaders(c, opts = {}) {
-	const { videoCaptionId, captionUrl, captionedVideoUrl } = opts;
-	c.header("X-Content-Type-Options", "nosniff");
-	c.header("Cache-Control", "no-store, private, max-age=0");
-	if (videoCaptionId) {
-		c.header("X-Video-Caption-Id", String(videoCaptionId));
-	}
-	if (captionUrl) {
-		c.header("X-Caption-Url", String(captionUrl));
-	}
-	if (captionedVideoUrl) {
-		c.header("X-Captioned-Video-Url", String(captionedVideoUrl));
-	}
-}
-
-const VIDEO_CAPTION_POST_RATE_LIMIT = 10;
-const VIDEO_CAPTION_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
-
-/**
- * POST /api/video-caption
- * JSON: { video_url | videoUrl, language?, burn_captions?, caption_style?, model | llm_model? }
- * multipart: file or video (uploads to UploadThing), optional video_url, language, etc.
- * Auth: non-empty Authorization (Bearer token). Rate limited per IP.
- */
-app.post("/api/video-caption", async (c) => {
-	const authHdr =
-		c.req.header("Authorization") || c.req.header("authorization");
-	const authToken = authHdr?.startsWith("Bearer ")
-		? authHdr.slice(7).trim()
-		: authHdr?.trim();
-	if (!authToken) {
-		return c.json(
-			{
-				error: "Authentication required",
-				code: "MISSING_AUTH_TOKEN",
-				details: "Provide a Bearer token in the Authorization header",
-			},
-			401,
-		);
-	}
-
-	const xff = c.req.header("x-forwarded-for");
-	const clientIp =
-		xff?.split(",")?.[0]?.trim() ||
-		c.req.header("x-real-ip") ||
-		c.req.header("cf-connecting-ip") ||
-		"unknown";
-	const rl = rateLimit(
-		clientIp,
-		VIDEO_CAPTION_POST_RATE_LIMIT,
-		VIDEO_CAPTION_POST_RATE_WINDOW_MS,
-	);
-	if (!rl.allowed) {
-		c.header("Retry-After", String(rl.retryAfter));
-		c.header("X-RateLimit-Limit", String(VIDEO_CAPTION_POST_RATE_LIMIT));
-		c.header("X-RateLimit-Remaining", "0");
-		c.header("X-RateLimit-Window", "10 minutes");
-		return c.json(
-			{
-				success: false,
-				error: "Rate limit exceeded",
-				retryAfter: rl.retryAfter,
-			},
-			429,
-		);
-	}
-	c.header("X-RateLimit-Limit", String(VIDEO_CAPTION_POST_RATE_LIMIT));
-	c.header("X-RateLimit-Remaining", String(rl.remaining));
-	c.header("X-RateLimit-Window", "10 minutes");
-
-	const contentType = c.req.header("content-type") || "";
-	let videoUrl;
-	let body = {};
-
-	const parseBool = (v) => v === true || v === "true" || v === "1";
-
-	if (contentType.includes("multipart/form-data")) {
-		let form;
-		try {
-			form = await c.req.formData();
-		} catch {
-			return c.json(
-				{
-					error:
-						"Invalid multipart/form-data payload. Use proper multipart encoding (-F in curl) or send JSON.",
-				},
-				400,
-			);
-		}
-		const fileField = form.get("file") || form.get("video");
-		if (
-			fileField &&
-			typeof fileField === "object" &&
-			"arrayBuffer" in fileField
-		) {
-			if (!process.env.UPLOADTHING_TOKEN) {
-				return c.json(
-					{
-						error:
-							"UPLOADTHING_TOKEN not configured (required to upload video files)",
-						code: "MISSING_UPLOAD_TOKEN",
-					},
-					503,
-				);
-			}
-			try {
-				const ab = await fileField.arrayBuffer();
-				const buf = Buffer.from(ab);
-				const origName =
-					typeof fileField.name === "string" ? fileField.name : "upload.mp4";
-				videoUrl = await uploadVideoBufferToUploadThing(buf, origName);
-			} catch (e) {
-				return c.json(
-					{ error: e?.message || "Video upload failed" },
-					502,
-				);
-			}
-		}
-		if (!videoUrl) {
-			videoUrl = form.get("video_url") || form.get("videoUrl");
-		}
-		if (form.has("language")) body.language = String(form.get("language") ?? "");
-		if (form.has("caption_language")) {
-			body.caption_language = String(form.get("caption_language") ?? "");
-		}
-		if (form.has("caption_style")) {
-			body.caption_style = String(form.get("caption_style") ?? "");
-		}
-		if (form.has("style")) body.style = String(form.get("style") ?? "");
-		if (form.has("burn_captions")) {
-			body.burn_captions = parseBool(form.get("burn_captions"));
-		}
-		if (form.has("burnCaptions")) {
-			body.burnCaptions = parseBool(form.get("burnCaptions"));
-		}
-		const modelField = form.get("model");
-		if (modelField != null && String(modelField).trim() !== "") {
-			body.model = String(modelField).trim();
-		}
-		const llmModelField = form.get("llm_model");
-		if (llmModelField != null && String(llmModelField).trim() !== "") {
-			body.llm_model = String(llmModelField).trim();
-		}
-	} else if (contentType.includes("application/json")) {
-		try {
-			body = await c.req.json();
-		} catch {
-			return c.json({ error: "Invalid JSON body" }, 400);
-		}
-		videoUrl = body.video_url || body.videoUrl;
-	} else {
-		return c.json(
-			{
-				error:
-					"Unsupported Content-Type. Use application/json or multipart/form-data.",
-			},
-			415,
-		);
-	}
-
-	if (!videoUrl || !String(videoUrl).trim()) {
-		return c.json(
-			{
-				error:
-					"Provide video_url (or videoUrl) or upload a video file (field: file or video)",
-			},
-			400,
-		);
-	}
-
-	const out = await createVideoCaptionJob({
-		videoUrl: String(videoUrl).trim(),
-		body,
-	});
-	const status = out.httpStatus ?? 200;
-	const { httpStatus: _h, ...rest } = out;
-	const createdId = rest?.data?.video_caption_id ?? null;
-	applyVideoCaptionApiHeaders(c, { videoCaptionId: createdId });
-	return c.json(rest, status);
-});
-
-/** GET /api/video-caption/:id — job status; captioned video + caption URLs when success */
-app.get("/api/video-caption/:id", async (c) => {
-	const id = c.req.param("id");
-	const out = await getVideoCaptionJobStatus(id);
-	const status = out.httpStatus ?? 200;
-	const { httpStatus: _h, ...rest } = out;
-	const d = rest?.data;
-	applyVideoCaptionApiHeaders(c, {
-		videoCaptionId: id,
-		captionUrl: d?.caption_url,
-		captionedVideoUrl: d?.captioned_video_url || d?.videoUrl,
-	});
-	return c.json(rest, status);
-});
-
-
-// ─── Viral clip cutter (OpenRouter + FFmpeg + UploadThing) ────────────────────
-//
-// POST /api/viral-clip-cut — { video_url, prompt?, clip_count?, max_clips?, ... }
-// GET  /api/viral-clip-cut/:id — job status; returns clips[] with video URLs when success
-
-function applyViralClipCutApiHeaders(c, opts = {}) {
-	const { viralClipCutId, clipCount } = opts;
-	c.header("X-Content-Type-Options", "nosniff");
-	c.header("Cache-Control", "no-store, private, max-age=0");
-	if (viralClipCutId) {
-		c.header("X-Viral-Clip-Cut-Id", String(viralClipCutId));
-	}
-	if (clipCount != null) {
-		c.header("X-Clip-Count", String(clipCount));
-	}
-}
-
-const VIRAL_CLIP_CUT_POST_RATE_LIMIT = 10;
-const VIRAL_CLIP_CUT_POST_RATE_WINDOW_MS = 10 * 60 * 1000;
-
-/**
- * POST /api/viral-clip-cut
- * JSON: { video_url | videoUrl, prompt?, clip_count?, max_clips?, min_clip_sec?, max_clip_sec?, target_aspect?, model? }
- * multipart: file or video + optional fields above
- */
-app.post("/api/viral-clip-cut", async (c) => {
-	const authHdr =
-		c.req.header("Authorization") || c.req.header("authorization");
-	const authToken = authHdr?.startsWith("Bearer ")
-		? authHdr.slice(7).trim()
-		: authHdr?.trim();
-	if (!authToken) {
-		return c.json(
-			{
-				error: "Authentication required",
-				code: "MISSING_AUTH_TOKEN",
-				details: "Provide a Bearer token in the Authorization header",
-			},
-			401,
-		);
-	}
-
-	const xff = c.req.header("x-forwarded-for");
-	const clientIp =
-		xff?.split(",")?.[0]?.trim() ||
-		c.req.header("x-real-ip") ||
-		c.req.header("cf-connecting-ip") ||
-		"unknown";
-	const rl = rateLimit(
-		clientIp,
-		VIRAL_CLIP_CUT_POST_RATE_LIMIT,
-		VIRAL_CLIP_CUT_POST_RATE_WINDOW_MS,
-	);
-	if (!rl.allowed) {
-		c.header("Retry-After", String(rl.retryAfter));
-		c.header("X-RateLimit-Limit", String(VIRAL_CLIP_CUT_POST_RATE_LIMIT));
-		c.header("X-RateLimit-Remaining", "0");
-		c.header("X-RateLimit-Window", "10 minutes");
-		return c.json(
-			{
-				success: false,
-				error: "Rate limit exceeded",
-				retryAfter: rl.retryAfter,
-			},
-			429,
-		);
-	}
-	c.header("X-RateLimit-Limit", String(VIRAL_CLIP_CUT_POST_RATE_LIMIT));
-	c.header("X-RateLimit-Remaining", String(rl.remaining));
-	c.header("X-RateLimit-Window", "10 minutes");
-
-	const contentType = c.req.header("content-type") || "";
-	let videoUrl;
-	let body = {};
-
-	const parseNumField = (form, ...keys) => {
-		for (const k of keys) {
-			if (!form.has(k)) continue;
-			const v = form.get(k);
-			if (v == null || String(v).trim() === "") continue;
-			const n = Number(v);
-			if (Number.isFinite(n)) return n;
-		}
-		return undefined;
-	};
-
-	if (contentType.includes("multipart/form-data")) {
-		let form;
-		try {
-			form = await c.req.formData();
-		} catch {
-			return c.json(
-				{
-					error:
-						"Invalid multipart/form-data payload. Use proper multipart encoding (-F in curl) or send JSON.",
-				},
-				400,
-			);
-		}
-		const fileField = form.get("file") || form.get("video");
-		if (
-			fileField &&
-			typeof fileField === "object" &&
-			"arrayBuffer" in fileField
-		) {
-			if (!process.env.UPLOADTHING_TOKEN) {
-				return c.json(
-					{
-						error:
-							"UPLOADTHING_TOKEN not configured (required to upload video files)",
-						code: "MISSING_UPLOAD_TOKEN",
-					},
-					503,
-				);
-			}
-			try {
-				const ab = await fileField.arrayBuffer();
-				const buf = Buffer.from(ab);
-				const origName =
-					typeof fileField.name === "string" ? fileField.name : "upload.mp4";
-				videoUrl = await uploadVideoBufferToUploadThing(buf, origName);
-			} catch (e) {
-				return c.json(
-					{ error: e?.message || "Video upload failed" },
-					502,
-				);
-			}
-		}
-		if (!videoUrl) {
-			videoUrl = form.get("video_url") || form.get("videoUrl");
-		}
-		if (form.has("prompt")) body.prompt = String(form.get("prompt") ?? "");
-		if (form.has("context")) body.context = String(form.get("context") ?? "");
-		if (form.has("language")) body.language = String(form.get("language") ?? "");
-		const clipCount = parseNumField(form, "clip_count", "clipCount");
-		if (clipCount != null) body.clip_count = clipCount;
-		const maxClips = parseNumField(form, "max_clips", "maxClips");
-		if (maxClips != null) body.max_clips = maxClips;
-		const minClipSec = parseNumField(form, "min_clip_sec", "minClipSec");
-		if (minClipSec != null) body.min_clip_sec = minClipSec;
-		const maxClipSec = parseNumField(form, "max_clip_sec", "maxClipSec");
-		if (maxClipSec != null) body.max_clip_sec = maxClipSec;
-		const secondsPerClip = parseNumField(
-			form,
-			"seconds_per_clip",
-			"secondsPerClip",
-		);
-		if (secondsPerClip != null) body.seconds_per_clip = secondsPerClip;
-		if (form.has("target_aspect")) {
-			body.target_aspect = String(form.get("target_aspect") ?? "");
-		}
-		if (form.has("targetAspect")) {
-			body.targetAspect = String(form.get("targetAspect") ?? "");
-		}
-		const modelField = form.get("model");
-		if (modelField != null && String(modelField).trim() !== "") {
-			body.model = String(modelField).trim();
-		}
-		const llmModelField = form.get("llm_model");
-		if (llmModelField != null && String(llmModelField).trim() !== "") {
-			body.llm_model = String(llmModelField).trim();
-		}
-	} else if (contentType.includes("application/json")) {
-		try {
-			body = await c.req.json();
-		} catch {
-			return c.json({ error: "Invalid JSON body" }, 400);
-		}
-		videoUrl = body.video_url || body.videoUrl;
-	} else {
-		return c.json(
-			{
-				error:
-					"Unsupported Content-Type. Use application/json or multipart/form-data.",
-			},
-			415,
-		);
-	}
-
-	if (!videoUrl || !String(videoUrl).trim()) {
-		return c.json(
-			{
-				error:
-					"Provide video_url (or videoUrl) or upload a video file (field: file or video)",
-			},
-			400,
-		);
-	}
-
-	const out = await createViralClipCutJob({
-		videoUrl: String(videoUrl).trim(),
-		body,
-	});
-	const status = out.httpStatus ?? 200;
-	const { httpStatus: _h, ...rest } = out;
-	const createdId = rest?.data?.viral_clip_cut_id ?? null;
-	applyViralClipCutApiHeaders(c, { viralClipCutId: createdId });
-	return c.json(rest, status);
-});
-
-/** GET /api/viral-clip-cut/:id — job status; clips[] with video URLs when success */
-app.get("/api/viral-clip-cut/:id", async (c) => {
-	const id = c.req.param("id");
-	const out = await getViralClipCutJobStatus(id);
-	const status = out.httpStatus ?? 200;
-	const { httpStatus: _h, ...rest } = out;
-	const d = rest?.data;
-	applyViralClipCutApiHeaders(c, {
-		viralClipCutId: id,
-		clipCount: d?.clip_count,
-	});
-	return c.json(rest, status);
-});
-
 
 const port = 3002;
 console.log(`Server is running on port ${port}`);
