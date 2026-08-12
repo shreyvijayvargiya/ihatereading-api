@@ -66,6 +66,7 @@ import {
 	YoutubeTranscriptNotAvailableLanguageError,
 } from "youtube-transcript-plus";
 import { openRouterTranslateAuthMiddleware } from "./lib/translateFirebaseAuth.js";
+import { runLinkedInLeadsTurn } from "./lib/linkedinLeadsAgent.js";
 import {
 	ttsSynthesizeToBuffer,
 	pcm16ToWavBuffer,
@@ -3222,89 +3223,6 @@ app.post("/scrape-google-maps", async (c) => {
 	}
 });
 
-// ─── Google Maps scraping via Lightpanda (Zig-based headless browser) ─────────
-// Faster and lighter than Chromium — uses CDP WebSocket, same Puppeteer page API
-app.post("/scrape-google-maps-lightpanda", async (c) => {
-	try {
-		const { queries, singleQuery } = await c.req.json();
-
-		if (!queries && !singleQuery) {
-			return c.json(
-				{
-					success: false,
-					error: "Either 'queries' array or 'singleQuery' string is required",
-				},
-				400,
-			);
-		}
-
-		const queryArray = Array.isArray(queries)
-			? queries
-			: [queries || singleQuery];
-
-		if (!queryArray.length || queryArray.some((q) => !q)) {
-			return c.json(
-				{ success: false, error: "At least one valid query is needed" },
-				400,
-			);
-		}
-
-		let lp = null;
-		try {
-			lp = await startLightpanda(9222);
-
-			// Lightpanda: single context — run queries sequentially to avoid conflicts
-			const results = [];
-			for (const query of queryArray) {
-				try {
-					const places = await runMapsQueryLightpanda(lp.browser, query);
-					results.push({ query, results: places });
-				} catch (error) {
-					console.error(`[Lightpanda] Query "${query}" failed:`, error.message);
-					results.push({ query, results: [], error: error.message });
-				}
-			}
-
-			if (!Array.isArray(queries)) {
-				const result = results[0];
-				if (!result.results || result.results.length === 0) {
-					return c.json(
-						{
-							success: false,
-							error: "No results found for the given query",
-							data: result,
-						},
-						404,
-					);
-				}
-				return c.json({ success: true, browser: "lightpanda", data: result });
-			}
-
-			return c.json({
-				success: true,
-				browser: "lightpanda",
-				data: {
-					totalQueries: queryArray.length,
-					results,
-					generatedAt: new Date().toISOString(),
-				},
-			});
-		} finally {
-			if (lp) stopLightpanda(lp);
-		}
-	} catch (error) {
-		console.error("[Lightpanda] Google Maps Scraping Error:", error);
-		return c.json(
-			{
-				success: false,
-				error: "Failed to scrape Google Maps via Lightpanda",
-				details: error.message,
-			},
-			500,
-		);
-	}
-});
-
 // ─── Google Maps Agentic Search ───────────────────────────────────────────────
 // 1. OpenRouter generates 2–5 targeted Maps search queries from the user prompt
 // 2. All queries scraped in parallel (shared browser, deduped by URL)
@@ -3524,6 +3442,89 @@ app.post("/google-maps-agent", async (c) => {
 		openRouterCalls,
 		timestamp: new Date().toISOString(),
 	});
+});
+
+// ─── Google Maps scraping via Lightpanda (Zig-based headless browser) ─────────
+// Faster and lighter than Chromium — uses CDP WebSocket, same Puppeteer page API
+app.post("/scrape-google-maps-lightpanda", async (c) => {
+	try {
+		const { queries, singleQuery } = await c.req.json();
+
+		if (!queries && !singleQuery) {
+			return c.json(
+				{
+					success: false,
+					error: "Either 'queries' array or 'singleQuery' string is required",
+				},
+				400,
+			);
+		}
+
+		const queryArray = Array.isArray(queries)
+			? queries
+			: [queries || singleQuery];
+
+		if (!queryArray.length || queryArray.some((q) => !q)) {
+			return c.json(
+				{ success: false, error: "At least one valid query is needed" },
+				400,
+			);
+		}
+
+		let lp = null;
+		try {
+			lp = await startLightpanda(9222);
+
+			// Lightpanda: single context — run queries sequentially to avoid conflicts
+			const results = [];
+			for (const query of queryArray) {
+				try {
+					const places = await runMapsQueryLightpanda(lp.browser, query);
+					results.push({ query, results: places });
+				} catch (error) {
+					console.error(`[Lightpanda] Query "${query}" failed:`, error.message);
+					results.push({ query, results: [], error: error.message });
+				}
+			}
+
+			if (!Array.isArray(queries)) {
+				const result = results[0];
+				if (!result.results || result.results.length === 0) {
+					return c.json(
+						{
+							success: false,
+							error: "No results found for the given query",
+							data: result,
+						},
+						404,
+					);
+				}
+				return c.json({ success: true, browser: "lightpanda", data: result });
+			}
+
+			return c.json({
+				success: true,
+				browser: "lightpanda",
+				data: {
+					totalQueries: queryArray.length,
+					results,
+					generatedAt: new Date().toISOString(),
+				},
+			});
+		} finally {
+			if (lp) stopLightpanda(lp);
+		}
+	} catch (error) {
+		console.error("[Lightpanda] Google Maps Scraping Error:", error);
+		return c.json(
+			{
+				success: false,
+				error: "Failed to scrape Google Maps via Lightpanda",
+				details: error.message,
+			},
+			500,
+		);
+	}
 });
 
 // Enhanced Bing Search endpoint using Axios
@@ -12128,6 +12129,118 @@ app.get("/api-token/credits/:userId", async (c) => {
 		return c.json({ success: true, userId, credits });
 	} catch (err) {
 		return c.json({ error: err?.message || "Failed to fetch credits" }, 500);
+	}
+});
+
+/**
+ * LinkedIn leads agent (OpenRouter + Composio) — conversational loop on one URL.
+ *
+ * POST /linkedin-leads
+ * Body (first turn):  { "prompt": "Find SaaS founders in SF who buy AI tools" }
+ * Response:           { status: "clarifying", sessionId, questions: [...] }
+ *
+ * Body (next turn):   { "sessionId": "...", "answers": { "q1": "...", "q2": "..." } }
+ * Response:           { status: "complete", leads, summary, topLeads, searchQueries, ... }
+ *
+ * Optional: skipClarification: true to force search without Q&A.
+ * Env: OPENROUTER_API_KEY, COMPOSIO_API_KEY, COMPOSIO_LINKEDIN_SEARCH_TOOL (default WIZA_PROSPECT_SEARCH)
+ */
+app.post("/linkedin-leads", async (c) => {
+	const RATE_LIMIT = 30;
+	const RATE_WINDOW_MS = 10 * 60 * 1000;
+	const clientIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const rl = rateLimit(clientIp, RATE_LIMIT, RATE_WINDOW_MS);
+	if (!rl.allowed) {
+		c.header("Retry-After", String(rl.retryAfter));
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: rl.retryAfter,
+			},
+			429,
+		);
+	}
+	c.header("X-RateLimit-Limit", String(RATE_LIMIT));
+	c.header("X-RateLimit-Remaining", String(rl.remaining));
+
+	if (!process.env.OPENROUTER_API_KEY?.trim()) {
+		return c.json(
+			{
+				success: false,
+				error: "OPENROUTER_API_KEY not configured",
+				code: "MISSING_OPENROUTER_KEY",
+			},
+			503,
+		);
+	}
+	if (!process.env.COMPOSIO_API_KEY?.trim()) {
+		return c.json(
+			{
+				success: false,
+				error: "COMPOSIO_API_KEY not configured",
+				code: "MISSING_COMPOSIO_KEY",
+			},
+			503,
+		);
+	}
+
+	let body = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ success: false, error: "Invalid JSON body" }, 400);
+	}
+
+	const {
+		prompt,
+		sessionId,
+		answers,
+		skipClarification = false,
+		userId,
+	} = body || {};
+
+	try {
+		const result = await runLinkedInLeadsTurn({
+			prompt,
+			sessionId,
+			answers,
+			skipClarification: Boolean(skipClarification),
+			userId: userId || undefined,
+		});
+		const http =
+			result.success === false
+				? result.code === "MISSING_PROMPT"
+					? 400
+					: result.code === "INVALID_COMPOSIO_API_KEY" ||
+						  result.code === "COMPOSIO_TOOLKIT_UNAVAILABLE" ||
+						  result.code === "MISSING_COMPOSIO_API_KEY" ||
+						  result.code ===
+								"COMPOSIO_MISSING_TOOL_EXECUTION_PERMISSION"
+						? 503
+						: 500
+				: 200;
+		return c.json(
+			{
+				...result,
+				timestamp: new Date().toISOString(),
+			},
+			http,
+		);
+	} catch (err) {
+		console.error("❌ /linkedin-leads error:", err);
+		return c.json(
+			{
+				success: false,
+				status: "error",
+				error: err?.message || "LinkedIn leads agent failed",
+			},
+			500,
+		);
 	}
 });
 

@@ -24,6 +24,7 @@
 		"generate:theme-landings": "node scripts/generate-theme-landing-pages.js"
 	},
 	"dependencies": {
+		"@composio/core": "^0.13.1",
 		"@google/genai": "^1.10.0",
 		"@hono/node-server": "^1.8.0",
 		"@hono/react-renderer": "^1.0.1",
