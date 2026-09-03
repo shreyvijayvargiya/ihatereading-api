@@ -1,0 +1,141 @@
+@import "tailwindcss";
+
+@theme {
+	--color-background: #ffffff;
+	--color-foreground: #0a0a0a;
+	--color-muted: #f4f4f5;
+	--color-muted-foreground: #52525b;
+	--color-border: #e4e4e7;
+	--color-primary: #0a0a0a;
+	--color-primary-foreground: #ffffff;
+	--color-card: #ffffff;
+	--color-card-foreground: #0a0a0a;
+	--color-sidebar: #fafafa;
+	--color-sidebar-foreground: #0a0a0a;
+	--color-sidebar-accent: #f4f4f5;
+	--font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* {
+	border-color: var(--color-border);
+}
+
+html,
+body,
+#root {
+	height: 100%;
+	overflow: hidden;
+	background: #f4f4f5;
+	color: var(--color-foreground);
+	font-family: var(--font-sans);
+}
+
+body {
+	margin: 0;
+}
+
+.docs-prose {
+	max-width: 56rem;
+	color: var(--color-foreground);
+	font-size: 0.9375rem;
+	line-height: 1.65;
+}
+
+.docs-prose h1 {
+	margin: 0 0 0.75rem;
+	font-size: 1.75rem;
+	font-weight: 600;
+	letter-spacing: -0.02em;
+}
+
+.docs-prose h2 {
+	margin: 2.25rem 0 0.75rem;
+	border-bottom: 1px solid var(--color-border);
+	padding-bottom: 0.4rem;
+	font-size: 1.25rem;
+	font-weight: 600;
+}
+
+.docs-prose h3 {
+	margin: 1.75rem 0 0.5rem;
+	font-size: 1.05rem;
+	font-weight: 600;
+}
+
+.docs-prose p,
+.docs-prose ul,
+.docs-prose ol {
+	margin: 0.75rem 0;
+}
+
+.docs-prose ul,
+.docs-prose ol {
+	padding-left: 1.25rem;
+}
+
+.docs-prose li {
+	margin: 0.25rem 0;
+}
+
+.docs-prose a {
+	color: var(--color-foreground);
+	text-decoration: underline;
+	text-underline-offset: 3px;
+}
+
+.docs-prose hr {
+	margin: 2rem 0;
+	border: 0;
+	border-top: 1px solid var(--color-border);
+}
+
+.docs-prose code {
+	border: 1px solid var(--color-border);
+	border-radius: 0.25rem;
+	background: var(--color-muted);
+	padding: 0.1rem 0.3rem;
+	font-size: 0.8em;
+}
+
+.docs-prose pre {
+	overflow-x: auto;
+	border: 1px solid var(--color-border);
+	border-radius: 0.5rem;
+	background: var(--color-muted);
+	padding: 0.9rem 1rem;
+	font-size: 0.8rem;
+	line-height: 1.5;
+}
+
+.docs-prose pre code {
+	border: 0;
+	background: transparent;
+	padding: 0;
+}
+
+.docs-prose table {
+	display: block;
+	width: 100%;
+	overflow-x: auto;
+	border-collapse: collapse;
+	margin: 1rem 0;
+	font-size: 0.8rem;
+}
+
+.docs-prose th,
+.docs-prose td {
+	border: 1px solid var(--color-border);
+	padding: 0.45rem 0.65rem;
+	text-align: left;
+	vertical-align: top;
+	white-space: nowrap;
+}
+
+.docs-prose th {
+	background: var(--color-muted);
+	font-weight: 600;
+}
+
+.docs-prose td:nth-child(n + 3) {
+	white-space: normal;
+}

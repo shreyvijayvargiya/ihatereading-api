@@ -6,6 +6,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import { createHash } from "node:crypto";
 import jwt from "jsonwebtoken";
 import chromium from "@sparticuz/chromium";
+import { runMapsQuery } from "./lib/mapsScrape.js";
 import { performance } from "perf_hooks";
 import { cpus } from "os";
 import UserAgent from "user-agents";
@@ -46,6 +47,31 @@ import {
 	MAX_SUMMARY_OUTPUT_CHARS,
 } from "./lib/inkgestAgent.js";
 import { browserAgentRouter } from "./lib/inkgestBrowserAgent.js";
+import { companySeedRouter } from "./lib/companySeedRouter.js";
+import { dlcRatesRouter } from "./lib/dlcRatesRouter.js";
+import { geoPipelineRouter } from "./lib/geoPipelineRouter.js";
+import { redditMonitorRouter } from "./lib/redditMonitorRouter.js";
+import { redditAgentsRouter } from "./lib/redditAgentsRouter.js";
+import { dashboardRouter } from "./lib/dashboardRouter.js";
+import { mapsAgentsRouter } from "./lib/mapsAgentsRouter.js";
+import { angelInvestorsRouter } from "./lib/angelInvestorsRouter.js";
+import { ycCompaniesRouter } from "./lib/ycCompaniesRouter.js";
+import { topMobileAppsRouter } from "./lib/topMobileAppsRouter.js";
+import { socialScrapersRouter } from "./lib/socialScrapersRouter.js";
+import { individualInfluencersRouter } from "./lib/individualInfluencersRouter.js";
+import { aiStylesPromptsRouter } from "./lib/aiStylesPromptsRouter.js";
+import { karyamLinkedInRouter } from "./lib/karyamLinkedInRouter.js";
+import { karyamFoundersRouter } from "./lib/karyamFoundersRouter.js";
+import { claudeTopratedRouter } from "./lib/claudeTopratedRouter.js";
+import { redditAiScraperRouter } from "./lib/redditAiScraperRouter.js";
+import { devMagazineRouter } from "./lib/devMagazineRouter.js";
+import { internetNewsRouter } from "./lib/internetNewsRouter.js";
+import { englandClubsRouter } from "./lib/englandClubsRouter.js";
+import { contentResearchRouter } from "./lib/contentResearchRouter.js";
+import {
+	buildGoogleNewsUrl,
+	extractGoogleNewsItems,
+} from "./lib/googleNews.js";
 import { logger } from "hono/logger";
 import UserAgents from "user-agents";
 import browserPool from "./browser-pool.js";
@@ -67,6 +93,7 @@ import {
 } from "youtube-transcript-plus";
 import { openRouterTranslateAuthMiddleware } from "./lib/translateFirebaseAuth.js";
 import { runLinkedInLeadsTurn } from "./lib/linkedinLeadsAgent.js";
+import { runMapsLeadsTurn } from "./lib/mapsLeadsAgent.js";
 import {
 	ttsSynthesizeToBuffer,
 	pcm16ToWavBuffer,
@@ -85,6 +112,7 @@ import {
 	createViralClipCutJob,
 	getViralClipCutJobStatus,
 } from "./lib/viralClipCutter.js";
+import { generateUrlIgCarousel } from "./lib/youtubeIgCarousel.js";
 import { GoogleGenAI } from "@google/genai";
 import {
 	buildDesignThemePromptSection,
@@ -1756,6 +1784,8 @@ app.use(
 			"http://localhost:4001",
 			"http://localhost:3000",
 			"http://localhost:3001",
+			"http://localhost:5173",
+			"http://127.0.0.1:5173",
 			"https://ihatereading.in",
 			"https://www.inkgest.com",
 			"https://aantraa.vercel.app",
@@ -1836,6 +1866,54 @@ app.get("/health", (c) => c.json({ ok: true, ts: Date.now() }));
 
 // Browser agent (Puppeteer ReAct loop for dynamic SPAs)
 app.route("/browser-agent", browserAgentRouter);
+
+// Company seed, blog topics, AI visibility (Firestore companySeeds/{userId})
+app.route("/", companySeedRouter);
+
+// Rajasthan DLC / circle rates (government floor). Other states 501 for now.
+app.route("/", dlcRatesRouter);
+
+// SEO/GEO pipeline: question mining + blog idea synthesis (Firestore)
+app.route("/", geoPipelineRouter);
+
+// Reddit monitor: RSS + Claude relevance (read-only, no Reddit auth)
+app.route("/", redditMonitorRouter);
+
+// Reddit agents: karyam / ihatereading / saas — CLI or POST /run only (no auto scheduler)
+app.route("/", redditAgentsRouter);
+
+app.route("/", dashboardRouter);
+
+// Google Maps local leads — karyam Kota/Jaipur — CLI or POST /run only
+app.route("/", mapsAgentsRouter);
+
+app.route("/", angelInvestorsRouter);
+
+app.route("/", ycCompaniesRouter);
+
+app.route("/", topMobileAppsRouter);
+
+app.route("/", socialScrapersRouter);
+
+app.route("/", individualInfluencersRouter);
+
+app.route("/", aiStylesPromptsRouter);
+
+app.route("/", karyamLinkedInRouter);
+app.route("/", karyamFoundersRouter);
+
+app.route("/", claudeTopratedRouter);
+
+app.route("/", redditAiScraperRouter);
+
+app.route("/", devMagazineRouter);
+
+app.route("/", internetNewsRouter);
+
+app.route("/", englandClubsRouter);
+
+// Content research planner: keywords + Reddit + internal + external → ideas
+app.route("/", contentResearchRouter);
 
 app.post("/post-to-devto", async (c) => {
 	try {
@@ -2942,175 +3020,7 @@ function parseJsonFromLLM(text) {
 	return JSON.parse(s);
 }
 
-/**
- * Scrapes a single Google Maps query using an existing puppeteer browser instance.
- * Returns an array of enriched place objects.
- */
-async function runMapsQuery(browser, query) {
-	const page = await browser.newPage();
-	try {
-		await page.setUserAgent(
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		);
-		await page.setRequestInterception(true);
-		page.on("request", (req) => {
-			if (["image", "font", "stylesheet", "media"].includes(req.resourceType()))
-				req.abort();
-			else req.continue();
-		});
-
-		await page.goto(
-			`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`,
-			{ waitUntil: "networkidle0", timeout: 30000 },
-		);
-		await new Promise((r) => setTimeout(r, 5000));
-
-		await page.evaluate(async () => {
-			const feed = document.querySelector('div[role="feed"]');
-			if (!feed) return;
-			for (let i = 0; i < 5; i++) {
-				feed.scrollBy(0, 1000);
-				await new Promise((r) => setTimeout(r, 1000));
-			}
-		});
-
-		// Pass 1: names + URLs + coordinates (from URL params)
-		const feedEntries = await page.evaluate(() => {
-			const feed = document.querySelector('div[role="feed"]');
-			if (!feed) return [];
-			return Array.from(feed.querySelectorAll('a[href*="/maps/place/"]'))
-				.slice(0, 10)
-				.map((card) => {
-					const url = card.href || "";
-					const latMatch = url.match(/[!,]3d(-?[\d.]+)/);
-					const lngMatch = url.match(/[!,]4d(-?[\d.]+)/);
-					return {
-						name: card.getAttribute("aria-label")?.trim() || "",
-						url,
-						coordinates:
-							latMatch && lngMatch
-								? { lat: parseFloat(latMatch[1]), lng: parseFloat(lngMatch[1]) }
-								: null,
-					};
-				})
-				.filter((item) => item.name.length > 0);
-		});
-
-		// Pass 2: visit each place page for rating, reviews, address, phone, website
-		const places = await Promise.all(
-			feedEntries.map(async (entry) => {
-				const detailPage = await browser.newPage();
-				try {
-					await detailPage.setRequestInterception(true);
-					detailPage.on("request", (req) => {
-						if (
-							["image", "font", "stylesheet", "media"].includes(
-								req.resourceType(),
-							)
-						)
-							req.abort();
-						else req.continue();
-					});
-					await detailPage.goto(entry.url, {
-						waitUntil: "domcontentloaded",
-						timeout: 15000,
-					});
-					await new Promise((r) => setTimeout(r, 2000));
-
-					const details = await detailPage.evaluate(() => {
-						let rating = null;
-						for (const el of document.querySelectorAll("[aria-label]")) {
-							const al = el.getAttribute("aria-label");
-							const m =
-								al.match(/([1-5]\.[0-9])\s*stars?/i) ||
-								al.match(/rated\s+([1-5]\.[0-9])/i);
-							if (m) {
-								rating = parseFloat(m[1]);
-								break;
-							}
-						}
-						let reviews = null;
-						for (const el of document.querySelectorAll("[aria-label]")) {
-							const al = el.getAttribute("aria-label");
-							const m = al.match(/([\d,]+)\s*reviews?/i);
-							if (m) {
-								reviews = m[1].replace(/,/g, "");
-								break;
-							}
-						}
-						const addrEl =
-							document.querySelector('button[data-item-id="address"]') ||
-							document.querySelector('[data-tooltip="Copy address"]');
-						const address =
-							addrEl
-								?.getAttribute("aria-label")
-								?.replace(/^Address:\s*/i, "")
-								?.trim() || "";
-						const phoneEl =
-							document.querySelector('[data-item-id^="phone"]') ||
-							document.querySelector('[data-tooltip="Copy phone number"]');
-						const phone =
-							phoneEl
-								?.getAttribute("aria-label")
-								?.replace(/^Phone:\s*/i, "")
-								?.trim() ||
-							phoneEl?.textContent?.trim() ||
-							"";
-						const websiteEl = document.querySelector(
-							'a[data-item-id="authority"]',
-						);
-						const rawWebsite = websiteEl?.href || "";
-						let website = rawWebsite;
-						try {
-							const u = new URL(rawWebsite);
-							const q = u.searchParams.get("q");
-							if (q) website = q;
-						} catch {
-							/* keep rawWebsite */
-						}
-						const category =
-							document
-								.querySelector('button[jsaction*="category"]')
-								?.textContent?.trim() || "";
-						const image =
-							document
-								.querySelector('meta[property="og:image"]')
-								?.getAttribute("content") || "";
-						return {
-							rating,
-							reviews,
-							address,
-							phone,
-							website,
-							category,
-							image,
-						};
-					});
-
-					return { ...entry, ...details };
-				} catch {
-					return {
-						...entry,
-						rating: null,
-						reviews: null,
-						address: "",
-						phone: "",
-						website: "",
-						category: "",
-						image: "",
-					};
-				} finally {
-					await detailPage.close().catch(() => {});
-				}
-			}),
-		);
-
-		return places;
-	} finally {
-		await page.close().catch(() => {});
-	}
-}
-
+// Google Maps scraping — see lib/mapsScrape.js
 
 // Google Maps scraping endpoint using headless Chrome
 app.post("/scrape-google-maps", async (c) => {
@@ -5582,7 +5492,12 @@ app.post("/scrape", async (c) => {
 	c.header("X-RateLimit-Window", "10 minutes");
 
 	const body = await c.req.json().catch(() => ({}));
-	const url = parseScrapeUrlInput(body.url, body.urls);
+	const keyword =
+		typeof body.keyword === "string" ? body.keyword.trim() : "";
+	let url = parseScrapeUrlInput(body.url, body.urls);
+	if (!url && keyword) {
+		url = buildGoogleNewsUrl(keyword);
+	}
 	const options = parseScrapeOptions(body);
 
 	if (!url || !isValidURL(url)) {
@@ -5591,7 +5506,7 @@ app.post("/scrape", async (c) => {
 				success: false,
 				error: "URL is required or invalid",
 				details:
-					"Provide `url` (string) or `urls` with exactly one entry — same as /scrape-multiple.",
+					"Provide `url` (string), `urls` with exactly one entry, or `keyword` to scrape Google News.",
 			},
 			400,
 		);
@@ -5599,8 +5514,15 @@ app.post("/scrape", async (c) => {
 
 	try {
 		const row = await scrapeOneUrlResult(url, options);
+		const news = keyword
+			? extractGoogleNewsItems(row, {
+					limit: body.limit || 20,
+					keyword,
+				})
+			: undefined;
 		return c.json({
 			...row,
+			...(keyword ? { keyword, query: keyword, news } : {}),
 			timestamp: new Date().toISOString(),
 			poolStats: browserPool.stats,
 		});
@@ -9240,6 +9162,45 @@ app.post("/scrape-youtube", async (c) => {
 	}
 });
 
+async function handleIgCarousel(c) {
+	let body = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		body = {};
+	}
+	const url = body.url || body.youtubeUrl || body.id;
+	if (!url) {
+		return c.json({ success: false, error: "url is required" }, 400);
+	}
+	try {
+		const result = await generateUrlIgCarousel({
+			url,
+			slides: body.slides,
+			style: body.style,
+			c,
+		});
+		return c.json({
+			success: true,
+			...result,
+			timestamp: new Date().toISOString(),
+		});
+	} catch (err) {
+		console.error("[/ig-carousel]", err);
+		return c.json(
+			{
+				success: false,
+				error: err?.message || "Failed to generate IG carousel",
+			},
+			500,
+		);
+	}
+}
+
+app.post("/ig-carousel", handleIgCarousel);
+app.post("/url-ig-carousel", handleIgCarousel);
+app.post("/youtube-ig-carousel", handleIgCarousel);
+
 // POST /repo/analyze — full AST analysis (public repos, no token)
 app.post("/repo/analyze", async (c) => {
 	try {
@@ -11099,30 +11060,34 @@ Rules:
 	}
 });
 
-// Google News Scraping Endpoint
+// Google News Scraping Endpoint — { keyword } or legacy { city, state }
 app.post("/scrape-google-news", async (c) => {
 	const operationId = performanceMonitor.startOperation("scrap_google_news");
 
 	try {
-		const { city, state, limit = 20 } = await c.req.json();
+		const body = await c.req.json().catch(() => ({}));
+		const keyword = String(
+			body.keyword ||
+				body.q ||
+				(body.city && body.state ? `${body.city} ${body.state}` : ""),
+		).trim();
 
-		if (!city || !state) {
+		if (!keyword) {
 			performanceMonitor.endOperation(operationId);
 			return c.json(
 				{
 					success: false,
-					error: "City and state are required",
+					error: "keyword is required",
+					details: "Pass `keyword` (or legacy `city` + `state`).",
 				},
 				400,
 			);
 		}
 
-		const articleLimit = Math.min(Math.max(parseInt(limit) || 20, 1), 50);
+		const articleLimit = Math.min(Math.max(parseInt(body.limit) || 20, 1), 50);
+		const googleNewsUrl = buildGoogleNewsUrl(keyword);
 
-		const searchQuery = encodeURIComponent(`${city} ${state}`);
-		const googleNewsUrl = `https://news.google.com/search?q=${searchQuery}&hl=en&gl=US&ceid=US%3Aen`;
-
-		console.log(`Scraping Google News for: ${city}, ${state}`);
+		console.log(`Scraping Google News for: ${keyword}`);
 
 		const scrapeResult = await scrapeSingleUrlWithPuppeteer(googleNewsUrl, {
 			includeSemanticContent: true,
@@ -11132,53 +11097,17 @@ app.post("/scrape-google-news", async (c) => {
 			timeout: 30000,
 		});
 
-		const scrapedData = scrapeResult?.data ?? scrapeResult?.scrapedData ?? {};
-		const rawLinks = scrapedData?.links ?? [];
-		const headings = [
-			...(scrapedData?.content?.h3 ?? []),
-			...(scrapedData?.content?.h4 ?? []),
-		];
-
-		// Google News article links contain "/articles/" or "/read/" in the path
-		const articleLinks = rawLinks.filter((link) => {
-			const href = link?.href ?? "";
-			return (
-				href.includes("/articles/") ||
-				href.includes("/read/") ||
-				href.includes("news.google.com/stories")
-			);
-		});
-
-		const news = articleLinks.slice(0, articleLimit).map((link, index) => {
-			const title =
-				link.text?.trim() ||
-				headings[index] ||
-				link.title?.trim() ||
-				"Untitled";
-			const url = link.href;
-			let source = "Unknown";
-			try {
-				source = new URL(url).hostname.replace(/^www\./, "");
-			} catch {}
-			return {
-				title,
-				url,
-				source,
-				snippet: link.title?.trim() || "",
-				metadata: {
-					ogTitle: scrapedData?.metadata?.["og:title"] ?? null,
-					ogDescription: scrapedData?.metadata?.["og:description"] ?? null,
-					pageTitle: scrapedData?.title ?? null,
-				},
-				index: index + 1,
-			};
+		const news = extractGoogleNewsItems(scrapeResult, {
+			limit: articleLimit,
+			keyword,
 		});
 
 		performanceMonitor.endOperation(operationId);
 
 		return c.json({
 			success: true,
-			query: `${city}, ${state}`,
+			keyword,
+			query: keyword,
 			limit: articleLimit,
 			total: news.length,
 			news,
@@ -12238,6 +12167,96 @@ app.post("/linkedin-leads", async (c) => {
 				success: false,
 				status: "error",
 				error: err?.message || "LinkedIn leads agent failed",
+			},
+			500,
+		);
+	}
+});
+
+/**
+ * Maps + Google Search leads agent — one prompt, optional clarifying questions.
+ *
+ * POST /maps-leads
+ * First:  { "prompt": "cafes in Kota" }  or  { "prompt": "https://saascrm.site find similar businesses" }
+ * Ask:    { status: "clarifying", sessionId, questions }
+ * Next:   { "sessionId": "...", "answers": { "q1": "Kota", "q2": "..." } }
+ * Done:   { status: "complete", leads, summary, queries }
+ *
+ * Optional: skipClarification: true, geo: "in"
+ */
+app.post("/maps-leads", async (c) => {
+	const RATE_LIMIT = 20;
+	const RATE_WINDOW_MS = 10 * 60 * 1000;
+	const clientIp =
+		c.req.header("x-forwarded-for")?.split(",")[0].trim() ||
+		c.req.header("x-real-ip") ||
+		c.req.header("cf-connecting-ip") ||
+		"unknown";
+	const rl = rateLimit(clientIp, RATE_LIMIT, RATE_WINDOW_MS);
+	if (!rl.allowed) {
+		c.header("Retry-After", String(rl.retryAfter));
+		return c.json(
+			{
+				success: false,
+				error: "Rate limit exceeded",
+				retryAfter: rl.retryAfter,
+			},
+			429,
+		);
+	}
+
+	if (!process.env.OPENROUTER_API_KEY?.trim()) {
+		return c.json(
+			{
+				success: false,
+				error: "OPENROUTER_API_KEY not configured",
+				code: "MISSING_OPENROUTER_KEY",
+			},
+			503,
+		);
+	}
+
+	let body = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ success: false, error: "Invalid JSON body" }, 400);
+	}
+
+	const {
+		prompt,
+		sessionId,
+		answers,
+		skipClarification = false,
+		geo = "in",
+	} = body || {};
+
+	try {
+		const result = await runMapsLeadsTurn({
+			prompt,
+			sessionId,
+			answers,
+			skipClarification: Boolean(skipClarification),
+			geo: String(geo || "in").slice(0, 2).toLowerCase(),
+			c,
+		});
+		const http =
+			result.success === false
+				? result.code === "MISSING_PROMPT"
+					? 400
+					: 500
+				: 200;
+		return c.json(
+			{ ...result, timestamp: new Date().toISOString() },
+			http,
+		);
+	} catch (err) {
+		console.error("❌ /maps-leads error:", err);
+		return c.json(
+			{
+				success: false,
+				status: "error",
+				error: err?.message || "Maps leads agent failed",
 			},
 			500,
 		);

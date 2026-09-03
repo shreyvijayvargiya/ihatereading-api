@@ -1,0 +1,102 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "blogIdeas",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "priorityScore", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "blogIdeas",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "priorityScore", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "keywordData",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "cluster", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "questionData",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "cluster", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "questionData",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "answeredOnSite", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "competitorData",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "contentGap", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "aiVisibilityResults",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "runId", "order": "ASCENDING" },
+        { "fieldPath": "cited", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "researchRuns",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "siteProfileId", "order": "ASCENDING" },
+        { "fieldPath": "startedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "redditPosts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "subreddit", "order": "ASCENDING" },
+        { "fieldPath": "publishedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "redditComments",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "subreddit", "order": "ASCENDING" },
+        { "fieldPath": "publishedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "threadMatches",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "relevanceScore", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "threadMatches",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "sourceType", "order": "ASCENDING" },
+        { "fieldPath": "sourceId", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

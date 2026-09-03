@@ -1,5 +1,9 @@
 {
-	
+	"functions": {
+		"index.js": {
+			"maxDuration": 300
+		}
+	},
 	"rewrites": [
 		{
 			"source": "/(.*)",

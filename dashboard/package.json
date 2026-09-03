@@ -1,0 +1,33 @@
+{
+	"name": "scrape-dashboard",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"dev": "vite --open --port 5173",
+		"build": "vite build",
+		"preview": "vite preview --port 5173"
+	},
+	"dependencies": {
+		"@tanstack/react-query": "^5.85.5",
+		"@tanstack/react-router": "^1.131.27",
+		"@tanstack/react-table": "^8.21.3",
+		"class-variance-authority": "^0.7.1",
+		"clsx": "^2.1.1",
+		"lucide-react": "^0.511.0",
+		"react": "^19.1.1",
+		"react-dom": "^19.1.1",
+		"react-markdown": "^10.1.0",
+		"remark-gfm": "^4.0.1",
+		"tailwind-merge": "^3.3.1"
+	},
+	"devDependencies": {
+		"@tailwindcss/vite": "^4.1.12",
+		"@types/react": "^19.1.10",
+		"@types/react-dom": "^19.1.7",
+		"@vitejs/plugin-react": "^5.0.2",
+		"tailwindcss": "^4.1.12",
+		"typescript": "^5.9.2",
+		"vite": "^7.1.3"
+	}
+}
