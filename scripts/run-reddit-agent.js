@@ -20,11 +20,13 @@ import { runDirectoryIdeasAgent } from "../lib/redditAgents/directoryIdeas.js";
 import { runScrapingProblemsAgent } from "../lib/redditAgents/scrapingProblems.js";
 import { runBuildsaasAgent } from "../lib/redditAgents/buildsaas.js";
 import { listAgentPosts } from "../lib/redditAgents/core.js";
+import { cliRedditAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "").toLowerCase();
 const skipGoogle = args.includes("--skip-google");
-const llm = args.includes("--llm") || args.includes("--enrich");
+const ai = cliRedditAiOpts(args);
+const llm = Boolean(ai.useAI);
 
 async function main() {
 	if (!cmd || cmd === "help" || cmd === "--help") {
@@ -45,6 +47,7 @@ Default is scrape-only (no OpenRouter). Pass --llm to score posts.
   npm run reddit:agent -- buildsaas
   npm run reddit:agent -- saas --skip-google
   npm run reddit:agent -- saas --llm
+  npm run reddit:agent -- saas --llm --model google/gemini-2.0-flash-exp:free
   npm run reddit:agent -- list
   npm run reddit:agent -- relevant <agentId>
 
@@ -75,8 +78,8 @@ HTTP (server must be running):
 		process.exit(0);
 	}
 
-	if (llm && !process.env.OPENROUTER_API_KEY?.trim()) {
-		console.error("OPENROUTER_API_KEY is required with --llm / --enrich");
+	if (llm && !hasOpenRouterKey()) {
+		console.error("OPENROUTER_API_KEY is required with --llm / --use-ai");
 		process.exit(1);
 	}
 
@@ -87,13 +90,13 @@ HTTP (server must be running):
 	}
 
 	console.log(
-		`[cli] starting agent: ${agent.id} (${agent.name}) llm=${llm ? "on" : "off (scrape-only)"}`,
+		`[cli] starting agent: ${agent.id} (${agent.name}) llm=${llm ? ai.model : "off (scrape-only)"}`,
 	);
 	const baseUrl =
 		process.env.SCRAPE_API_BASE_URL ||
 		process.env.INKGEST_SCRAPE_BASE_URL ||
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
-	const runOpts = { skipGoogle, baseUrl, ...(llm ? { llm: true } : {}) };
+	const runOpts = { skipGoogle, baseUrl, ...ai };
 	let summary;
 	if (cmd === "karyam") summary = await runKaryamAgent(runOpts);
 	else if (cmd === "ihatereading") summary = await runIhatereadingAgent(runOpts);

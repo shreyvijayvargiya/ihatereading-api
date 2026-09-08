@@ -12,18 +12,20 @@ import "dotenv/config";
 import { getAgent } from "../lib/redditAgents/configs.js";
 import { listAgentPosts } from "../lib/redditAgents/core.js";
 import { runDirectoryIdeasAgent } from "../lib/redditAgents/directoryIdeas.js";
+import { cliRedditAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
 const skipGoogle = args.includes("--skip-google");
-const llm = args.includes("--llm") || args.includes("--enrich");
+const ai = cliRedditAiOpts(args);
+const llm = Boolean(ai.useAI);
 const intervalMs = Number(process.env.REDDIT_DIRECTORIES_INTERVAL_MS || 30 * 1000);
 
 async function runOnce() {
-	if (llm && !process.env.OPENROUTER_API_KEY?.trim()) {
-		console.error("OPENROUTER_API_KEY required with --llm / --enrich");
+	if (llm && !hasOpenRouterKey()) {
+		console.error("OPENROUTER_API_KEY required with --llm / --use-ai");
 		process.exit(1);
 	}
 	const baseUrl =
@@ -32,12 +34,12 @@ async function runOnce() {
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 	const agent = getAgent("directories");
 	console.log(
-		`[directories] ${agent.subsPerRun} subs/tick, google=${skipGoogle ? "off" : "on"} llm=${llm ? "on" : "off"} base=${baseUrl}`,
+		`[directories] ${agent.subsPerRun} subs/tick, google=${skipGoogle ? "off" : "on"} llm=${llm ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runDirectoryIdeasAgent({
 		baseUrl,
 		skipGoogle,
-		...(llm ? { llm: true } : {}),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

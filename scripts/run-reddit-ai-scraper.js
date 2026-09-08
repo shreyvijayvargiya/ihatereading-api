@@ -16,6 +16,7 @@ import {
 	listAiScraperTopics,
 	runRedditAiScraper,
 } from "../lib/redditAiScraper/orchestrator.js";
+import { cliRedditAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -23,7 +24,8 @@ const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
 const skipGoogle = args.includes("--skip-google");
 const rediscover = args.includes("--rediscover");
-const llm = args.includes("--llm") || args.includes("--enrich");
+const ai = cliRedditAiOpts(args);
+const llm = Boolean(ai.useAI);
 
 function flag(name) {
 	const i = args.indexOf(name);
@@ -37,8 +39,8 @@ const prompt =
 const intervalMs = Number(process.env.REDDIT_AI_SCRAPER_INTERVAL_MS || 30 * 1000);
 
 async function runOnce() {
-	if (llm && !process.env.OPENROUTER_API_KEY?.trim()) {
-		console.error("OPENROUTER_API_KEY required with --llm / --enrich");
+	if (llm && !hasOpenRouterKey()) {
+		console.error("OPENROUTER_API_KEY required with --llm / --use-ai");
 		process.exit(1);
 	}
 	if (!String(prompt).trim()) {
@@ -50,14 +52,14 @@ async function runOnce() {
 		process.env.INKGEST_SCRAPE_BASE_URL ||
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 	console.log(
-		`[reddit-ai-scraper] llm=${llm ? "on" : "off"} prompt=${JSON.stringify(prompt).slice(0, 80)}`,
+		`[reddit-ai-scraper] llm=${llm ? ai.model : "off"} prompt=${JSON.stringify(prompt).slice(0, 80)}`,
 	);
 	const summary = await runRedditAiScraper({
 		prompt,
 		baseUrl,
 		skipGoogle,
 		rediscover,
-		...(llm ? { llm: true } : {}),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

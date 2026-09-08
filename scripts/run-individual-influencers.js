@@ -20,7 +20,7 @@ import {
 	listInfluencers,
 	runIndividualInfluencersAgent,
 } from "../lib/individualInfluencers/orchestrator.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -32,7 +32,8 @@ function flag(name) {
 
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const platform = flag("--platform");
 const niche = flag("--niche") || flag("--tag");
 const queriesPerRun = flag("--queries") ? Number(flag("--queries")) : undefined;
@@ -49,7 +50,7 @@ async function runOnce() {
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 
 	console.log(
-		`[influencers] platform=${platform || "all"} niche=${niche || "all"} llm=${useAI ? "on" : "off"} base=${baseUrl}`,
+		`[influencers] platform=${platform || "all"} niche=${niche || "all"} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runIndividualInfluencersAgent({
 		baseUrl,
@@ -57,7 +58,7 @@ async function runOnce() {
 		niche,
 		queriesPerRun,
 		enrich: !args.includes("--no-enrich"),
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

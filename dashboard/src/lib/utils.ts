@@ -29,7 +29,7 @@ export function rowHref(doc: Record<string, unknown>) {
 		String(doc.wikiUrl || "") ||
 		String(doc.threadUrl || "") ||
 		redditUrl(doc) ||
-		String(doc.url || doc.mapsUrl || doc.linkedinUrl || doc.ycUrl || doc.website || doc.profileUrl || doc.sourceUrl || "")
+		String(doc.url || doc.mapsUrl || doc.linkedinUrl || doc.a16zUrl || doc.ycUrl || doc.website || doc.profileUrl || doc.sourceUrl || "")
 	);
 }
 
@@ -69,6 +69,7 @@ export function rowMeta(doc: Record<string, unknown>) {
 					doc.platform ||
 					doc.batch ||
 					doc.category ||
+					doc.domain ||
 					doc.source ||
 					"—"),
 	);

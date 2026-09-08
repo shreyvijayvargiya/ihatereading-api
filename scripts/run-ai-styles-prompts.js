@@ -14,7 +14,7 @@ import {
 	listPrompts,
 	runAiStylesPromptsAgent,
 } from "../lib/aiStylesPrompts/orchestrator.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -26,7 +26,8 @@ function flag(name) {
 
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const stylesPerRun = flag("--styles") ? Number(flag("--styles")) : undefined;
 const intervalMs = Number(process.env.AI_STYLES_INTERVAL_MS || 30 * 1000);
 
@@ -41,12 +42,12 @@ async function runOnce() {
 		process.exit(1);
 	}
 
-	console.log(`[ai-styles] list=${REFERO_LIST_URL} llm=${useAI ? "on" : "off"} base=${baseUrl}`);
+	console.log(`[ai-styles] list=${REFERO_LIST_URL} llm=${useAI ? ai.model : "off"} base=${baseUrl}`);
 	const summary = await runAiStylesPromptsAgent({
 		baseUrl,
 		stylesPerRun,
 		scrape: !args.includes("--no-scrape"),
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

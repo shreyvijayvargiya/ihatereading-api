@@ -16,7 +16,7 @@ import {
 	listInvestors,
 	runAngelInvestorsAgent,
 } from "../lib/angelInvestors/orchestrator.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -27,7 +27,8 @@ function flag(name) {
 }
 
 const hasLoop = args.includes("--loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const platform = flag("--platform");
 const queriesPerRun = flag("--queries") ? Number(flag("--queries")) : undefined;
 const intervalMs = Number(process.env.ANGEL_INTERVAL_MS || 30 * 1000);
@@ -43,14 +44,14 @@ async function runOnce() {
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 
 	console.log(
-		`[angel-cli] angel-seed — platform=${platform || "all"} llm=${useAI ? "on" : "off"} base=${baseUrl}`,
+		`[angel-cli] angel-seed — platform=${platform || "all"} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runAngelInvestorsAgent({
 		baseUrl,
 		platform,
 		queriesPerRun,
 		enrich: !args.includes("--no-enrich"),
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;
@@ -64,6 +65,7 @@ Default is scrape-only. Pass --use-ai to score with OpenRouter.
 
   npm run angel:investors
   npm run angel:investors -- --use-ai
+  npm run angel:investors -- --use-ai --model google/gemini-2.0-flash-exp:free
   npm run angel:investors -- --platform x
   npm run angel:investors -- --platform linkedin --queries 2
   npm run angel:investors -- --loop

@@ -22,7 +22,7 @@ import {
 } from "../lib/mapsAgents/configs.js";
 import { listMapsLeads } from "../lib/mapsAgents/core.js";
 import { runKaryamMapsLeadsAgent } from "../lib/mapsAgents/karyamLocal.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -34,7 +34,8 @@ function flag(name) {
 
 const hasLoop = args.includes("--loop");
 const allKeywords = args.includes("--all-keywords");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const city = flag("--city");
 const queriesPerRun = flag("--queries") ? Number(flag("--queries")) : undefined;
 const intervalMs = Number(
@@ -55,14 +56,14 @@ async function runOnce() {
 
 	const resolved = city ? resolveCity(city) : null;
 	console.log(
-		`[maps-cli] karyam — city=${resolved?.id || city || "all"} llm=${useAI ? "on" : "off"} scrape=${scrapeMode}`,
+		`[maps-cli] karyam — city=${resolved?.id || city || "all"} llm=${useAI ? ai.model : "off"} scrape=${scrapeMode}`,
 	);
 	const summary = await runKaryamMapsLeadsAgent({
 		baseUrl,
 		city,
 		queriesPerRun,
 		allKeywords,
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

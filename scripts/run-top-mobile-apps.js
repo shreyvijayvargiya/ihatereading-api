@@ -20,7 +20,7 @@ import {
 	listApps,
 	runTopMobileAppsAgent,
 } from "../lib/topApps/orchestrator.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -32,7 +32,8 @@ function flag(name) {
 
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const category = flag("--category");
 const platform = flag("--platform");
 const sourcesPerRun = flag("--sources") ? Number(flag("--sources")) : undefined;
@@ -54,7 +55,7 @@ async function runOnce() {
 	}
 
 	console.log(
-		`[top-mobile-apps] category=${category || "all"} platform=${platform || "both"} llm=${useAI ? "on" : "off"} base=${baseUrl}`,
+		`[top-mobile-apps] category=${category || "all"} platform=${platform || "both"} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runTopMobileAppsAgent({
 		baseUrl,
@@ -62,7 +63,7 @@ async function runOnce() {
 		platform,
 		sourcesPerRun,
 		enrich: !args.includes("--no-enrich"),
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

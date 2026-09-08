@@ -25,7 +25,9 @@ Top mobile apps can run without Puppeteer (HTTP Play pages + iTunes RSS).
 | 6 | Karyam LinkedIn leads | `ihatereading-4ba52` / `(default)` | `karyamLinkedInLeads` | `karyamLinkedInState` | `npm run karyam:linkedin` | `POST /karyam-linkedin` |
 | 7 | Angel / seed investors | `ihatereading-4ba52` / `(default)` | `angel-seed-investors` | `angelSeedInvestorState` | `npm run angel:investors` | `POST /angel-investors/run` |
 | 8 | YC companies | `ihatereading-4ba52` / `(default)` | `yc-companies` | `ycCompaniesState` | `npm run yc:companies` | `POST /yc-companies/run` |
+| 23 | a16z companies | `ihatereading-4ba52` / `(default)` | `yc-companies` | `a16zCompaniesState` | `npm run a16z:companies` | `POST /a16z-companies/run` |
 | 9 | Top mobile apps | `ihatereading-4ba52` / `(default)` | `top-mobile-apps` | `topMobileAppsAgentState` | `npm run top:mobile-apps` | `POST /top-mobile-apps/run` |
+| 24 | Business CRMs | `ihatereading-4ba52` / `(default)` | `business-crms` | `businessCrmsState` | `npm run crm:directory` | `POST /business-crms/run` |
 | 10 | Content research | `ihatereading-4ba52` / `(default)` | `content_research_runs`, `content_calendar` | — | — | `POST /api/content-research` |
 | 11 | Company seed | `ihatereading-4ba52` / `(default)` | `companySeeds` | — | — | `POST /company-seed` |
 | 12 | Individual influencers | `ihatereading-4ba52` / `(default)` | `individual-influencers` | `individualInfluencersState` | `npm run top:influencers` | `POST /individual-influencers/run` |
@@ -38,7 +40,15 @@ Top mobile apps can run without Puppeteer (HTTP Play pages + iTunes RSS).
 
 
 Shared scrape primitives: `/scrape`, `/scrape-google-news`, `/scrape-google-maps`, `/google-search`, `/scrape-instagram`, `/scrape-x`, `/scrape-youtube-channel`.
-Shared LLM: OpenRouter (`OPENROUTER_API_KEY`) — **opt-in** for Reddit agents (`--llm` / `{ "llm": true }`). Default Reddit runs are scrape-only.
+Shared LLM: OpenRouter (`OPENROUTER_API_KEY`) — **opt-in**. Default is scrape-only.
+
+```bash
+# any scrape CLI
+--use-ai                         # or --llm for Reddit
+--model google/gemini-2.0-flash-exp:free   # optional; this is the default
+```
+
+HTTP: `{ "useAI": true, "model": "google/gemini-2.0-flash-exp:free" }`. If `model` is omitted, agents use free Gemini on OpenRouter (`OPENROUTER_MODEL` overrides).
 
 ---
 
@@ -408,7 +418,7 @@ Env: `ANGEL_INTERVAL_MS=30000`, `ANGEL_QUERIES_PER_RUN=3`, `ANGEL_ENRICH_PER_RUN
 
 ## 8. YC Companies
 
-**Purpose:** Real YC startups (hiring / batch / status) — not listicle junk.
+**Purpose:** Real YC startups (hiring / batch / status) — not listicle junk. a16z portfolio companies are stored in this same collection (`sourceType: "a16z"`).
 
 
 |                |                                                                                   |
@@ -432,6 +442,44 @@ npm run yc:companies -- sources
 ```
 
 Env: `YC_INTERVAL_MS=30000`, `YC_PAGE_SIZE=40`, `YC_ENRICH_PER_RUN=8`.
+
+---
+
+
+
+## 23. a16z Companies
+
+**Purpose:** Active Andreessen Horowitz portfolio companies from [a16z.com/portfolio](https://a16z.com/portfolio/?status=Active). **Stored in the same `yc-companies` collection** (YC dashboard page). Website enrich runs **in the same agent** (no separate enrich CLI).
+
+Copy leftover docs from the old `a16z-companies` collection:
+
+```bash
+npm run a16z:companies:merge
+```
+
+
+|                |                                                                                   |
+| -------------- | --------------------------------------------------------------------------------- |
+| **Collection** | `yc-companies` (shared with YC)                                                   |
+| **State**      | `a16zCompaniesState`                                                              |
+| **Code**       | `lib/a16zCompanies/`*                                                             |
+| **CLI**        | `npm run a16z:companies` (loops 4 / 8s) · `npm run a16z:companies:once`           |
+| **API**        | `POST /a16z-companies/run` · `GET /a16z-companies/list`                           |
+| **Dashboard**  | YC table (`yc-companies`) — no separate a16z page                                 |
+
+
+**Source:** HTML `data-companies` JSON on the portfolio grid (modal fields are already in that payload — name, description, focus area, stage, website, X / LinkedIn / GitHub by domain).
+
+**Key stored fields:** same as YC (`name`, `slug`, `ycUrl`, `website`, `status`, `batch`, `oneLiner`, `industry`, `founders`, `isHiring`, `jobs`, `email`, `emails`, `address`, `confidence`, `summary`) plus `a16zId`, `a16zUrl`, `socials`, `sourceType: "a16z"`.
+
+```bash
+npm run a16z:companies
+npm run a16z:companies -- once
+npm run a16z:companies -- --reset
+npm run a16z:companies -- list --status Active
+```
+
+Env: `A16Z_INTERVAL_MS=8000`, `A16Z_BATCH_SIZE=4`.
 
 ---
 
@@ -489,6 +537,34 @@ GET /top-mobile-apps/sources
 
 Env: `TOP_MOBILE_APPS_INTERVAL_MS=30000`, `TOP_MOBILE_APPS_TARGET=10000`, `TOP_MOBILE_APPS_SOURCES_PER_RUN=2`, `TOP_MOBILE_APPS_LISTINGS_PER_SOURCE=40`.  
 `OPENROUTER_API_KEY` is optional (listings still store). `--no-enrich` skips listing + founder enrich.
+
+---
+
+
+
+## 24. Business CRM directory
+
+**Purpose:** Find unique CRM products worldwide (Salesforce, HubSpot, Zoho, …) via Google + list-page scrape. **No LLM.** Store official websites.
+
+
+|                |                                                                                |
+| -------------- | ------------------------------------------------------------------------------ |
+| **Collection** | `business-crms`                                                                |
+| **State**      | `businessCrmsState`                                                            |
+| **Code**       | `lib/crmDirectory/`*                                                           |
+| **CLI**        | `npm run crm:directory` (10s loop) · `npm run crm:directory:once`              |
+| **API**        | `POST /business-crms/run` · `GET /business-crms/list` · `GET /business-crms/queries` |
+
+
+**Pipeline:** rotate **20** keyword queries → Google SERP → scrape G2/Capterra/Wikipedia-style lists for outbound product URLs → optional homepage scrape for name → Firestore sha256(domain).
+
+```bash
+npm run crm:directory
+npm run crm:directory -- once
+npm run crm:directory -- list
+```
+
+Env: `CRM_INTERVAL_MS=10000`, `CRM_QUERIES_PER_RUN=1`, `CRM_SCRAPE_LISTS_PER_RUN=2`, `CRM_ENRICH_PER_RUN=4`.
 
 ---
 
@@ -798,8 +874,8 @@ Env: `NEWS_INTERVAL_MS=30000`, `NEWS_PLATFORMS_PER_RUN=4`, `NEWS_URLS_PER_PLATFO
 | **Collection** | `clubs`                                                                                  |
 | **State**      | `englandClubsState` (listing `offset`, stops at 333)                                     |
 | **Code**       | `lib/englandClubs/`*, `lib/englandClubsRouter.js`                                        |
-| **CLI**        | `npm run england:clubs` (loops to 333) · `npm run england:clubs:once` (one page)                                   |
-| **API**        | `POST /england-clubs/run` · `GET /england-clubs/list`                                    |
+| **CLI**        | `npm run england:clubs` (loops to 333) · `npm run england:clubs:once` (one page) · `npm run england:clubs:enrich` (Maps + site, 4 at a time) |
+| **API**        | `POST /england-clubs/run` · `POST /england-clubs/enrich` · `GET /england-clubs/list`                                    |
 
 
 **Pipeline (one layer):**
@@ -809,24 +885,41 @@ Env: `NEWS_INTERVAL_MS=30000`, `NEWS_PLATFORMS_PER_RUN=4`, `NEWS_URLS_PER_PLATFO
 3. Store into Firestore `clubs` (hash id from `eng` + `clubid`). Skip if already stored.
 4. Advance offset by 50. **Keep looping** until Firestore has **333** unique clubs, then stop.
 
-Does not auto-start on `npm run dev`. Optional `--enrich` (off by default) Google-searches the official site and `/scrape`s it for emails / socials — still no LLM.
+Does not auto-start on `npm run dev`. Listing `--enrich` still exists; the dedicated enrich loop is the one to use for stadium / lat / phone / contact.
+
+**Enrichment loop (4 clubs per tick):**
+
+1. Read Firestore `clubs` docs that are not yet enriched (empty contact/maps retries automatically).
+2. DuckDuckGo + local `POST /google-search` (Puppeteer scrape) for **Head of Ticketing (HT)**, **CMO**, **Marketing Head**, and staff emails. Does **not** use Firecrawl, Google CSE, or OpenRouter unless `--use-ai`.
+3. Harvest emails and names from SERP snippets, then fetch the official site + `/contact` / `/tickets` / `/commercial` pages.
+4. **Optional `--use-ai`:** OpenRouter (default free Gemini) extracts named staff emails from that evidence only.
+5. Wikidata / Wikipedia / Nominatim for stadium address, latitude, longitude, Maps URL, phone, website.
+6. Merge onto the same Firestore doc (`email`, `outreachEmail`, `staff`, `staffByRole`, `contactName`, `contactRole`, `contact`, `website`, `latitude`, `longitude`, `mapsUrl`, `maps`, `enrichedAt`).
+7. Next 4 until the collection is done.
 
 ```bash
 npm run england:clubs
 npm run england:clubs -- once
 npm run england:clubs -- --reset
-npm run england:clubs -- --enrich
 npm run england:clubs -- list
+npm run england:clubs:enrich
+npm run england:clubs:enrich -- once
+npm run england:clubs:enrich -- --use-ai
+npm run england:clubs:enrich -- --use-ai --model google/gemini-2.0-flash-exp:free
+npm run england:clubs:enrich -- --reset
 ```
 
 ```http
 POST /england-clubs/run
-{ "reset": false, "enrich": false }
+{ "reset": false }
+
+POST /england-clubs/enrich
+{ "reset": false }
 
 GET /england-clubs/list?limit=50
 ```
 
-Env: `CLUBS_PAGES_PER_RUN=8`, `CLUBS_ENRICH_PER_PAGE=8`. Needs the API server for `/scrape` (and `/google-search` if enriching).
+Needs the API server on `http://127.0.0.1:3002` for `/scrape`, `/google-search`, and `/scrape-google-maps`.
 
 ---
 
@@ -975,7 +1068,9 @@ npm run karyam:linkedin -- --geo in
 npm run karyam:founders -- --loop
 npm run angel:investors:loop
 npm run yc:companies
+npm run a16z:companies
 npm run top:mobile-apps
+npm run crm:directory
 npm run top:influencers
 npm run magazine:creators -- --category frontend --topic react
 npm run ai:styles
@@ -999,7 +1094,9 @@ npm run england:clubs
 | Karyam founders  | website / linkedinUrl / email / sourceUrl   |
 | Angel investors  | xUrl / linkedinUrl / website / email / name |
 | YC companies     | YC slug / ycUrl / website                   |
+| a16z companies   | a16z id / slug / website                    |
 | Top mobile apps  | `playStoreId` or `appStoreId`               |
+| Business CRMs    | website domain (sha256)                     |
 | Influencers      | `platform:handle` (or YouTube channel id)   |
 | Dev magazine     | `platform:handle` / YouTube `videoId`       |
 | AI style prompts | Refero style UUID                           |

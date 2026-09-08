@@ -56,6 +56,8 @@ import { dashboardRouter } from "./lib/dashboardRouter.js";
 import { mapsAgentsRouter } from "./lib/mapsAgentsRouter.js";
 import { angelInvestorsRouter } from "./lib/angelInvestorsRouter.js";
 import { ycCompaniesRouter } from "./lib/ycCompaniesRouter.js";
+import { a16zCompaniesRouter } from "./lib/a16zCompaniesRouter.js";
+import { crmDirectoryRouter } from "./lib/crmDirectoryRouter.js";
 import { topMobileAppsRouter } from "./lib/topMobileAppsRouter.js";
 import { socialScrapersRouter } from "./lib/socialScrapersRouter.js";
 import { individualInfluencersRouter } from "./lib/individualInfluencersRouter.js";
@@ -113,6 +115,10 @@ import {
 	getViralClipCutJobStatus,
 } from "./lib/viralClipCutter.js";
 import { generateUrlIgCarousel } from "./lib/youtubeIgCarousel.js";
+import {
+	generateImageUsingOpenAIServerLocally,
+	pingMlxOpenAiServer,
+} from "./lib/mlxOpenAiImage.js";
 import { GoogleGenAI } from "@google/genai";
 import {
 	buildDesignThemePromptSection,
@@ -755,44 +761,7 @@ async function getEmbedding(text) {
 	return embedding;
 }
 
-async function indexAll() {
-	const files = fs
-		.readdirSync(EMAIL_DIR)
-		.filter((f) => /\.(html|jsx|tsx)$/.test(f));
-	console.log(`Indexing ${files.length} emails...`);
 
-	const index = [];
-
-	for (let i = 0; i < files.length; i++) {
-		const file = files[i];
-		const html = fs.readFileSync(path.join(EMAIL_DIR, file), "utf8");
-
-		const base = path.basename(file, path.extname(file));
-		const category = base.split("-")[0];
-		const stripped = html
-			.replace(/<[^>]+>/g, " ")
-			.replace(/\s+/g, " ")
-			.slice(0, 800);
-		const subject = base.replace(/-/g, " ");
-
-		const embedding = await getEmbedding(`${subject} ${category} ${stripped}`);
-
-		index.push({
-			filename: file,
-			category,
-			subject,
-			description: stripped.slice(0, 200),
-			embedding, // just a number[] in JSON
-		});
-
-		console.log(`[${i + 1}/${files.length}] ${file}`);
-	}
-
-	fs.writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
-	console.log(`✅ email-index.json written (${index.length} entries)`);
-}
-
-indexAll().catch(console.error);
 
 const userAgents = new UserAgent();
 
@@ -1890,6 +1859,10 @@ app.route("/", mapsAgentsRouter);
 app.route("/", angelInvestorsRouter);
 
 app.route("/", ycCompaniesRouter);
+
+app.route("/", a16zCompaniesRouter);
+
+app.route("/", crmDirectoryRouter);
 
 app.route("/", topMobileAppsRouter);
 
@@ -9178,6 +9151,7 @@ async function handleIgCarousel(c) {
 			url,
 			slides: body.slides,
 			style: body.style,
+			imageBackend: body.imageBackend,
 			c,
 		});
 		return c.json({
@@ -9200,6 +9174,54 @@ async function handleIgCarousel(c) {
 app.post("/ig-carousel", handleIgCarousel);
 app.post("/url-ig-carousel", handleIgCarousel);
 app.post("/youtube-ig-carousel", handleIgCarousel);
+
+app.get("/mlx-images/health", async (c) => {
+	const ping = await pingMlxOpenAiServer();
+	return c.json(
+		{ success: ping.ok, ...ping, timestamp: new Date().toISOString() },
+		ping.ok ? 200 : 503,
+	);
+});
+
+app.post("/mlx-images/generate", async (c) => {
+	let body = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		body = {};
+	}
+	const prompt = body.prompt || body.text;
+	if (!prompt) {
+		return c.json({ success: false, error: "prompt is required" }, 400);
+	}
+	try {
+		const { buffer, mime, model, backend } =
+			await generateImageUsingOpenAIServerLocally({
+				prompt,
+				size: body.size,
+				model: body.model,
+				n: body.n,
+			});
+		return c.json({
+			success: true,
+			backend,
+			model,
+			mime,
+			size: body.size || process.env.MLX_IMAGE_SIZE || "1024x1024",
+			imageBase64: buffer.toString("base64"),
+			timestamp: new Date().toISOString(),
+		});
+	} catch (err) {
+		console.error("[/mlx-images/generate]", err);
+		return c.json(
+			{
+				success: false,
+				error: err?.message || "Local image generation failed",
+			},
+			503,
+		);
+	}
+});
 
 // POST /repo/analyze — full AST analysis (public repos, no token)
 app.post("/repo/analyze", async (c) => {

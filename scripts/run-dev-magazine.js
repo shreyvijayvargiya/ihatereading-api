@@ -25,7 +25,7 @@ import {
 	listChannels,
 	runDevMagazineAgent,
 } from "../lib/devMagazine/orchestrator.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -37,7 +37,8 @@ function flag(name) {
 
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const videosOnly = args.includes("--videos") || cmd === "videos";
 const category = flag("--category") || flag("--cover");
 const topic = flag("--topic");
@@ -59,7 +60,7 @@ async function runOnce() {
 		process.env.INKGEST_SCRAPE_BASE_URL ||
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 	console.log(
-		`[magazine] category=${category || "all"} topic=${topic || "all"} platform=${platform || "yt+x"} videosOnly=${videosOnly} llm=${useAI ? "on" : "off"}`,
+		`[magazine] category=${category || "all"} topic=${topic || "all"} platform=${platform || "yt+x"} videosOnly=${videosOnly} llm=${useAI ? ai.model : "off"}`,
 	);
 	const summary = await runDevMagazineAgent({
 		baseUrl,
@@ -70,7 +71,7 @@ async function runOnce() {
 		videosOnly,
 		enrich: !args.includes("--no-enrich"),
 		fetchVideos: !args.includes("--no-videos"),
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

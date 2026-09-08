@@ -23,7 +23,7 @@ import {
 	listCompanies,
 	runYcCompaniesAgent,
 } from "../lib/ycCompanies/orchestrator.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -35,7 +35,8 @@ function flag(name) {
 
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const status = flag("--status");
 const hiring = args.includes("--hiring");
 const sourcesPerRun = flag("--sources") ? Number(flag("--sources")) : undefined;
@@ -52,7 +53,7 @@ async function runOnce() {
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 
 	console.log(
-		`[yc-cli] ${YC_AGENT.id} — status=${status || "all"} hiring=${hiring} llm=${useAI ? "on" : "off"} base=${baseUrl}`,
+		`[yc-cli] ${YC_AGENT.id} — status=${status || "all"} hiring=${hiring} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runYcCompaniesAgent({
 		baseUrl,
@@ -60,7 +61,7 @@ async function runOnce() {
 		hiring,
 		sourcesPerRun,
 		enrich: !args.includes("--no-enrich"),
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

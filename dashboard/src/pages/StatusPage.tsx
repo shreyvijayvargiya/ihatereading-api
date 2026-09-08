@@ -18,9 +18,9 @@ export function StatusPage() {
 		return (
 			<Card>
 				<CardContent className="p-6 text-sm">
-					<p className="font-medium">Could not reach the API.</p>
+					<p className="font-medium">Could not load Firestore tables.</p>
 					<p className="mt-1 text-muted-foreground">
-						Start the Hono server with `npm run start` (port 3002), then refresh.
+						`npm run dashboard` reads Firebase directly. Check the repo-root `.env` and `config/service-account-file.js`.
 					</p>
 					<p className="mt-2 font-mono text-xs">{String(q.error)}</p>
 				</CardContent>

@@ -22,7 +22,7 @@ import {
 	listArticles,
 	runInternetNewsAgent,
 } from "../lib/internetNews/orchestrator.js";
-import { cliWantsUseAi } from "../lib/useAi.js";
+import { cliAiOpts } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -34,7 +34,8 @@ function flag(name) {
 
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const platform = flag("--platform");
 const keyword = flag("--keyword");
 const urlsPerPlatform = flag("--urls") ? Number(flag("--urls")) : undefined;

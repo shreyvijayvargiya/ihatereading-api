@@ -41,7 +41,7 @@ export function DataTable<T>({
 
 	return (
 		<div className={cn("h-full min-h-0 overflow-auto rounded-lg border border-border bg-card", className)}>
-			<Table className="min-w-[800px]">
+			<Table className="min-w-max">
 				<TableHeader>
 					{table.getHeaderGroups().map((group) => (
 						<TableRow key={group.id} className="hover:bg-transparent">

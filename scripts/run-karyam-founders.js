@@ -25,7 +25,7 @@ import {
 	sendLeadsByIds,
 } from "../lib/karyamFounders/orchestrator.js";
 import { autosendConfig } from "../lib/karyamFounders/autosend.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -36,7 +36,8 @@ function flag(name) {
 }
 
 const hasLoop = args.includes("--loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const doSend = args.includes("--send");
 const intent = flag("--intent");
 const queryId = flag("--query");
@@ -58,7 +59,7 @@ async function runOnce() {
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 
 	console.log(
-		`[founders-cli] karyam — intent=${intent || "all"} llm=${useAI ? "on" : "off"} send=${doSend ? "on" : "off"} base=${baseUrl}`,
+		`[founders-cli] karyam — intent=${intent || "all"} llm=${useAI ? ai.model : "off"} send=${doSend ? "on" : "off"} base=${baseUrl}`,
 	);
 	const summary = await runKaryamFoundersAgent({
 		baseUrl,
@@ -67,7 +68,7 @@ async function runOnce() {
 		queriesPerRun,
 		enrich: !args.includes("--no-enrich"),
 		send: doSend,
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

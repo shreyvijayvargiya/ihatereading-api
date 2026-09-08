@@ -21,7 +21,7 @@ import {
 	resolveGeo,
 	runKaryamLinkedInAgent,
 } from "../lib/karyamLinkedIn/agent.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "").toLowerCase();
@@ -32,7 +32,8 @@ function flag(name) {
 }
 
 const once = cmd === "once" || args.includes("--once");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const geo = flag("--geo") || process.env.KARYAM_LI_GEO || "in";
 const city = flag("--city") || process.env.KARYAM_LI_CITY || undefined;
 const queriesPerRun = flag("--queries") ? Number(flag("--queries")) : undefined;
@@ -49,14 +50,14 @@ async function runOnce() {
 	const g = resolveGeo(geo);
 	const c = city ? resolveCity(city) : null;
 	console.log(
-		`[karyam-li] run geo=${g?.id || geo} city=${c?.id || city || "-"} llm=${useAI ? "on" : "off"} base=${baseUrl}`,
+		`[karyam-li] run geo=${g?.id || geo} city=${c?.id || city || "-"} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runKaryamLinkedInAgent({
 		baseUrl,
 		geo,
 		city,
 		queriesPerRun,
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;

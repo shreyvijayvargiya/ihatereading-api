@@ -16,7 +16,7 @@ import {
 	loadEnrichState,
 	runAiStylesEnrichAgent,
 } from "../lib/aiStylesPrompts/enrich.js";
-import { cliWantsUseAi, hasOpenRouterKey, useAiOpts } from "../lib/useAi.js";
+import { cliAiOpts, hasOpenRouterKey } from "../lib/useAi.js";
 
 const args = process.argv.slice(2);
 const cmd = (args[0] || "run").toLowerCase();
@@ -28,7 +28,8 @@ function flag(name) {
 
 const once =
 	args.includes("--once") || cmd === "once" || args.includes("--no-loop");
-const useAI = cliWantsUseAi(args);
+const ai = cliAiOpts(args);
+const useAI = Boolean(ai.useAI);
 const reset = args.includes("--reset") || cmd === "reset";
 const batch = flag("--batch") ? Number(flag("--batch")) : undefined;
 const intervalMs = Number(
@@ -45,13 +46,13 @@ async function runOnce(opts = {}) {
 		process.env.INKGEST_SCRAPE_BASE_URL ||
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 	console.log(
-		`[ai-styles:enrich] collection=${AI_STYLES_AGENT.collection} batch=${batch || AI_STYLES_ENRICH.batchSize} llm=${useAI ? "on" : "off"} base=${baseUrl}`,
+		`[ai-styles:enrich] collection=${AI_STYLES_AGENT.collection} batch=${batch || AI_STYLES_ENRICH.batchSize} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runAiStylesEnrichAgent({
 		baseUrl,
 		batch,
 		reset: opts.reset === true,
-		...useAiOpts(useAI),
+		...ai,
 	});
 	console.log(JSON.stringify(summary, null, 2));
 	return summary;
