@@ -68,7 +68,9 @@
 		"england:clubs:enrich:once": "node scripts/run-england-clubs-enrich.js once",
 		"mlx:images": "bash scripts/mlx-openai-images.sh",
 		"dashboard": "npm run dev --prefix dashboard",
-		"simba:getdesign": "node scripts/fetch-getdesign-prompts.js"
+		"simba:getdesign": "node scripts/fetch-getdesign-prompts.js",
+		"sandbox": "node agent-sandbox/server.js",
+		"sandbox:dev": "node --watch agent-sandbox/server.js"
 	},
 	"dependencies": {
 		"@composio/core": "^0.13.1",

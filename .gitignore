@@ -6,4 +6,5 @@ package-lock.json
 data/
 cache/
 .cache
+agent-sandbox/.data
 
