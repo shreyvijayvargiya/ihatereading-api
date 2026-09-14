@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { handle } from "hono/vercel";
+import { handle } from "@hono/node-server/vercel";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore } from "./config/firebase.js";
@@ -153,6 +153,10 @@ import {
 	capturePageScreenshot,
 	normalizeScreenshotViewport,
 } from "./lib/pageScreenshot.js";
+import {
+	requiresBrowserForScrape,
+	tryScrapeWithHttp,
+} from "./lib/scrapeHttp.js";
 import {
 	applyStealthToPage,
 	extractNextDataMarkdown,
@@ -769,6 +773,14 @@ import("puppeteer-extra-plugin-stealth/evasions/window.outerdimensions/index.js"
 
 // GitHub Trending Cache
 const trendingCache = new NodeCache({ stdTTL: 60 * 5, checkperiod: 120 }); // default 5 min cache
+const GITHUB_TRENDING_FETCH_TIMEOUT_MS = Math.min(
+	55_000,
+	Math.max(
+		8_000,
+		Number.parseInt(process.env.GITHUB_TRENDING_TIMEOUT_MS || "25000", 10) ||
+			25_000,
+	),
+);
 
 // GitHub Trending Types
 // Repo type: { name, url, description?, stars?, language?, forks?, avatar?, trendingRank? }
@@ -828,7 +840,10 @@ async function fetchTrendingFromGitHubSearch({
 		headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
 	}
 
-	const res = await fetch(url, { headers });
+	const res = await fetch(url, {
+		headers,
+		signal: AbortSignal.timeout(GITHUB_TRENDING_FETCH_TIMEOUT_MS),
+	});
 	if (!res.ok) {
 		const text = await res.text();
 		throw new Error(`GitHub Search API error: ${res.status} ${text}`);
@@ -859,8 +874,13 @@ async function fetchTrendingFromScrape({
 
 	const res = await fetch(url, {
 		headers: {
-			"User-Agent": "hono-trending-bot",
+			"User-Agent":
+				"Mozilla/5.0 (compatible; ihatereading-api/1.0; +https://ihatereading.in)",
+			Accept: "text/html,application/xhtml+xml",
+			"Accept-Language": "en-US,en;q=0.9",
 		},
+		signal: AbortSignal.timeout(GITHUB_TRENDING_FETCH_TIMEOUT_MS),
+		redirect: "follow",
 	});
 
 	if (!res.ok) {
@@ -5245,35 +5265,10 @@ async function scrapeSingleUrlWithPuppeteer(
 
 				let summary = null;
 				let openRouterSummary = null;
-				if (aiSummary && markdown && process.env.OPENROUTER_API_KEY) {
-					try {
-						const truncated = markdown.slice(0, 12000);
-						const or = await openRouterChatMessages(
-							process.env.OPENROUTER_API_KEY,
-							[
-								{
-									role: "system",
-									content:
-										"You summarize web page content concisely. Respond with plain text only—no markdown code fences.",
-								},
-								{
-									role: "user",
-									content: `Summarize the following content concisely. Target length: roughly 100–1000 tokens depending on content length.\n\n${truncated}`,
-								},
-							],
-							2048,
-							{ temperature: 0.3 },
-						);
-						summary = String(or.content || "").trim() || null;
-						openRouterSummary = {
-							tokenUsage: or.tokenUsage,
-							usage: or.usage,
-							model: or.model,
-							aiPrompt: or.aiPrompt,
-						};
-					} catch (err) {
-						console.error("[scrape] AI summary failed:", err?.message);
-					}
+				if (aiSummary && markdown) {
+					const ai = await applyScrapeAiSummary(markdown, { aiSummary });
+					summary = ai.summary;
+					openRouterSummary = ai.openRouterSummary;
 				}
 
 				return {
@@ -5335,6 +5330,8 @@ function parseScrapeOptions(body = {}) {
 		useProxy = false,
 		aiSummary = false,
 		takeScreenshot = false,
+		forceBrowser = false,
+		preferBrowser = false,
 	} = body;
 	return {
 		selectors,
@@ -5348,14 +5345,112 @@ function parseScrapeOptions(body = {}) {
 		useProxy,
 		aiSummary,
 		takeScreenshot,
+		forceBrowser,
+		preferBrowser,
 	};
 }
 
+async function applyScrapeAiSummary(markdown, options = {}) {
+	if (!options.aiSummary || !markdown || !process.env.OPENROUTER_API_KEY) {
+		return { summary: null, openRouterSummary: null };
+	}
+	try {
+		const truncated = String(markdown).slice(0, 12000);
+		const or = await openRouterChatMessages(
+			process.env.OPENROUTER_API_KEY,
+			[
+				{
+					role: "system",
+					content:
+						"You summarize web page content concisely. Respond with plain text only—no markdown code fences.",
+				},
+				{
+					role: "user",
+					content: `Summarize the following content concisely. Target length: roughly 100–1000 tokens depending on content length.\n\n${truncated}`,
+				},
+			],
+			2048,
+			{ temperature: 0.3 },
+		);
+		return {
+			summary: String(or.content || "").trim() || null,
+			openRouterSummary: {
+				tokenUsage: or.tokenUsage,
+				usage: or.usage,
+				model: or.model,
+				aiPrompt: or.aiPrompt,
+			},
+		};
+	} catch (err) {
+		console.error("[scrape] AI summary failed:", err?.message);
+		return { summary: null, openRouterSummary: null };
+	}
+}
+
+async function tryScrapeRedditWithHttp(targetUrl, options = {}) {
+	const redditJsonUrl = targetUrl.endsWith("/")
+		? `${targetUrl.slice(0, -1)}.json`
+		: `${targetUrl}.json`;
+	try {
+		const { userAgent, extraHTTPHeaders } = generateScreenshotHeaders();
+		const res = await fetch(redditJsonUrl, {
+			signal: AbortSignal.timeout(options.timeout ?? 30_000),
+			headers: {
+				"User-Agent": userAgent,
+				Accept: "application/json",
+				...extraHTTPHeaders,
+			},
+		});
+		if (!res.ok) return null;
+		const data = await res.json();
+		const { markdown, posts } = parseRedditData(data, targetUrl);
+		if (!posts?.length && String(markdown || "").trim().length < 40) return null;
+		return {
+			success: true,
+			data: {
+				posts,
+				url: targetUrl,
+				title: "Reddit Posts",
+				metadata: null,
+			},
+			markdown,
+			summary: null,
+			screenshot: null,
+		};
+	} catch (err) {
+		console.warn("[scrape] Reddit HTTP fast-path failed:", err?.message || err);
+		return null;
+	}
+}
+
 async function scrapeOneUrlResult(inputUrl, options) {
-	const result = await scrapeSingleUrlWithPuppeteer(inputUrl, options);
+	const targetUrl = rewriteUrl(inputUrl) || inputUrl;
+	let result = null;
+	let scrapeMethod = "puppeteer";
+
+	if (!requiresBrowserForScrape(targetUrl, options)) {
+		if (targetUrl.includes("reddit.com")) {
+			result = await tryScrapeRedditWithHttp(targetUrl, options);
+		} else {
+			result = await tryScrapeWithHttp(targetUrl, options);
+		}
+		if (result) scrapeMethod = "http";
+	}
+
+	if (!result) {
+		result = await scrapeSingleUrlWithPuppeteer(inputUrl, options);
+	}
+
+	if (options.aiSummary && !result.summary && result.markdown) {
+		const ai = await applyScrapeAiSummary(result.markdown, options);
+		result.summary = ai.summary;
+		if (ai.openRouterSummary) result.openRouterSummary = ai.openRouterSummary;
+	}
+
 	return {
 		url: inputUrl,
 		success: true,
+		scrapeMethod,
 		data: result.data,
 		markdown: result.markdown,
 		summary: result.summary,
@@ -5380,9 +5475,9 @@ function scrapeOneUrlFailure(inputUrl, err) {
 	};
 }
 
-// New Puppeteer-based URL scraping endpoint (single URL)
+// URL scraping — HTTP fetch first, Puppeteer only when needed
 app.post("/scrape", async (c) => {
-	customLogger("Scraping URL with Puppeteer", await c.req.header());
+	customLogger("Scraping URL", c.req.path);
 
 	const RATE_LIMIT = 50;
 	const RATE_WINDOW_MS = 10 * 60 * 1000;
@@ -5466,7 +5561,7 @@ app.post("/scrape", async (c) => {
 
 // Batch Puppeteer scraping: multiple URLs in parallel, never fails entire request
 app.post("/scrape-multiple", async (c) => {
-	customLogger("Scraping URLs (batch) with Puppeteer", await c.req.header());
+	customLogger("Scraping URLs (batch)", c.req.path);
 
 	const RATE_LIMIT = 100;
 	const RATE_WINDOW_MS = 10 * 60 * 1000;
