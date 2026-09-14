@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { handle } from "hono/vercel";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { firestore } from "./config/firebase.js";
@@ -741,24 +742,6 @@ async function openRouterChat({
 		...buildOpenRouterAiMeta({ model, messages, usage }),
 		label,
 	};
-}
-
-const OUTPUT_FILE = "./templates.json";
-
-const EMAIL_DIR = path.join(__dirname, "./templates");
-const INDEX_FILE = path.join(__dirname, "../templates-index.json");
-
-async function getEmbedding(text) {
-	const res = await fetch("http://localhost:11434/api/embeddings", {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			model: "mxbai-embed-large",
-			prompt: `Represent this sentence for searching relevant passages: ${text}`,
-		}),
-	});
-	const { embedding } = await res.json();
-	return embedding;
 }
 
 
@@ -1712,38 +1695,6 @@ const BLOCK_DISTRACTIONS_CSS = `
   { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }
 `;
 
-const generateRandomHeaders = () => {
-	const acceptLanguages = [
-		"en-US,en;q=0.9",
-		"en-GB,en;q=0.9",
-		"en-CA,en;q=0.8",
-		"en-IN,en;q=0.8",
-		"en;q=0.9",
-	];
-	const ua = new UserAgents();
-	return {
-		userAgent: ua.random().toString(),
-		extraHTTPHeaders: {
-			Accept:
-				"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-			"Accept-Encoding": "gzip, deflate, br",
-			"Accept-Language":
-				acceptLanguages[Math.floor(Math.random() * acceptLanguages.length)],
-			"Cache-Control": "no-cache",
-			Pragma: "no-cache",
-			"Sec-Ch-Ua":
-				'"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-			"Sec-Ch-Ua-Mobile": "?0",
-			"Sec-Ch-Ua-Platform": '"macOS"',
-			"Sec-Fetch-Dest": "document",
-			"Sec-Fetch-Mode": "navigate",
-			"Sec-Fetch-Site": "none",
-			"Sec-Fetch-User": "?1",
-			"Upgrade-Insecure-Requests": "1",
-		},
-		viewport: pickRandomViewport(),
-	};
-};
 
 // Add CORS middleware
 app.use(
@@ -1782,7 +1733,6 @@ app.use("*", openRouterTranslateAuthMiddleware);
 
 // Apply performance monitoring middleware
 app.use("*", performanceMiddleware);
-app.use("/");
 
 app.get("/", (c) => {
 	return c.text("Welcome to iHateReading API", 200);
@@ -9456,8 +9406,6 @@ app.post("/scrape-git", async (c) => {
 	}
 });
 
-export default app;
-
 const THEME_HTML_DIR = path.join(
 	__dirname,
 	"ai-examples/htmlTemplates",
@@ -15039,11 +14987,14 @@ app.post("/generate/:type", async (c) => {
 	}
 });
 
-const port = 3002;
-console.log(`Server is running on port ${port}`);
+const port = Number(process.env.PORT || 3002);
 
-// Start the server
-serve({
-	fetch: app.fetch,
-	port,
-});
+if (!process.env.VERCEL) {
+	console.log(`Server is running on port ${port}`);
+	serve({
+		fetch: app.fetch,
+		port,
+	});
+}
+
+export default handle(app);
