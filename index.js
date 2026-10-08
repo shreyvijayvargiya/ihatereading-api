@@ -12606,7 +12606,15 @@ app.post("/url-to-video", async (c) => {
 		);
 	} catch (error) {
 		console.error("❌ url-to-video error:", error);
-		return c.json({ success: false, error: error?.message || String(error) }, 500);
+		const message = error?.message || String(error);
+		return c.json(
+			{
+				success: false,
+				error: message,
+				...(message.startsWith("No working ffmpeg") && { code: "FFMPEG_UNAVAILABLE" }),
+			},
+			500,
+		);
 	}
 });
 

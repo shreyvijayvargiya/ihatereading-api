@@ -49,6 +49,6 @@ Body options: `url`, `duration_sec` (15–180), `aspect` (`16:9` | `9:16` | `1:1
 | `URL_VIDEO_VISION_MODEL` | `google/gemini-2.5-flash` |
 | `URL_VIDEO_TTS_MODEL` | `openai/gpt-audio-mini` |
 | `GITHUB_TOKEN` | optional, raises the GitHub API rate limit |
-| `FFMPEG_PATH` / `FFPROBE_PATH` | `ffmpeg` / `ffprobe` on PATH |
+| `FFMPEG_PATH` | optional. Otherwise the first working one of: system `ffmpeg`, then the bundled `ffmpeg-static`. A broken system install (e.g. a Homebrew build missing `libx265`) is skipped automatically. `ffprobe` is not needed |
 
-Job state is kept in memory, and `manifest.json` in the job folder is updated after every step, so `GET /url-to-video/:id` still works after a restart on the same machine. A render needs a long-running host with ffmpeg and Chromium (Fly or Docker). Serverless functions are not suitable.
+Job state is kept in memory, and `manifest.json` in the job folder is updated after every step, so `GET /url-to-video/:id` still works after a restart on the same machine. A render needs a long-running host with Chromium (Fly or Docker). ffmpeg comes bundled via `ffmpeg-static`. Serverless functions are not suitable.
