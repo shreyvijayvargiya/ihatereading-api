@@ -19,11 +19,7 @@ app = "ihatereading-api"
   interval = "30s"
   method = "GET"
   timeout = "5s"
-  path = "/"
+  path = "/health"
 
 [processes]
   app = "node index.js"
-
-[deploy]
-  npx playwright instlll chromium
-

@@ -35,20 +35,37 @@ Top mobile apps can run without Puppeteer (HTTP Play pages + iTunes RSS).
 | 14 | AI DESIGN.md style prompts | `ihatereading-4ba52` / `(default)` | `ai-styles-prompts` | `aiStylesPromptsAgentState` | `npm run ai:styles` · `npm run ai:styles:enrich` | `POST /ai-styles-prompts/run` · `/enrich` |
 | 15 | Claude toprated (chat + tools) | `ihatereading-4ba52` / `(default)` | any name via `table_add_rows` (+ registry `claudeTopratedTables`) | — | — | `POST /claude-toprated/chat` (SSE) |
 | 20 | iHateReading internet news | `ihatereading-4ba52` / `(default)` | `ihatereading-internet-news` | `ihatereadingInternetNewsState` | `npm run news:ihatereading` | `POST /internet-news/run` |
-| 21 | England football clubs | `ihatereading-4ba52` / `(default)` | `clubs` | `englandClubsState` | `npm run england:clubs` | `POST /england-clubs/run` |
+| 21 | England football clubs | `ihatereading-4ba52` / `(default)` | `clubs` | `englandClubsState` | `npm run england:clubs` · `npm run england:clubs:enrich` | `POST /england-clubs/run` · `POST /england-clubs/enrich` |
 | 22 | Karyam B2B founders | `ihatereading-4ba52` / `(default)` | `karyamFounderLeads` | `karyamFounderAgentState` | `npm run karyam:founders` | `POST /karyam-founders/run` |
+| 25 | Outbound B2B prospects | `ihatereading-4ba52` / `(default)` | `outboundProspectLeads` | `outboundProspectAgentState` | `npm run outbound:prospects` | `POST /outbound-prospects/run` |
+| 26 | Content Intelligence (AI blog) | `ihatereading-4ba52` / `(default)` | `content_sites` (+ `topics`, `articles`, `research` subcollections) | — | `npm run content:intelligence` | `POST /content/enroll` · `POST /content/research` · `POST /content/generate` |
+| 27 | SEO/GEO research pipeline | `ihatereading-4ba52` / `(default)` | `siteProfiles`, `researchRuns`, `blogIdeas`, `keywordData`, `questionData`, `competitorData`, `aiVisibilityResults` | `researchRuns` (per-run status) | — | `POST /sites` · `POST /sites/:id/runs` · `GET /runs/:id` |
 
+### Scrape APIs & tools (stateless — no Firestore loop)
 
-Shared scrape primitives: `/scrape`, `/scrape-google-news`, `/scrape-google-maps`, `/google-search`, `/scrape-instagram`, `/scrape-x`, `/scrape-youtube-channel`.
+| Kind | HTTP | Notes |
+| --- | --- | --- |
+| Core scrape | `POST /scrape` · `POST /scrape-multiple` | HTTP-first; Puppeteer fallback. Rate-limited. |
+| Search | `POST /google-search` · `POST /bing-search` · `POST /ddg-search` | SERP primitives used by agents |
+| Maps | `POST /scrape-google-maps` · `POST /google-maps-agent` | Maps listing scrape |
+| News | `POST /scrape-google-news` | Keyword or legacy city+state |
+| Reddit (on-demand) | `POST /scrape-reddit` | One-off Reddit page scrape (not the Firestore agents) |
+| Social profiles | `POST /scrape-instagram` · `POST /scrape-x` · `POST /scrape-youtube-channel` | Public OG / page JSON; no login |
+| Metadata | `POST /fetch-metadata` | Lightweight page meta |
+| Browser agent | `POST /browser-agent/*` | Puppeteer ReAct for SPAs |
+| Inkgest agent | `POST /inkgest-agent` | Prompt → scrape/crawl skills (orchestration, not a lead loop) |
+| Maps leads (chat) | `POST /maps-leads` | In-memory conversational session |
+
+Shared scrape primitives (most agents): `/scrape`, `/scrape-google-news`, `/scrape-google-maps`, `/google-search`, `/scrape-instagram`, `/scrape-x`, `/scrape-youtube-channel`.
 Shared LLM: OpenRouter (`OPENROUTER_API_KEY`) — **opt-in**. Default is scrape-only.
 
 ```bash
 # any scrape CLI
 --use-ai                         # or --llm for Reddit
---model google/gemini-2.0-flash-exp:free   # optional; this is the default
+--model openrouter/free   # optional; this is the default
 ```
 
-HTTP: `{ "useAI": true, "model": "google/gemini-2.0-flash-exp:free" }`. If `model` is omitted, agents use free Gemini on OpenRouter (`OPENROUTER_MODEL` overrides).
+HTTP: `{ "useAI": true, "model": "openrouter/free" }`. If `model` is omitted, agents use `openrouter/free` on OpenRouter (`OPENROUTER_MODEL` overrides).
 
 ---
 
@@ -437,9 +454,14 @@ Env: `ANGEL_INTERVAL_MS=30000`, `ANGEL_QUERIES_PER_RUN=3`, `ANGEL_ENRICH_PER_RUN
 ```bash
 npm run yc:companies
 npm run yc:companies -- once --hiring
+npm run yc:companies -- once --year 2026          # W26 + S26 batch sources
+npm run yc:companies -- once --year 2025          # W25 + S25
+npm run yc:companies -- once --batch W26,W25
 npm run yc:companies -- list --status Active
 npm run yc:companies -- sources
 ```
+
+**Batch / year:** Rotating sources include **W26, S25, W25**, … via `yc-oss` `all.json` + Google `site:ycombinator.com/companies`. Pass `--year` or `--batch` (CLI) or `year` / `batch` / `batches` on `POST /yc-companies/run` to limit discovery to those batches; results still land in `yc-companies` (hash dedupe).
 
 Env: `YC_INTERVAL_MS=30000`, `YC_PAGE_SIZE=40`, `YC_ENRICH_PER_RUN=8`.
 
@@ -972,19 +994,128 @@ Env: `KARYAM_FOUNDERS_QUERIES_PER_RUN=3`, `KARYAM_FOUNDERS_ENRICH_PER_RUN=6`, `K
 
 
 
+## 25. Outbound B2B prospect pipeline (karyam.xyz + saascrm.site)
+
+**Purpose:** Find B2B buyers worldwide (US → Australia → Europe → India) for [karyam.xyz](https://karyam.xyz) (custom software, AI agents, apps, websites, CRM/ERP, scraping APIs) and [saascrm.site](https://saascrm.site) (AI CRM, ERP, SEO auditing, AI SEO articles, consultancy). Uses your scraping API — Google Search + Google Maps → `/scrape` for email/phone. Optional OpenRouter scoring + outreach drafts.
+
+
+|                |                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Collection** | `outboundProspectLeads`                                                                                      |
+| **State**      | `outboundProspectAgentState` (rotating job cursor)                                                           |
+| **Code**       | `lib/outboundProspects/*`                                                                                    |
+| **CLI**        | `npm run outbound:prospects` · `npm run outbound:prospects:loop`                                             |
+| **API**        | `GET /outbound-prospects` · `POST /outbound-prospects/run`                                                   |
+
+
+**Pipeline:** Rotating Google SERP + Maps jobs (~26 queries) → dedupe by domain/company hash → scrape website for email/phone → optional OpenRouter relevance score + `draftSubject` / `draftMessage` → Firestore. Scrape-only by default (no Apollo, no paid ads).
+
+**Intents:** `ai-agent`, `crm-erp`, `software-mvp`, `seo-content`, `agency-buyer`, `consulting`
+
+**Countries:** `us`, `au`, `uk`, `de`, `in`
+
+**Key stored fields:** `name`, `company`, `email`, `emails`, `phone`, `phones`, `website`, `address`, `mapsUrl`, `brand`, `brandFit`, `intent`, `country`, `channel`, `painPoint`, `draftSubject`, `draftMessage`, `relevanceScore`, `hasContact`, `outreachStatus`
+
+```bash
+npm run outbound:prospects
+npm run outbound:prospects -- --loop
+npm run outbound:prospects -- --use-ai --country us --channel maps
+npm run outbound:prospects -- list --min-score 4
+npm run outbound:prospects -- jobs
+```
+
+```http
+POST /outbound-prospects/run
+{ "country": "us", "channel": "google", "useAI": true, "jobsPerRun": 4 }
+
+GET /outbound-prospects
+```
+
+Dashboard: Collections → Outbound prospects. Loop from Scrapers → Outbound prospects.
+
+Env: `OUTBOUND_PROSPECTS_JOBS_PER_RUN=4`, `OUTBOUND_PROSPECTS_ENRICH_PER_RUN=8`, `OUTBOUND_PROSPECTS_INTERVAL_MS=30000`, `OPENROUTER_API_KEY` (only with `--use-ai` / `useAI: true`).
+
+---
+
+
+
+## 26. Content Intelligence (AI blog generation)
+
+**Purpose:** Enroll a client website, research 30 editorial topics (Google + Reddit-via-search + scrape), approve topics, generate hook-specific Markdown articles with validated internal/external links.
+
+
+|                |                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Collection** | `content_sites/{siteId}` + subcollections `topics`, `articles`, `research`                                 |
+| **Code**       | `lib/content/*`, `lib/contentIntelligenceRouter.js`                                                          |
+| **CLI**        | `npm run content:intelligence` · `npm run content:intelligence:loop` (research interval)                     |
+| **API**        | `POST /content/enroll` · `POST /content/research` · `POST /content/generate` · `POST /content/generate-batch` · `GET /content/dashboard` · `PATCH /content/topics/:topicId` |
+
+
+**Hooks:** `glossary`, `faq`, `explainer`, `comparison`, `alternative`
+
+**Pipeline:** enroll site → plan queries → Google search (+ `site:reddit.com`) → scrape pages → OpenRouter research agent (30 topics) → dashboard approve → writer agent per topic → link + article validators → Firestore.
+
+```bash
+npm run content:intelligence -- enroll --name "Site" --domain https://example.com
+npm run content:intelligence -- research --site example-com
+npm run content:intelligence -- research --site example-com --loop
+npm run content:intelligence -- list topics --site example-com --status pending
+npm run content:intelligence -- approve --site example-com --topic <id>
+npm run content:intelligence -- generate-batch --site example-com --limit 15
+```
+
+Env: `OPENROUTER_API_KEY`, `CONTENT_INTEL_RESEARCH_MODEL`, `CONTENT_INTEL_WRITER_MODEL`, `CONTENT_INTEL_INTERVAL_MS`, `CONTENT_INTEL_RESEARCH_COOLDOWN_MS`, `SCRAPE_API_BASE_URL`.
+
+---
+
+
+
+## 27. SEO/GEO research pipeline
+
+**Purpose:** Onboard a site URL, run a multi-stage SEO/GEO research job (keywords, questions, competitors, AI visibility), store blog ideas in Firestore.
+
+
+|                |                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Collections**| `siteProfiles`, `researchRuns`, `blogIdeas`, `keywordData`, `questionData`, `competitorData`, `aiVisibilityResults` |
+| **Code**       | `lib/geoPipeline/*`, `lib/geoPipelineRouter.js`, `lib/jobs/runPipeline.js`                                 |
+| **CLI**        | — (HTTP-driven)                                                                                              |
+| **API**        | `POST /sites` · `POST /sites/:id/runs` · `GET /runs/:id` · `GET /runs/:id/ideas` · `GET /sites/:id/ideas` · `PATCH /ideas/:id` |
+
+
+```http
+POST /sites
+{ "url": "https://example.com", "niche": "...", "description": "..." }
+
+POST /sites/{siteProfileId}/runs
+GET /runs/{runId}
+GET /runs/{runId}/ideas
+```
+
+Uses `/scrape` and `/google-search` via `resolveScrapeBaseUrl`. OpenRouter for synthesis stages.
+
+---
+
+
+
 ## Related (not lead monitors)
 
 
 | Surface                        | Role                                                                                          |
 | ------------------------------ | --------------------------------------------------------------------------------------------- |
+| `POST /content/*`              | Content Intelligence — enroll, research, generate (see §26)                                   |
+| `POST /sites` · `GET /runs/*`  | SEO/GEO pipeline — site profiles + blog ideas (see §27)                                       |
 | `POST /inkgest-agent`          | Prompt → skills (scrape/crawl/blog/table…) — content orchestration, not a Firestore lead loop |
 | `POST /browser-agent`          | Puppeteer ReAct trail for SPAs                                                                |
 | `POST /maps-leads`             | Conversational Maps lead session (in-memory)                                                  |
+| `POST /scrape-reddit`           | On-demand Reddit page scrape (distinct from Firestore Reddit agents)                          |
 | `POST /scrape-google-maps`     | Maps scrape primitive                                                                         |
 | `POST /scrape-instagram`       | Public IG profile (OG + page JSON; no login click, no RapidAPI)                               |
 | `POST /scrape-x`               | Public X profile (follow-button widget + OG / GraphQL intercept)                              |
 | `POST /scrape-youtube-channel` | Public YouTube channel (Data API if `YOUTUBE_API_KEY`, else ytInitialData)                    |
 | `POST /google-search`          | SERP primitive                                                                                |
+| `POST /bing-search` · `POST /ddg-search` | Alternate SERP endpoints                                                              |
 | `POST /scrape`                 | Generic page scrape. `{ "keyword": "…" }` with no url → Google News |
 | `POST /scrape-google-news`     | Google News by `keyword` (legacy `city`+`state` still works)         |
 | `POST /claude-toprated/chat`   | Claude + scrape/table tools, SSE realtime                                                     |
@@ -1042,6 +1173,13 @@ REDDIT_AI_SCRAPER_INTERVAL_MS=30000
 REDDIT_AI_SCRAPER_SUBS_PER_RUN=10
 # REDDIT_USE_LLM=1   # opt-in OpenRouter scoring for Reddit CLIs
 REDDIT_RSS_MIN_INTERVAL_MS=60000
+OUTBOUND_PROSPECTS_JOBS_PER_RUN=4
+OUTBOUND_PROSPECTS_ENRICH_PER_RUN=8
+OUTBOUND_PROSPECTS_INTERVAL_MS=30000
+CONTENT_INTEL_INTERVAL_MS=1800000
+CONTENT_INTEL_RESEARCH_COOLDOWN_MS=21600000
+# CONTENT_INTEL_RESEARCH_MODEL=openrouter/free
+# CONTENT_INTEL_WRITER_MODEL=google/gemini-2.5-flash-lite
 ```
 
 ---
@@ -1075,6 +1213,9 @@ npm run top:influencers
 npm run magazine:creators -- --category frontend --topic react
 npm run ai:styles
 npm run england:clubs
+npm run england:clubs:enrich
+npm run outbound:prospects -- --loop
+npm run content:intelligence -- research --site <siteId> --loop
 ```
 
 ---
@@ -1101,6 +1242,10 @@ npm run england:clubs
 | Dev magazine     | `platform:handle` / YouTube `videoId`       |
 | AI style prompts | Refero style UUID                           |
 | England clubs    | `eng` + Soccer Wiki `clubid` (or name)      |
+| Outbound prospects | website / sourceUrl / company hash        |
+| Content Intelligence topics | `slugify(title)` per site          |
+| Content Intelligence articles | `slug` per site                    |
+| SEO/GEO blog ideas | runId + idea hash / title               |
 
 
 Never create a new agent folder for a new city/category when the existing agent already accepts `--city` / `--category` / `--geo` — extend config instead.

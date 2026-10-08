@@ -1,0 +1,9 @@
+node_modules/
+.env
+data/jobs/
+data/guides/
+data/research/
+data/images/
+data/settings.json
+*.log
+.DS_Store

@@ -15,6 +15,8 @@
  *   npm run yc:companies -- list --status shutdown
  *   npm run yc:companies -- sources
  *   npm run yc:companies -- --status funded
+ *   npm run yc:companies -- once --year 2026
+ *   npm run yc:companies -- once --batch W26,W25
  */
 
 import "dotenv/config";
@@ -39,6 +41,9 @@ const ai = cliAiOpts(args);
 const useAI = Boolean(ai.useAI);
 const status = flag("--status");
 const hiring = args.includes("--hiring");
+const batch = flag("--batch");
+const batches = flag("--batches");
+const year = flag("--year");
 const sourcesPerRun = flag("--sources") ? Number(flag("--sources")) : undefined;
 const intervalMs = Number(process.env.YC_INTERVAL_MS || 30 * 1000);
 
@@ -52,13 +57,17 @@ async function runOnce() {
 		process.env.INKGEST_SCRAPE_BASE_URL ||
 		`http://127.0.0.1:${process.env.PORT || 3002}`;
 
+	const batchLabel = batch || batches || year || "all";
 	console.log(
-		`[yc-cli] ${YC_AGENT.id} — status=${status || "all"} hiring=${hiring} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
+		`[yc-cli] ${YC_AGENT.id} — batch=${batchLabel} status=${status || "all"} hiring=${hiring} llm=${useAI ? ai.model : "off"} base=${baseUrl}`,
 	);
 	const summary = await runYcCompaniesAgent({
 		baseUrl,
 		status,
 		hiring,
+		batch,
+		batches,
+		year,
 		sourcesPerRun,
 		enrich: !args.includes("--no-enrich"),
 		...ai,
@@ -78,6 +87,10 @@ Default is scrape-only. Pass --use-ai to LLM-polish profiles.
   npm run yc:companies -- --use-ai
   npm run yc:companies -- --hiring
   npm run yc:companies -- --status funded
+  npm run yc:companies -- once --year 2026
+  npm run yc:companies -- once --year 2025
+  npm run yc:companies -- once --batch W26
+  npm run yc:companies -- once --batch W26,W25,S25
   npm run yc:companies -- list
   npm run yc:companies -- list --hiring
   npm run yc:companies -- list --status Active

@@ -65,12 +65,15 @@ import { individualInfluencersRouter } from "./lib/individualInfluencersRouter.j
 import { aiStylesPromptsRouter } from "./lib/aiStylesPromptsRouter.js";
 import { karyamLinkedInRouter } from "./lib/karyamLinkedInRouter.js";
 import { karyamFoundersRouter } from "./lib/karyamFoundersRouter.js";
+import { outboundProspectsRouter } from "./lib/outboundProspectsRouter.js";
 import { claudeTopratedRouter } from "./lib/claudeTopratedRouter.js";
 import { redditAiScraperRouter } from "./lib/redditAiScraperRouter.js";
 import { devMagazineRouter } from "./lib/devMagazineRouter.js";
 import { internetNewsRouter } from "./lib/internetNewsRouter.js";
 import { englandClubsRouter } from "./lib/englandClubsRouter.js";
 import { contentResearchRouter } from "./lib/contentResearchRouter.js";
+import { contentIntelligenceRouter } from "./lib/contentIntelligenceRouter.js";
+import { youtubeChannelScriptsRouter } from "./lib/youtubeChannelScriptsRouter.js";
 import {
 	buildGoogleNewsUrl,
 	extractGoogleNewsItems,
@@ -1733,7 +1736,7 @@ app.use(
 			"https://gettemplate.website/",
 			"https://swipe-emails.vercel.app",
 		], // Allow specific origins
-		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+		allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 		// Do not set allowHeaders to a fixed list: browsers send Access-Control-Request-Headers
 		// (e.g. authorization, sentry-trace, baggage). Hono mirrors those when allowHeaders is empty.
 		exposeHeaders: [
@@ -1844,6 +1847,7 @@ app.route("/", aiStylesPromptsRouter);
 
 app.route("/", karyamLinkedInRouter);
 app.route("/", karyamFoundersRouter);
+app.route("/", outboundProspectsRouter);
 
 app.route("/", claudeTopratedRouter);
 
@@ -1857,6 +1861,8 @@ app.route("/", englandClubsRouter);
 
 // Content research planner: keywords + Reddit + internal + external → ideas
 app.route("/", contentResearchRouter);
+app.route("/", contentIntelligenceRouter);
+app.route("/", youtubeChannelScriptsRouter);
 
 app.post("/post-to-devto", async (c) => {
 	try {
