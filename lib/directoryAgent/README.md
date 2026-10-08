@@ -18,6 +18,8 @@ Dashboard: `GET /directory-agent` — requires a long-running Node server (brows
 | `DIRECTORY_AGENT_MAX_BROWSERS` | Concurrent browsers; extra tasks stay `QUEUED` (default 5). |
 | `DIRECTORY_AGENT_HEADLESS=false` | Show a real browser window. |
 | `DIRECTORY_AGENT_CHROMIUM_PATH` | Custom Chromium executable. |
+| `DIRECTORY_AGENT_CHANNEL=chrome` | Use the installed Google Chrome instead of bundled Chromium (pair with `HEADLESS=false`). |
+| `DIRECTORY_AGENT_CDP_URL` | Attach to **your own** Chrome (`chrome --remote-debugging-port=9222`), so Google/Cloudflare see your real signed-in browser. The agent opens its own tabs, never closes your Chrome, and never copies your cookies to disk. |
 | `DIRECTORY_AGENT_CHECK_INTERVAL_MS` | Follow-up check cadence while waiting for review (default 6h). |
 | `DIRECTORY_AGENT_ALLOW_PRIVATE=1` | Allow localhost/private URLs (tests only; otherwise SSRF-blocked). |
 

@@ -20,17 +20,23 @@ main{display:grid;grid-template-columns:320px 1fr;height:calc(100vh - 53px)}
 .item:hover,.item.sel{background:var(--panel)}.item .n{font-weight:600}.item .u{color:var(--mute);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;font-weight:600;border:1px solid var(--line);margin-top:4px}
 .s-run{color:var(--accent)}.s-wait{color:var(--warn);border-color:var(--warn)}.s-ok{color:var(--ok)}.s-bad{color:var(--bad)}
-#detail{overflow:auto;padding:16px;display:grid;gap:14px;align-content:start}
+#detail{overflow:auto;padding:12px}
+.split{display:grid;grid-template-columns:minmax(320px,430px) 1fr;gap:12px;align-items:start;height:100%}
+.split>.col{display:grid;gap:12px;align-content:start;min-width:0}
+.split>.left{max-height:100%;overflow:auto;padding-right:2px}
+.split>.right{position:sticky;top:0;height:100%}
+@media(max-width:1000px){.split{grid-template-columns:1fr;height:auto}.split>.left{max-height:none}.split>.right{position:static;height:auto}}
+#live{min-height:calc(100vh - 100px);display:flex;flex-direction:column}#live .view{flex:1;min-height:0;display:flex;align-items:flex-start;justify-content:center;overflow:auto}
 .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
 .box h3{margin:0 0 8px;font-size:13px;color:var(--mute);text-transform:uppercase;letter-spacing:.04em}
 .card{border:1px solid var(--warn);background:#1d1a10}.card h2{margin:0 0 6px;font-size:18px}.card p{margin:0 0 10px;white-space:pre-wrap}
 .actions{display:flex;gap:8px;flex-wrap:wrap}
 pre.code{background:#0c0e12;border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:8px 0}
 table{width:100%;border-collapse:collapse}td{padding:4px 6px;border-top:1px solid var(--line);vertical-align:top}td:first-child{color:var(--mute);width:30%}
-#logs{max-height:240px;overflow:auto;font:12px/1.5 ui-monospace,monospace}
+#logs{max-height:300px;overflow:auto;font:12px/1.5 ui-monospace,monospace}
 .l-warn{color:var(--warn)}.l-error{color:var(--bad)}.l-state{color:var(--accent)}
-.shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}.shots figure{margin:0}.shots img{width:100%;border:1px solid var(--line);border-radius:6px;cursor:zoom-in}.shots figcaption{font-size:11px;color:var(--mute)}
-#live img{width:100%;max-width:1280px;border:1px solid var(--line);border-radius:6px;display:block;cursor:crosshair;outline:none}
+.shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}.shots figure{margin:0}.shots img{width:100%;border:1px solid var(--line);border-radius:6px;cursor:zoom-in}.shots figcaption{font-size:11px;color:var(--mute)}
+#live img{width:100%;max-height:calc(100vh - 190px);object-fit:contain;border:1px solid var(--line);border-radius:6px;display:block;cursor:crosshair;outline:none}#live img.view-only{cursor:default}
 .bar{display:flex;gap:6px;margin-bottom:8px}.bar input{flex:1}
 form.new{display:grid;gap:8px;grid-template-columns:1fr 1fr}form.new .full{grid-column:1/-1}@media(max-width:700px){form.new{grid-template-columns:1fr}}
 .empty{color:var(--mute);padding:30px;text-align:center}
@@ -101,7 +107,7 @@ async function loadDetail() {
   let fresh;
   try { fresh = (await api("/api/tasks/" + selected)).task; } catch (e) { detail = null; toast(e.message); return renderDetail(); }
   // keep the live browser mounted (no flicker / lost focus) when only logs changed
-  const same = detail && liveOn && fresh.id === detail.id && fresh.state === detail.state && fresh.currentStep === detail.currentStep &&
+  const same = detail && liveOn && fresh.screenshots.length === detail.screenshots.length && fresh.id === detail.id && fresh.state === detail.state && fresh.currentStep === detail.currentStep &&
     fresh.card?.id === detail.card?.id && fresh.liveSessionOpen === detail.liveSessionOpen;
   detail = fresh;
   if (same && $("#logs")) {
@@ -146,25 +152,26 @@ function renderCard(t) {
 
 let liveTimer = null, liveBusy = false;
 function renderLive(t) {
-  const canLive = t.session && ((t.liveSessionOpen && ["WAITING_FOR_LOGIN", "WAITING_FOR_CAPTCHA"].includes(t.state)) || ["WAITING_FOR_BADGE", "WAITING_FOR_APPROVAL"].includes(t.state));
-  if (!canLive) { liveOn = false; return null; }
-  if (t.liveSessionOpen) liveOn = true;
-  if (!liveOn) return h("div", { class: "box" }, h("div", { class: "actions" }, h("button", { onclick: () => { liveOn = true; renderDetail(); } }, "Open live browser")));
-  const img = h("img", { alt: "live browser", tabindex: "0" });
-  const url = h("input", { placeholder: "Go to URL…" });
+  const ended = ["COMPLETED", "FAILED", "CANCELLED"].includes(t.state);
+  if (!t.session || ended) { liveOn = false; return h("div", { class: "box", id: "live" }, h("h3", {}, "Browser"), h("div", { class: "empty" }, ended ? "Task finished — browser closed." : "No active browser session (sleeping or queued).")); }
+  liveOn = true;
+  const control = (t.liveSessionOpen && ["WAITING_FOR_LOGIN", "WAITING_FOR_CAPTCHA"].includes(t.state)) || ["WAITING_FOR_BADGE", "WAITING_FOR_APPROVAL"].includes(t.state);
+  const img = h("img", { alt: "live browser", tabindex: "0", class: control ? "" : "view-only" });
+  const url = h("input", { placeholder: "Go to URL…", disabled: !control });
   let queue = Promise.resolve();
-  const send = (ev) => { queue = queue.then(() => api(`/api/tasks/${t.id}/live/input`, { method: "POST", body: JSON.stringify(ev) }).catch((e) => toast(e.message))); return queue; };
-  const pos = (e) => { const r = img.getBoundingClientRect(); return { x: Math.round((e.clientX - r.left) * (img.naturalWidth / r.width)), y: Math.round((e.clientY - r.top) * (img.naturalHeight / r.height)) }; };
+  const send = (ev) => { if (!control) return; queue = queue.then(() => api(`/api/tasks/${t.id}/live/input`, { method: "POST", body: JSON.stringify(ev) }).catch((e) => toast(e.message))); return queue; };
+  const pos = (e) => { const r = img.getBoundingClientRect(); const nw = img.naturalWidth, nh = img.naturalHeight; const scale = Math.min(r.width / nw, r.height / nh); const w = nw * scale, hh = nh * scale; const ox = (r.width - w) / 2, oy = (r.height - hh) / 2; return { x: Math.round((e.clientX - r.left - ox) / scale), y: Math.round((e.clientY - r.top - oy) / scale) }; };
   img.addEventListener("click", (e) => { img.focus(); send({ type: "click", ...pos(e) }); });
   img.addEventListener("dblclick", (e) => send({ type: "click", double: true, ...pos(e) }));
-  img.addEventListener("wheel", (e) => { e.preventDefault(); send({ type: "scroll", dx: e.deltaX, dy: e.deltaY }); }, { passive: false });
+  img.addEventListener("wheel", (e) => { if (!control) return; e.preventDefault(); send({ type: "scroll", dx: e.deltaX, dy: e.deltaY }); }, { passive: false });
   const special = new Set(["Enter", "Backspace", "Tab", "Escape", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"]);
   img.addEventListener("keydown", (e) => {
+    if (!control) return;
     if (e.ctrlKey || e.metaKey) { if (/^[a-z]$/i.test(e.key)) { e.preventDefault(); send({ type: "key", key: "Control+" + e.key.toLowerCase() }); } return; }
     if (special.has(e.key)) { e.preventDefault(); send({ type: "key", key: e.key }); }
     else if (e.key.length === 1) { e.preventDefault(); send({ type: "type", text: e.key }); }
   });
-  const text = h("input", { placeholder: "Paste text to type into the focused field…", type: "password" });
+  const text = h("input", { placeholder: "Paste text to type into the focused field…", type: "password", disabled: !control });
   const frame = async () => {
     if (liveBusy || !liveOn) return; liveBusy = true;
     try {
@@ -172,12 +179,13 @@ function renderLive(t) {
       if (res.ok) { const b = await res.blob(); const old = img.src; img.src = URL.createObjectURL(b); if (old.startsWith("blob:")) URL.revokeObjectURL(old); const pu = res.headers.get("X-Page-Url"); if (pu && document.activeElement !== url) url.value = decodeURIComponent(pu); }
     } catch {} finally { liveBusy = false; }
   };
-  clearInterval(liveTimer); liveTimer = setInterval(frame, 800); frame();
-  return h("div", { class: "box", id: "live" }, h("h3", {}, "Live browser — click, scroll and type here"),
-    h("div", { class: "bar" }, h("button", { onclick: () => send({ type: "back" }) }, "←"), url,
-      h("button", { onclick: () => url.value && send({ type: "goto", url: url.value }) }, "Go")),
-    img,
-    h("div", { class: "bar", style: "margin-top:8px" }, text, h("button", { onclick: () => { if (text.value) { send({ type: "type", text: text.value }); text.value = ""; } } }, "Type")));
+  clearInterval(liveTimer); liveTimer = setInterval(frame, control ? 700 : 1500); frame();
+  return h("div", { class: "box", id: "live" },
+    h("h3", {}, control ? "Live browser — click, scroll and type here" : "Live browser (view only while the agent is working)"),
+    h("div", { class: "bar" }, h("button", { disabled: !control, onclick: () => send({ type: "back" }) }, "←"), url,
+      h("button", { disabled: !control, onclick: () => url.value && send({ type: "goto", url: url.value }) }, "Go")),
+    h("div", { class: "view" }, img),
+    control ? h("div", { class: "bar", style: "margin-top:8px" }, text, h("button", { onclick: () => { if (text.value) { send({ type: "type", text: text.value }); text.value = ""; } } }, "Type")) : null);
 }
 
 function renderDetail() {
@@ -186,27 +194,29 @@ function renderDetail() {
   if (showNew) return el.append(newForm());
   if (!detail) return el.append(h("div", { class: "empty" }, "Select a task or create one."));
   const t = detail;
-  el.append(h("div", { class: "box" },
+  const left = h("div", { class: "col left" }), right = h("div", { class: "col right" });
+  left.append(h("div", { class: "box" },
     h("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" }, h("strong", {}, t.input.product.name), stateBadge(t.state), h("span", { style: "color:var(--mute)" }, "step: " + t.currentStep),
       h("span", { style: "flex:1" }),
       !["COMPLETED", "FAILED", "CANCELLED"].includes(t.state) ? h("button", { class: "danger", onclick: () => confirm("Cancel this task?") && act("cancel") }, "Cancel") : null),
-    h("div", { style: "color:var(--mute);margin-top:6px" }, t.id + " · " + t.input.directoryUrl),
+    h("div", { style: "color:var(--mute);margin-top:6px;word-break:break-all" }, t.id + " · " + t.input.directoryUrl),
     t.humanMessage ? h("p", { style: "margin:8px 0 0" }, t.humanMessage) : null,
     t.error ? h("p", { style: "margin:8px 0 0;color:var(--bad)" }, t.error) : null,
     t.pauseExpiresAt ? h("p", { style: "margin:8px 0 0;color:var(--mute)" }, "Auto-fails if no response by " + new Date(t.pauseExpiresAt).toLocaleString()) : null,
     t.nextCheckAt ? h("p", { style: "margin:8px 0 0;color:var(--mute)" }, "Next status check: " + new Date(t.nextCheckAt).toLocaleString()) : null));
-  const card = renderCard(t); if (card) el.append(h("div", {}, h("h3", { style: "margin:0 0 6px;color:var(--mute);font-size:12px" }, "REQUIRED HUMAN ACTION"), card));
-  const live = renderLive(t); if (live) el.append(live);
+  const card = renderCard(t); if (card) left.append(h("div", {}, h("h3", { style: "margin:0 0 6px;color:var(--mute);font-size:12px" }, "REQUIRED HUMAN ACTION"), card));
   const conf = t.data.confirmation;
-  if (conf && t.state === "COMPLETED") el.append(h("div", { class: "box" }, h("h3", {}, "Result"), h("table", {}, ["confirmationUrl", "listingUrl", "directory", "submittedAt"].filter((k) => conf[k]).map((k) => h("tr", {}, h("td", {}, k), h("td", {}, conf[k]))))));
+  if (conf && t.state === "COMPLETED") left.append(h("div", { class: "box" }, h("h3", {}, "Result"), h("table", {}, ["confirmationUrl", "listingUrl", "directory", "submittedAt"].filter((k) => conf[k]).map((k) => h("tr", {}, h("td", {}, k), h("td", {}, conf[k]))))));
   const logs = h("div", { id: "logs" }, t.logs.map((l) => h("div", { class: "l-" + l.level }, `${l.ts.slice(11, 19)} [${l.step}] ${l.message}`)));
-  el.append(h("div", { class: "box" }, h("h3", {}, "Logs"), logs));
+  left.append(h("div", { class: "box" }, h("h3", {}, "Logs"), logs));
   setTimeout(() => { logs.scrollTop = logs.scrollHeight; });
-  if (t.screenshots.length) el.append(h("div", { class: "box" }, h("h3", {}, "Screenshots"), h("div", { class: "shots" }, t.screenshots.slice().reverse().map((s) => {
+  if (t.screenshots.length) left.append(h("div", { class: "box" }, h("h3", {}, "Screenshots"), h("div", { class: "shots" }, t.screenshots.slice().reverse().map((s) => {
     const img = h("img", { alt: s.label, loading: "lazy" });
     fetch(s.url, { headers: authHeaders() }).then((r) => r.blob()).then((b) => { img.src = URL.createObjectURL(b); img.onclick = () => window.open(img.src); }).catch(() => {});
     return h("figure", {}, img, h("figcaption", {}, `${s.label} · ${s.step}`));
   }))));
+  right.append(renderLive(t));
+  el.append(h("div", { class: "split" }, left, right));
 }
 
 function newForm() {
