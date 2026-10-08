@@ -16,6 +16,7 @@
 		"dev:profiler": "nodemon index.js --firebase_env=profiler",
 		"build": "npm install && npm install --only=dev",
 		"test:load": "node tests/test-load.js",
+		"test:directory-agent": "node tests/directory-agent.e2e.mjs",
 		"pentest": "node tests/pentest-load.js",
 		"pentest:pool": "node tests/test-load.js",
 		"monitor": "node monitor-resources.js",
