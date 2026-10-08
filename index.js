@@ -117,6 +117,12 @@ import {
 } from "./lib/viralClipCutter.js";
 import { generateUrlIgCarousel } from "./lib/youtubeIgCarousel.js";
 import {
+	createUrlVideoJob,
+	estimateUrlVideoCost,
+	getUrlVideoJob,
+	parseUrlVideoInput,
+} from "./lib/urlToVideo/index.js";
+import {
 	generateImageUsingOpenAIServerLocally,
 	pingMlxOpenAiServer,
 } from "./lib/mlxOpenAiImage.js";
@@ -12537,6 +12543,85 @@ function listBlogAudioLanguages() {
 		.map(([name, code]) => ({ code, name }))
 		.sort((a, b) => a.name.localeCompare(b.name));
 }
+
+// ── URL / GitHub repo → narrated MP4 video ─────────────────────────────────
+// Reuses the scraper, screenshot pool and OpenRouter TTS; renders with FFmpeg, uploads to UploadThing.
+
+const urlVideoDeps = {
+	scrape: (url) => scrapeOneUrlResult(url, parseScrapeOptions({ includeImages: false, includeLinks: false })),
+	capture: async (url, { device = "desktop", fullPage = true } = {}) => {
+		const { buffer } = await browserPool.withPage((page) =>
+			captureOneScreenshotWithPage(page, {
+				url,
+				device,
+				fullPage,
+				waitUntil: "load",
+				timeout: 50_000,
+				contentReadyTimeout: 20_000,
+				postLoadWaitMs: 2_000,
+				blockDistractions: true,
+				skipMarkdown: true,
+			}),
+		);
+		return Buffer.from(buffer);
+	},
+	renderHtml: (htmlList, { width, height }) =>
+		browserPool.withPage(async (page) => {
+			await page.setViewport({ width, height, deviceScaleFactor: 1 });
+			const out = [];
+			for (const html of htmlList) {
+				await page
+					.setContent(html, { waitUntil: "networkidle0", timeout: 20_000 })
+					.catch(() => page.setContent(html, { waitUntil: "load", timeout: 20_000 }));
+				await page
+					.evaluate(() => Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 3000))]))
+					.catch(() => {});
+				out.push(Buffer.from(await page.screenshot({ type: "png", clip: { x: 0, y: 0, width, height } })));
+			}
+			return out;
+		}),
+};
+
+/**
+ * POST /url-to-video
+ * Body: { url (website or github.com/owner/repo), duration_sec?: 15-180 (45), aspect?: "16:9"|"9:16"|"1:1",
+ *   voice?: alloy|echo|fable|onyx|nova|shimmer, tone?, audience?, language?, music?: auto|openverse|generate|none|<mp3 url>,
+ *   music_volume?, sfx?, captions?, theme?: { background, accent, text, mode }, max_frames?, max_scenes?,
+ *   script_model?, vision_model?, tts_model?, analyze_screenshots?, branch?, upload?, keep_local?, wait? }
+ * Returns 202 + job id (poll GET /url-to-video/:id), or the finished job when wait=true.
+ */
+app.post("/url-to-video", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = parseUrlVideoInput(body);
+	if (parsed.error) return c.json({ success: false, error: parsed.error }, 400);
+	if (!process.env.OPENROUTER_API_KEY?.trim()) {
+		return c.json({ success: false, error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" }, 500);
+	}
+	try {
+		const wait = body.wait === true;
+		const job = await createUrlVideoJob(parsed.input, urlVideoDeps, { wait });
+		return c.json(
+			{ success: job.status !== "failed", job_id: job.id, status_url: `/url-to-video/${job.id}`, ...job },
+			wait ? (job.status === "failed" ? 500 : 200) : 202,
+		);
+	} catch (error) {
+		console.error("❌ url-to-video error:", error);
+		return c.json({ success: false, error: error?.message || String(error) }, 500);
+	}
+});
+
+/** POST /url-to-video/estimate — projected USD cost for the same body, without running anything. */
+app.post("/url-to-video/estimate", async (c) => {
+	const parsed = parseUrlVideoInput(await c.req.json().catch(() => ({})));
+	if (parsed.error) return c.json({ success: false, error: parsed.error }, 400);
+	return c.json({ success: true, input: parsed.input, estimate: estimateUrlVideoCost(parsed.input) });
+});
+
+app.get("/url-to-video/:id", async (c) => {
+	const job = await getUrlVideoJob(c.req.param("id"));
+	if (!job) return c.json({ success: false, error: "Unknown job id" }, 404);
+	return c.json({ success: job.status !== "failed", ...job });
+});
 
 app.get("/blog-to-audio/voices", (c) => {
 	return c.json({
