@@ -7,7 +7,7 @@
 | # | Step | How | Cost |
 |---|------|-----|------|
 | 1 | Ingest | GitHub: `git clone --depth 1` into the job folder, then read the README, manifests, file tree and the top code files, plus stars/topics from the GitHub API. Website: the existing scraper (`scrapeOneUrlResult`). | free |
-| 2 | Screenshots | Full-page capture with the browser pool (`captureOneScreenshotWithPage`), cropped into 16:10 (desktop) or 9:16 (mobile) frame candidates | free |
+| 2 | Screenshots | All targets (repo page, project homepage, website) captured **in parallel** on the browser pool. Each target goes through: (1) scrolled viewport shots from one page opened with `domcontentloaded`; (2) fast full-page capture, cropped; (3) GitHub only: the cloned README rendered offline into frames, so a GitHub job always has visuals even when github.com is slow or blocked | free |
 | 3 | Frame analysis | Vision model (`SCREENSHOT_ANALYST_SYSTEM`) scores each frame, picks a focus point and a camera move, and marks bad frames to skip | ~$0.01 |
 | 4 | Script + storyboard | `SCRIPT_DIRECTOR_SYSTEM` writes the scenes (hook → problem → features → proof → CTA), with narration, visuals, music mood and theme | ~$0.05–0.08 |
 | 5 | Narration | OpenRouter TTS (`gpt-audio-mini` by default), one clip per scene, run in parallel | ~$0.025/min |
@@ -42,7 +42,7 @@ Body options: `url`, `duration_sec` (15–180), `aspect` (`16:9` | `9:16` | `1:1
 
 | Var | Default |
 |-----|---------|
-| `OPENROUTER_API_KEY` | required |
+| `OPENROUTER_API_KEY` | required. Checked before each job: an invalid or revoked key fails right away with `code: OPENROUTER_AUTH` (HTTP 401; OpenRouter's message is "User not found.") |
 | `UPLOADTHING_TOKEN` | optional. Without it, files stay local only |
 | `URL_VIDEO_OUTPUT_DIR` | `$TMPDIR/url-to-video` |
 | `URL_VIDEO_SCRIPT_MODEL` | `OPENROUTER_MODEL` or `anthropic/claude-sonnet-4` |

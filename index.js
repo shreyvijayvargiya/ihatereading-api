@@ -12547,18 +12547,58 @@ function listBlogAudioLanguages() {
 // ── URL / GitHub repo → narrated MP4 video ─────────────────────────────────
 // Reuses the scraper, screenshot pool and OpenRouter TTS; renders with FFmpeg, uploads to UploadThing.
 
+/**
+ * Open a page once (domcontentloaded — no waiting on long-lived requests), scroll it and take
+ * viewport-sized shots. Faster and sharper than one huge full-page capture, and tolerant of
+ * pages like GitHub whose `load` event can take longer than the navigation timeout.
+ */
+async function captureScrolledSections(url, { device = "desktop", count = 4 } = {}) {
+	return browserPool.withPage(async (page) => {
+		const viewport = SCREENSHOT_VIEWPORT_MAP[device] || SCREENSHOT_VIEWPORT_MAP.desktop;
+		const { userAgent, extraHTTPHeaders } = generateScreenshotHeaders();
+		await applyStealthToPage(page);
+		await page.setViewport({ width: viewport.width, height: viewport.height, deviceScaleFactor: 1 });
+		await page.setUserAgent(userAgent);
+		await page.setExtraHTTPHeaders(extraHTTPHeaders);
+		try {
+			await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+		} catch (err) {
+			// A slow sub-resource can time out navigation even though the document is usable.
+			const hasBody = await page.evaluate(() => (document.body?.innerText || "").length > 40).catch(() => false);
+			if (!hasBody) throw err;
+		}
+		await waitForVisiblePageContent(page, { timeout: 10_000, minTextLength: 40 }).catch(() => {});
+		await new Promise((r) => setTimeout(r, 1_200));
+		if (BLOCK_DISTRACTIONS_CSS) await page.addStyleTag({ content: BLOCK_DISTRACTIONS_CSS }).catch(() => {});
+		const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight).catch(() => viewport.height);
+		const maxY = Math.max(0, Math.min(scrollHeight, viewport.height * 8) - viewport.height);
+		const n = Math.max(1, Math.min(count, Math.ceil((maxY + viewport.height) / viewport.height)));
+		const shots = [];
+		for (let i = 0; i < n; i++) {
+			const y = n === 1 ? 0 : Math.round((maxY * i) / (n - 1));
+			await page.evaluate((top) => window.scrollTo(0, top), y);
+			await new Promise((r) => setTimeout(r, 450));
+			const buffer = await capturePageScreenshot(page, { fullPage: false });
+			shots.push({ buffer: Buffer.from(buffer), y, scrollHeight });
+		}
+		return shots;
+	});
+}
+
 const urlVideoDeps = {
 	scrape: (url) => scrapeOneUrlResult(url, parseScrapeOptions({ includeImages: false, includeLinks: false })),
+	captureSections: captureScrolledSections,
 	capture: async (url, { device = "desktop", fullPage = true } = {}) => {
 		const { buffer } = await browserPool.withPage((page) =>
 			captureOneScreenshotWithPage(page, {
 				url,
 				device,
 				fullPage,
-				waitUntil: "load",
-				timeout: 50_000,
-				contentReadyTimeout: 20_000,
-				postLoadWaitMs: 2_000,
+				waitUntil: "domcontentloaded",
+				fastCapture: true,
+				timeout: 30_000,
+				contentReadyTimeout: 10_000,
+				postLoadWaitMs: 1_000,
 				blockDistractions: true,
 				skipMarkdown: true,
 			}),
@@ -12612,8 +12652,9 @@ app.post("/url-to-video", async (c) => {
 				success: false,
 				error: message,
 				...(message.startsWith("No working ffmpeg") && { code: "FFMPEG_UNAVAILABLE" }),
+				...(error?.code === "OPENROUTER_AUTH" && { code: "OPENROUTER_AUTH" }),
 			},
-			500,
+			error?.code === "OPENROUTER_AUTH" ? 401 : 500,
 		);
 	}
 });
