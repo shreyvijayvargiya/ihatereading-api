@@ -123,6 +123,16 @@ import {
 	parseUrlVideoInput,
 } from "./lib/urlToVideo/index.js";
 import {
+	FORMATS as VIDEO_SHORT_FORMATS,
+	createShortsJob,
+	estimateShortsCost,
+	getShortsJob,
+	listShortsJobs,
+	parseShortsInput,
+	resolveShortsFile,
+} from "./lib/videoShorts/index.js";
+import { Readable } from "node:stream";
+import {
 	generateImageUsingOpenAIServerLocally,
 	pingMlxOpenAiServer,
 } from "./lib/mlxOpenAiImage.js";
@@ -12616,6 +12626,7 @@ const urlVideoDeps = {
 				await page
 					.evaluate(() => Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 3000))]))
 					.catch(() => {});
+				await page.bringToFront().catch(() => {});
 				out.push(Buffer.from(await page.screenshot({ type: "png", clip: { x: 0, y: 0, width, height } })));
 			}
 			return out;
@@ -12670,6 +12681,72 @@ app.get("/url-to-video/:id", async (c) => {
 	const job = await getUrlVideoJob(c.req.param("id"));
 	if (!job) return c.json({ success: false, error: "Unknown job id" }, 404);
 	return c.json({ success: job.status !== "failed", ...job });
+});
+
+// ── Video shorts agent: many < 60 s variations from one product's context ──────────
+
+/**
+ * POST /video-shorts
+ * Body: { url, github_url?, blog_url?, extra_urls?: string[], variations?: 1-6 (3), duration_sec?: 10-59 (30),
+ *   aspect?: "9:16"|"1:1"|"16:9", formats?: string[], tone?, audience?, language?,
+ *   audio?: false | { narration?: bool, music?: auto|openverse|generate|none|<mp3 url>, sfx?: bool, voice?, music_volume? },
+ *   captions?, script_model?, vision_model?, tts_model?, max_screenshots?, max_images?, max_blog_posts?,
+ *   render_concurrency?, upload?, wait? }
+ */
+app.post("/video-shorts", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = parseShortsInput(body);
+	if (parsed.error) return c.json({ success: false, error: parsed.error }, 400);
+	if (!process.env.OPENROUTER_API_KEY?.trim()) {
+		return c.json({ success: false, error: "OPENROUTER_API_KEY not configured", code: "MISSING_API_KEY" }, 500);
+	}
+	try {
+		const wait = body.wait === true;
+		const job = await createShortsJob(parsed.input, urlVideoDeps, { wait });
+		return c.json({ success: job.status !== "failed", job_id: job.id, status_url: `/video-shorts/${job.id}`, ...job }, wait ? 200 : 202);
+	} catch (error) {
+		const message = error?.message || String(error);
+		const code = error?.code === "OPENROUTER_AUTH" ? "OPENROUTER_AUTH" : message.startsWith("No working ffmpeg") ? "FFMPEG_UNAVAILABLE" : undefined;
+		return c.json({ success: false, error: message, ...(code && { code }) }, code === "OPENROUTER_AUTH" ? 401 : 500);
+	}
+});
+
+app.post("/video-shorts/estimate", async (c) => {
+	const parsed = parseShortsInput(await c.req.json().catch(() => ({})));
+	if (parsed.error) return c.json({ success: false, error: parsed.error }, 400);
+	return c.json({ success: true, input: parsed.input, estimate: estimateShortsCost(parsed.input) });
+});
+
+app.get("/video-shorts", async (c) => c.json({ success: true, jobs: await listShortsJobs(Number(c.req.query("limit")) || 20) }));
+
+app.get("/video-shorts/formats", (c) => c.json({ success: true, formats: VIDEO_SHORT_FORMATS }));
+
+app.get("/video-shorts/:id", async (c) => {
+	const job = await getShortsJob(c.req.param("id"));
+	if (!job) return c.json({ success: false, error: "Unknown job id" }, 404);
+	return c.json({ success: job.status !== "failed", ...job });
+});
+
+/** GET /video-shorts/:id/file?p=<relative path> — local previews (frames, MP4s) with Range support. */
+app.get("/video-shorts/:id/file", async (c) => {
+	const file = resolveShortsFile(c.req.param("id"), c.req.query("p"));
+	if (!file) return c.json({ success: false, error: "Not found" }, 404);
+	const types = { ".mp4": "video/mp4", ".png": "image/png", ".jpg": "image/jpeg", ".json": "application/json", ".srt": "text/plain; charset=utf-8", ".wav": "audio/wav", ".m4a": "audio/mp4" };
+	const type = types[path.extname(file).toLowerCase()] || "application/octet-stream";
+	const size = fs.statSync(file).size;
+	const range = /^bytes=(\d*)-(\d*)$/.exec(c.req.header("range") || "");
+	if (range) {
+		const start = range[1] ? Number(range[1]) : 0;
+		const end = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+		if (start > end || start >= size) return c.body(null, 416, { "Content-Range": `bytes */${size}` });
+		return c.body(Readable.toWeb(fs.createReadStream(file, { start, end })), 206, {
+			"Content-Type": type,
+			"Content-Length": String(end - start + 1),
+			"Content-Range": `bytes ${start}-${end}/${size}`,
+			"Accept-Ranges": "bytes",
+		});
+	}
+	return c.body(Readable.toWeb(fs.createReadStream(file)), 200, { "Content-Type": type, "Content-Length": String(size), "Accept-Ranges": "bytes" });
 });
 
 app.get("/blog-to-audio/voices", (c) => {

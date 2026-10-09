@@ -12,6 +12,7 @@ import { StatusPage } from "@/pages/StatusPage";
 import { TablesPage } from "@/pages/TablesPage";
 import { DocsPage } from "@/pages/DocsPage";
 import { ScraperPage } from "@/pages/ScraperPage";
+import { VideoShortsPage } from "@/pages/VideoShortsPage";
 import "./index.css";
 
 const queryClient = new QueryClient({
@@ -52,12 +53,19 @@ const scraperRoute = createRoute({
 	component: ScraperPage,
 });
 
+const videoShortsRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/video-shorts",
+	component: VideoShortsPage,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	tablesIndexRoute,
 	tableRoute,
 	docsRoute,
 	scraperRoute,
+	videoShortsRoute,
 ]);
 const router = createRouter({ routeTree });
 
