@@ -1,5 +1,5 @@
 import { Link, useRouterState } from "@tanstack/react-router";
-import { Activity, BookOpen, Clapperboard, Database, PanelLeft, Search, X } from "lucide-react";
+import { Activity, BookOpen, Bot, Database, PanelLeft, Search, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchStatus } from "@/lib/api";
 import { withPinnedTables } from "@/lib/catalog";
@@ -11,7 +11,7 @@ const NAV = [
 	{ to: "/", label: "Scrapers", icon: Activity, match: (p: string) => p === "/" || p.startsWith("/scrapers") },
 	{ to: "/tables", label: "Collections", icon: Database, match: (p: string) => p.startsWith("/tables") },
 	{ to: "/docs", label: "Docs", icon: BookOpen, match: (p: string) => p.startsWith("/docs") },
-	{ to: "/video-shorts", label: "Video shorts", icon: Clapperboard, match: (p: string) => p.startsWith("/video-shorts") },
+	{ to: "/directory-agent", label: "Directory agent", icon: Bot, match: (p: string) => p.startsWith("/directory-agent") },
 ];
 
 export function AppSidebar({
@@ -191,6 +191,8 @@ export function AppNavbar({
 			? "Scrapers"
 			: pathname.startsWith("/docs")
 				? "Documentation"
+				: pathname.startsWith("/directory-agent")
+				? "Directory agent"
 				: pathname.startsWith("/tables")
 					? matched?.label || "Collections"
 					: matched?.label || "Agent";

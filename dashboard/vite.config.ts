@@ -14,6 +14,10 @@ export default defineConfig({
 		open: "/",
 		fs: { allow: [".."] },
 		proxy: {
+			"/api/tasks": {
+				target: "http://127.0.0.1:3002",
+				changeOrigin: true,
+			},
 			"/api": {
 				target: "http://127.0.0.1:3002",
 				changeOrigin: true,
