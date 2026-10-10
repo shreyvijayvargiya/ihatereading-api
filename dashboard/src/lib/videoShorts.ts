@@ -111,7 +111,7 @@ export type ShortsJobSummary = {
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-	const res = await fetch(`/api${path}`, {
+	const res = await fetch(`http://localhost:3002${path}`, {
 		...init,
 		headers: init?.body ? { "Content-Type": "application/json" } : undefined,
 	});
