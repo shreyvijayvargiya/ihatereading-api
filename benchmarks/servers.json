@@ -1,0 +1,24 @@
+{
+	"endpoints": {
+		"single": { "method": "GET", "path": "/scrape?url={url}" },
+		"bulk": { "method": "POST", "path": "/scrape/bulk" }
+	},
+	"urls": [
+		"https://example.com",
+		"https://news.ycombinator.com",
+		"https://en.wikipedia.org/wiki/Web_scraping",
+		"https://www.python.org",
+		"https://developer.mozilla.org"
+	],
+	"servers": [
+		{ "name": "hono-puppeteer", "dir": "../../hono-puppeteer", "port": 3001 },
+		{ "name": "hono-lightpanda", "dir": "../../hono-lightpanda", "port": 3002 },
+		{ "name": "hono-playwright", "dir": "../../hono-playwright", "port": 3003 },
+		{ "name": "nest-puppeteer", "dir": "../../nest-puppeteer", "port": 3004 },
+		{ "name": "nest-lightpanda", "dir": "../../nest-lightpanda", "port": 3005 },
+		{ "name": "nest-playwright", "dir": "../../nest-playwright", "port": 3006 },
+		{ "name": "fastify-puppeteer", "dir": "../../fastify-puppeteer", "port": 3007 },
+		{ "name": "fastify-lightpanda", "dir": "../../fastify-lightpanda", "port": 3008 },
+		{ "name": "fastify-playwright", "dir": "../../fastify-playwright", "port": 3009 }
+	]
+}
