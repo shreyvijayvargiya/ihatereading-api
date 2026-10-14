@@ -71,6 +71,7 @@ import { devMagazineRouter } from "./lib/devMagazineRouter.js";
 import { internetNewsRouter } from "./lib/internetNewsRouter.js";
 import { englandClubsRouter } from "./lib/englandClubsRouter.js";
 import { contentResearchRouter } from "./lib/contentResearchRouter.js";
+import { schedulerRouter } from "./lib/schedulerRouter.js";
 import {
 	buildGoogleNewsUrl,
 	extractGoogleNewsItems,
@@ -1857,6 +1858,9 @@ app.route("/", englandClubsRouter);
 
 // Content research planner: keywords + Reddit + internal + external → ideas
 app.route("/", contentResearchRouter);
+
+// Scheduling + posting API (X/Twitter, GitHub markdown commits)
+app.route("/scheduler", schedulerRouter);
 
 app.post("/post-to-devto", async (c) => {
 	try {
