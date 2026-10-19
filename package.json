@@ -17,6 +17,7 @@
 		"build": "npm install && npm install --only=dev",
 		"test:load": "node tests/test-load.js",
 		"test:scheduler": "node --test tests/scheduler.test.js",
+		"test:graph": "node --test tests/graph.test.js",
 		"pentest": "node tests/pentest-load.js",
 		"pentest:pool": "node tests/test-load.js",
 		"monitor": "node monitor-resources.js",
